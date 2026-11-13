@@ -1,6 +1,7 @@
-# hollow worker (scaffold placeholder — NOT deployed); script name keeps the newproto- prefix infra naming.
-# Config only; deployment is a separate, explicitly assigned step.
-name = "newproto-worker"
+# hollow worker (deployment is via the Cloudflare API, this file documents
+# the intended settings; script name keeps the newproto- prefix infra naming).
+name = "newproto-hollow"
 main = "src/index.js"
 compatibility_date = "2025-10-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true

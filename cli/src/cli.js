@@ -1,12 +1,122 @@
 #!/usr/bin/env node
-// hollow cli — minimal shell (M1 scaffold, NP-1113-02).
-// Only --version / --health. No protocol logic yet:
-// protocol implementation lands after spec v0.1 passes review.
+// Hollow CLI (M1 prototype, NP-1113-06).
+// Commands:
+//   --version | --health
+//   psk init [--file PATH]        generate the 32B PSK locally (0600, never in repo)
+//   psk verifier [--file PATH]    print V (hex) for the owner to set as the Worker secret
+//   serve [--listen 127.0.0.1:1080] [--url wss://...] [--psk-file PATH]
+//                                 SOCKS5 entry + carrier with §8.4 reconnect backoff
+// Secrets discipline (spec §1.1): the PSK exists only in the local key file;
+// the server stores only V. Nothing here hardcodes or logs the PSK itself.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomBytes } from "../../shared/crypto.js";
+import { deriveVerifier } from "../../shared/protocol.js";
+import { HollowClient } from "../../shared/client-core.js";
+import { connectWs } from "./ws-client.js";
+import { startSocks } from "./socks.js";
 
 export const NAME = "hollow-cli";
-export const VERSION = "0.0.1";
+export const VERSION = "0.1.0";
 
-function main(argv) {
+const DEFAULT_PSK = path.join(os.homedir(), ".hollow", "psk.bin");
+
+function argVal(argv, name, dflt) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;
+}
+
+async function pskInit(argv) {
+  const file = argVal(argv, "--file", DEFAULT_PSK);
+  if (fs.existsSync(file)) {
+    console.error(`psk file already exists: ${file} (refusing to overwrite)`);
+    return 1;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const psk = randomBytes(32);
+  fs.writeFileSync(file, psk, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  const v = await deriveVerifier(new Uint8Array(psk));
+  console.log(`PSK written to ${file} (0600, 32 bytes)`);
+  console.log(`key_id: 1`);
+  console.log(`verifier V (hex, for the Worker secret PSK_V_HEX): ${Buffer.from(v).toString("hex")}`);
+  return 0;
+}
+
+function loadPsk(file) {
+  const b = fs.readFileSync(file);
+  if (b.length !== 32) throw new Error(`psk file must be 32 bytes, got ${b.length}`);
+  return new Uint8Array(b);
+}
+
+async function pskVerifier(argv) {
+  const file = argVal(argv, "--file", DEFAULT_PSK);
+  const v = await deriveVerifier(loadPsk(file));
+  console.log(Buffer.from(v).toString("hex"));
+  return 0;
+}
+
+async function serve(argv) {
+  const listen = argVal(argv, "--listen", "127.0.0.1:1080");
+  const [lhost, lport] = listen.split(":");
+  const url = argVal(argv, "--url", process.env.HOLLOW_WORKER_URL || "");
+  if (!url) { console.error("--url wss://<worker> is required (or HOLLOW_WORKER_URL)"); return 1; }
+  const psk = loadPsk(argVal(argv, "--psk-file", DEFAULT_PSK));
+  const keyId = Number(argVal(argv, "--key-id", "1"));
+
+  let current = null;
+  let stopped = false;
+  let failures = 0;
+  const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+  async function runCarrier() {
+    while (!stopped) {
+      try {
+        const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5: 75–150s randomized
+        const transport = await connectWs(url, { pingIntervalMs: pingMs });
+        const client = new HollowClient({ transport, psk, keyId });
+        current = client;
+        await client.handshake();
+        failures = 0;
+        log(`carrier up: ${url}`);
+        // §5.6: rotate the carrier at 15 minutes (old streams fail per §8.4)
+        const rotate = setTimeout(() => {
+          log("carrier rotation (15 min)");
+          client.close();
+        }, 15 * 60 * 1000);
+        rotate.unref();
+        await new Promise((res) => { client.onCarrierDead = () => res(); });
+        clearTimeout(rotate);
+        current = null;
+        log("carrier down; will reconnect");
+      } catch (e) {
+        current = null;
+        log("carrier attempt failed:", e && e.message || e);
+      }
+      if (stopped) break;
+      failures++;
+      const base = Math.min(60000, 1000 * 2 ** Math.min(failures - 1, 6));
+      const delay = Math.round(base * (1 + (Math.random() * 0.5 - 0.25))); // §8.4: ±25% jitter
+      log(`reconnect in ${delay}ms (failure ${failures})`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  const server = await startSocks({
+    getClient: () => current,
+    host: lhost, port: Number(lport),
+    log: (...a) => log(...a),
+  });
+  log(`socks5 listening on ${lhost}:${lport} (loopback only)`);
+  process.on("SIGINT", () => { stopped = true; server.close(); process.exit(0); });
+  process.on("SIGTERM", () => { stopped = true; server.close(); process.exit(0); });
+  runCarrier();
+  await new Promise(() => {}); // serve forever; signals exit explicitly
+  return 0;
+}
+
+async function main(argv) {
   const cmd = argv[2];
   if (cmd === "--version" || cmd === "-v" || cmd === "version") {
     console.log(`${NAME} ${VERSION}`);
@@ -16,11 +126,14 @@ function main(argv) {
     console.log(JSON.stringify({ name: NAME, version: VERSION, status: "ok" }));
     return 0;
   }
-  console.log(`usage: ${NAME} [--version|--health]`);
+  if (cmd === "psk" && argv[3] === "init") return pskInit(argv);
+  if (cmd === "psk" && argv[3] === "verifier") return pskVerifier(argv);
+  if (cmd === "serve") return serve(argv);
+  console.log(`usage: ${NAME} [--version|--health|psk init|psk verifier|serve]`);
   return cmd === undefined || cmd === "--help" || cmd === "-h" ? 0 : 1;
 }
 
 import { fileURLToPath } from "node:url";
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  process.exit(main(process.argv));
+  process.exit(await main(process.argv));
 }
