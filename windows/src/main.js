@@ -1,15 +1,17 @@
-// Electron main (NP-1114-01 skeleton): single instance, tray-resident,
-// main window is a status shell; all protocol work lives in CoreBridge.
-// Exit exists only in the tray menu and always restores the system proxy.
+// Electron main (M2-1, NP-1114-03): single instance, tray-resident; the
+// CoreBridge owns protocol state, SOCKS lifecycle follows connect/disconnect,
+// and every exit path disconnects the bridge (closing the SOCKS port) and
+// restores the system proxy. Renderer gets state via IPC + pushed events.
 import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage } from "electron";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
-import { loadConfig, loadOrCreatePsk, verifierHex } from "./config.js";
+import { loadConfig, saveConfig, loadOrCreatePsk, pskStatus, configDir } from "./config.js";
 import * as sysproxy from "./sysproxy.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const cfg = loadConfig();
+let cfg = loadConfig();
 const logs = [];
 function log(m) {
   const line = `${new Date().toISOString()} ${m}`;
@@ -19,6 +21,17 @@ function log(m) {
 
 let win = null, tray = null, bridge = null, proxyOn = false;
 
+function getBridge() {
+  if (!bridge) {
+    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk: loadOrCreatePsk(), keyId: cfg.keyId, log });
+    bridge.onEvent((ev) => {
+      if (win && !win.isDestroyed()) win.webContents.send("hollow:event", ev);
+      if (tray) tray.setToolTip(`Hollow — ${ev.state || bridge.state}`);
+    });
+  }
+  return bridge;
+}
+
 async function restoreProxyQuietly() {
   if (process.platform !== "win32") return;
   try { if (await sysproxy.restore()) log("system proxy restored"); } catch (e) { log(`proxy restore failed: ${e.message}`); }
@@ -26,10 +39,13 @@ async function restoreProxyQuietly() {
 }
 
 async function doConnect() {
-  bridge = bridge || new CoreBridge({ workerUrl: cfg.workerUrl, psk: loadOrCreatePsk(), keyId: cfg.keyId, log });
-  await bridge.connect();
-  await bridge.startSocks(cfg.socksPort);
-  if (cfg.proxyMode === "global") { await sysproxy.enableGlobal(cfg.socksPort); proxyOn = true; log("system proxy enabled (global)"); }
+  const b = getBridge();
+  await b.startSocks(cfg.socksPort).catch((e) => log(`socks start failed: ${e.message}`));
+  await b.connect();
+  if (cfg.proxyMode === "global" && process.platform === "win32") {
+    try { await sysproxy.enableGlobal(b.socksPort || cfg.socksPort); proxyOn = true; log("system proxy enabled (global)"); }
+    catch (e) { log(`system proxy enable failed: ${e.message}`); }
+  }
 }
 async function doDisconnect() {
   if (proxyOn) await restoreProxyQuietly();
@@ -38,7 +54,7 @@ async function doDisconnect() {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 560, height: 640, show: false,
+    width: 560, height: 680, show: false,
     webPreferences: { preload: path.join(here, "preload.js"), contextIsolation: true, nodeIntegration: false },
   });
   win.loadFile(path.join(here, "renderer", "index.html"));
@@ -48,13 +64,13 @@ function createWindow() {
 function createTray() {
   const icon = nativeImage.createFromPath(path.join(here, "..", "assets", "tray.png"));
   tray = new Tray(icon);
-  tray.setToolTip("Hollow");
+  tray.setToolTip("Hollow — disconnected");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "连接", click: () => doConnect().catch((e) => log(`connect failed: ${e.message}`)) },
     { label: "断开", click: () => doDisconnect().catch((e) => log(`disconnect failed: ${e.message}`)) },
     { type: "separator" },
     { label: "显示主窗口", click: () => { if (win) { win.show(); win.focus(); } } },
-    { label: "还原代理并退出", click: async () => { app.isQuitting = true; await restoreProxyQuietly(); app.quit(); } },
+    { label: "还原代理并退出", click: async () => { app.isQuitting = true; await doDisconnect(); await restoreProxyQuietly(); app.quit(); } },
   ]));
   tray.on("double-click", () => { if (win) win.isVisible() ? win.hide() : win.show(); });
 }
@@ -68,9 +84,26 @@ else {
     if (process.platform === "win32") { try { if (await sysproxy.selfHealOnStartup()) log("startup self-heal: proxy restored"); } catch { /* ignore */ } }
     createWindow(); createTray();
   });
-  app.on("window-all-closed", (e) => { /* tray-resident: never quit from windows */ if (e) e.preventDefault?.(); });
+  app.on("window-all-closed", (e) => { if (e) e.preventDefault?.(); }); // tray-resident
+  app.on("before-quit", async () => { try { await doDisconnect(); } catch { /* ignore */ } });
 }
 
-ipcMain.handle("hollow:getState", () => ({ ...(bridge ? bridge.snapshot() : { state: "disconnected", socksPort: null, stats: null }), logs: logs.slice(-50), verifier: verifierHex(loadOrCreatePsk()) }));
+ipcMain.handle("hollow:getState", () => ({
+  ...(bridge ? bridge.snapshot() : { state: "disconnected", detail: "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
+  logs: logs.slice(-80),
+  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir() },
+  psk: pskStatus(),
+  pskFileExists: fs.existsSync(path.join(configDir(), "psk.bin")),
+}));
 ipcMain.handle("hollow:connect", async () => { await doConnect(); return bridge.snapshot(); });
 ipcMain.handle("hollow:disconnect", async () => { await doDisconnect(); return bridge ? bridge.snapshot() : { state: "disconnected" }; });
+ipcMain.handle("hollow:saveSettings", async (_e, { workerUrl }) => {
+  if (typeof workerUrl === "string" && /^wss?:\/\//.test(workerUrl)) {
+    cfg = { ...cfg, workerUrl };
+    saveConfig(cfg);
+    // Apply on the next connect: drop a non-connected bridge so it rebuilds.
+    if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
+    log(`settings saved: workerUrl=${workerUrl}`);
+  }
+  return { workerUrl: cfg.workerUrl };
+});

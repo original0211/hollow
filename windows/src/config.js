@@ -71,3 +71,15 @@ export function loadOrCreatePsk() {
 export function verifierHex(psk) {
   return crypto.createHmac("sha256", Buffer.from(psk)).update("newproto-v0.1-server-verifier").digest("hex");
 }
+
+// PSK file status for the settings page (M2-1 minimal surface): existence and
+// size only — never the material. Does not create a key (that is M2-3).
+export function pskStatus() {
+  const file = path.join(configDir(), "psk.bin");
+  if (!fs.existsSync(file)) return { exists: false, bytes: 0, verifier: null };
+  const data = fs.readFileSync(file);
+  return {
+    exists: true, bytes: data.length,
+    verifier: data.length === 32 ? verifierHex(new Uint8Array(data)) : null,
+  };
+}

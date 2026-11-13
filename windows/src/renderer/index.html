@@ -9,23 +9,33 @@
   .sub { color: #6b6b70; font-size: 12px; margin-bottom: 16px; }
   .card { border: 1px solid #d9d9de; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
   .state { font-size: 16px; font-weight: 600; }
+  .banner { display: none; background: #fff4d6; border: 1px solid #e3c766; color: #6b5510; border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; font-size: 13px; }
   button { padding: 8px 18px; border-radius: 8px; border: 1px solid #b9b9c0; background: #f5f5f7; cursor: pointer; margin-right: 8px; }
   button.primary { background: #2b7a78; color: #fff; border-color: #2b7a78; }
-  pre { background: #111; color: #c8e6c9; padding: 10px; border-radius: 8px; height: 220px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
+  input[type="text"] { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid #c9c9cf; border-radius: 6px; margin: 6px 0; font-size: 12px; }
+  pre { background: #111; color: #c8e6c9; padding: 10px; border-radius: 8px; height: 200px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
   .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; }
+  label { font-size: 12px; color: #444; }
 </style>
 </head>
 <body>
   <h1>Hollow</h1>
-  <div class="sub">Windows MVP 骨架（NP-1114-01）· 系统代理第一步</div>
+  <div class="sub">Windows MVP · M2-1 核心桥接</div>
+  <div class="banner" id="queued-banner">服务端繁忙，已排队（等待中…）</div>
   <div class="card">
     <div class="state" id="state">状态：—</div>
-    <div id="stats" class="sub"></div>
+    <div class="sub" id="detail"></div>
+    <div class="sub" id="stats"></div>
     <button class="primary" id="btn-connect">连接</button>
     <button id="btn-disconnect">断开</button>
   </div>
   <div class="card">
-    <div>服务端配对（把 V 写入 Worker secret <span class="mono">PSK_V_HEX</span>）</div>
+    <div>设置（最小面：完整配对流程在 M2-3）</div>
+    <label>Worker 地址</label>
+    <input type="text" id="worker-url" spellcheck="false">
+    <button id="btn-save">保存</button>
+    <div class="sub" id="psk-status"></div>
+    <div>服务端配对 V（写入 Worker secret <span class="mono">PSK_V_HEX</span>）</div>
     <div class="mono" id="verifier">—</div>
   </div>
   <div class="card"><div>活动日志</div><pre id="log"></pre></div>
