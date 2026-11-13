@@ -37,6 +37,18 @@ function getBridge() {
     }
     bridgeError = null;
     bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log });
+    let restoring = false;
+    bridge.onEvent((ev) => {
+      // RF-06-03: if the bridge lands in its Error terminal state while the
+      // system proxy points at us, give the user's proxy back immediately —
+      // a dead carrier must not blackhole their browsing. Reconnecting is
+      // transient and deliberately does NOT restore.
+      if (ev.type === "state" && ev.state === "error" && proxyOn && !restoring) {
+        restoring = true;
+        log("bridge entered Error terminal state — restoring system proxy");
+        restoreProxyQuietly().finally(() => { restoring = false; });
+      }
+    });
     bridge.onEvent((ev) => {
       if (win && !win.isDestroyed()) win.webContents.send("hollow:event", ev);
       if (tray) tray.setToolTip(`Hollow — ${ev.state || bridge.state}`);

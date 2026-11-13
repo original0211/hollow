@@ -71,16 +71,28 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
 
   async function enableGlobal(port) {
     const held = readBackup(dir);
+    let written;
     if (held.kind === "ok") {
       log("proxy: backup already held — snapshot kept verbatim (iron rule), enabling with recorded state");
+      written = held.data.written;
+      // RF-06-02: the recorded written state must name the port SOCKS
+      // actually bound this time. Only the written port field may move —
+      // the snapshotted original is never touched.
+      const want = writtenFor(port);
+      if (written.ProxyServer !== want.ProxyServer) {
+        written = { ...written, ProxyServer: want.ProxyServer };
+        writeBackupAtomic(dir, { ...held.data, written });
+        log("proxy: held backup written-port updated to the actually bound port (original untouched)");
+      }
     } else if (held.kind === "corrupt") {
       log("proxy: WARNING existing backup unreadable — keeping it untouched; restore will degrade safely");
+      written = writtenFor(port);
     } else {
       const original = await readCurrent();
-      writeBackupAtomic(dir, { version: 2, takenAt: now(), original, written: writtenFor(port) });
+      written = writtenFor(port);
+      writeBackupAtomic(dir, { version: 2, takenAt: now(), original, written });
       log("proxy: snapshot saved");
     }
-    const written = held.kind === "ok" ? held.data.written : writtenFor(port);
     await applyState(written);
     const v = await verifyAgainst(written);
     if (!v.ok) throw new Error(`proxy enable verification failed on: ${v.mismatches.join(",")}`);
@@ -130,7 +142,19 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
       log("proxy: startup found values already at the original state — stale backup dropped");
       return { healed: false, mode: "already-original" };
     }
-    log("proxy: startup found a PARTIAL/damaged proxy state (matches neither written nor original) — degrading to direct no-proxy restore");
+    // RF-06-01: a partial state is only OURS to degrade when it carries our
+    // fingerprint — the recorded ProxyServer or ProxyOverride (the fixed
+    // bypass list) still present. With neither, the live values are someone
+    // else's complete configuration: touch nothing, keep the backup, and
+    // leave a trace for manual handling (--restore-proxy still works).
+    const hasFingerprint =
+      (cur.ProxyServer !== null && cur.ProxyServer === written.ProxyServer) ||
+      (cur.ProxyOverride !== null && cur.ProxyOverride === written.ProxyOverride);
+    if (!hasFingerprint) {
+      log("proxy: startup found a FOREIGN proxy state (no Hollow fingerprint) with a backup held — registry left untouched; manual handling advised (--restore-proxy remains available)");
+      return { healed: false, mode: "foreign-state" };
+    }
+    log("proxy: startup found a PARTIAL/damaged proxy state carrying the Hollow fingerprint — degrading to direct no-proxy restore");
     const r = await finishRestore(NO_PROXY, "degraded-partial-state");
     return { healed: r.restored, mode: r.mode, verified: r.verified };
   }

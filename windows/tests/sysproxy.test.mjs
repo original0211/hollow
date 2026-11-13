@@ -64,9 +64,42 @@ test("R1 iron rule: a second enable never overwrites the held snapshot", async (
   await sp.enableGlobal(1081);
   const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
   assert.deepEqual(backup.original, USER_STATE); // still the true original
+  // RF-06-02 same-shape assertion: written followed the actually bound port.
+  assert.deepEqual(backup.written, writtenFor(1081));
+  assert.deepEqual(reg.snapshot(), writtenFor(1081));
   const r = await sp.restore();
   assert.equal(r.restored, true);
   assert.deepEqual(reg.snapshot(), USER_STATE);
+});
+
+test("RF-06-02: held backup — only the written port moves, original never does", async () => {
+  const { reg, sp, backupFile } = setup({ ...USER_STATE });
+  await sp.enableGlobal(1080); // first session binds 1080
+  // App restarts; SOCKS now binds 1090 (1080 was taken). Enable reuses backup.
+  await sp.enableGlobal(1090);
+  const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
+  assert.deepEqual(backup.original, USER_STATE);
+  assert.deepEqual(backup.written, writtenFor(1090));
+  assert.deepEqual(reg.snapshot(), writtenFor(1090)); // post-enable read-back == writtenFor(actual port)
+  const r = await sp.restore();
+  assert.equal(r.restored, true);
+  assert.deepEqual(reg.snapshot(), USER_STATE);
+});
+
+test("RF-06-01: backup held + complete FOREIGN config -> registry untouched, backup kept", async () => {
+  const { reg, sp, backupFile, logs } = setup({ ...USER_STATE });
+  await sp.enableGlobal(1080);
+  // The user has since adopted their own complete proxy setup (no Hollow
+  // fingerprint in ProxyServer or ProxyOverride).
+  const foreign = { ProxyEnable: 1, ProxyServer: "their.proxy:3128", ProxyOverride: "their-bypass-list", AutoConfigURL: "http://their.example/pac" };
+  for (const [k, v] of Object.entries(foreign)) await reg.set(k, v);
+  const fresh = createSysProxy({ adapter: reg, dir: path.dirname(backupFile), log: (m) => logs.push(m) });
+  const r = await fresh.selfHealOnStartup();
+  assert.equal(r.healed, false);
+  assert.equal(r.mode, "foreign-state");
+  assert.deepEqual(reg.snapshot(), foreign); // byte-for-byte untouched
+  assert.equal(fs.existsSync(backupFile), true); // backup retained for manual handling
+  assert.ok(logs.some((l) => /FOREIGN/.test(l)));
 });
 
 test("R2: corrupt backup degrades to a verified no-proxy restore (never silent)", async () => {
@@ -119,9 +152,9 @@ test("R3 self-heal: partial/damaged state -> degraded no-proxy restore", async (
   const { reg, sp, logs } = setup({ ...USER_STATE });
   await sp.enableGlobal(1080);
   await reg.set("ProxyServer", "half-written.example:1234"); // one key diverged
-  const r = await sp.selfHealOnStartup();
-  assert.equal(r.healed, true);
-  assert.equal(r.mode, "degraded-partial-state");
+  const res = await sp.selfHealOnStartup();
+  assert.equal(res.healed, true);
+  assert.equal(res.mode, "degraded-partial-state");
   assert.deepEqual(reg.snapshot(), { ...NO_PROXY, ProxyEnable: 0 });
   assert.ok(logs.some((l) => /PARTIAL/.test(l)));
 });

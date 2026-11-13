@@ -30,11 +30,15 @@ for (const f of walk(vendor)) {
 }
 console.log(`vendor byte-identity: ${checked} files checked`);
 
-// (b) every relative import in app sources resolves to a real file
-const importRe = /(?:from\s+|import\s*\(\s*)["'](\.[^"']+)["']/g;
+// (b) every relative import in app sources resolves to a real file — and, per
+// NP-1114-08, the same scan runs over the vendored files themselves: if a
+// vendored file grows a new cross-file dependency and the prepare whitelist
+// misses it, this goes red instead of shipping a broken bundle.
+const importRe = /(?:from\s+|import\s*\(\s*|import\s+)["'](\.[^"']+)["']/g;
 const appFiles = [
   ...fs.readdirSync(path.join(winDir, "src")).filter((f) => f.endsWith(".js")).map((f) => path.join(winDir, "src", f)),
   path.join(winDir, "smoke.mjs"),
+  ...[...walk(vendor)].filter((f) => f.endsWith(".js")),
 ];
 let imports = 0;
 for (const f of appFiles) {
