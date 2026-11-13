@@ -1,8 +1,8 @@
-# newproto（代号）
+# Hollow
 
 从零设计的代理协议与配套客户端（Windows / Android），服务端运行在 Cloudflare 免费额度上。
 
-> 代号说明：`newproto` 为开发期代号，正式名未定，定后仓库可改名。
+> 正式名：Hollow（2026-11-13 定名，原代号 NEWPROTO 退役；仓库已由 newproto 改名为 hollow）。
 > 本仓库开发期私有。协议规格见 `spec/`（v0.1 制定中），本仓库目前只有工程脚手架与最小空壳，不含协议实现。
 
 ## 目录

@@ -1,4 +1,4 @@
-# newproto worker (scaffold placeholder — NOT deployed)
+# hollow worker (scaffold placeholder — NOT deployed); script name keeps the newproto- prefix infra naming.
 # Config only; deployment is a separate, explicitly assigned step.
 name = "newproto-worker"
 main = "src/index.js"

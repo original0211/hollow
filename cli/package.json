@@ -1,1 +1,1 @@
-{"bin":{"newproto":"src/cli.js"},"main":"src/cli.js","name":"newproto-cli","private":true,"type":"module","version":"0.0.1"}
+{"bin":{"hollow":"src/cli.js"},"main":"src/cli.js","name":"hollow-cli","private":true,"type":"module","version":"0.0.1"}

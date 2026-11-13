@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// newproto cli — minimal shell (M1 scaffold, NP-1113-02).
+// hollow cli — minimal shell (M1 scaffold, NP-1113-02).
 // Only --version / --health. No protocol logic yet:
 // protocol implementation lands after spec v0.1 passes review.
 
-export const NAME = "newproto-cli";
+export const NAME = "hollow-cli";
 export const VERSION = "0.0.1";
 
 function main(argv) {

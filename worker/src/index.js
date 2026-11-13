@@ -1,4 +1,4 @@
-// newproto worker — minimal shell (M1 scaffold, NP-1113-02).
+// hollow worker shell — Cloudflare script name stays "newproto-worker" (newproto- prefix infra naming, unchanged by the Hollow rename).
 // Only version + health endpoints. No protocol logic yet:
 // protocol implementation lands after spec v0.1 passes review.
 
