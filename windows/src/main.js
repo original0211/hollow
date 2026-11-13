@@ -34,8 +34,27 @@ function getBridge() {
 
 async function restoreProxyQuietly() {
   if (process.platform !== "win32") return;
-  try { if (await sysproxy.restore()) log("system proxy restored"); } catch (e) { log(`proxy restore failed: ${e.message}`); }
+  try {
+    const r = await sysproxy.restore(log);
+    if (r.restored) log(`system proxy restored (mode=${r.mode})`);
+    else if (r.mode === "snapshot" || r.mode === "degraded-corrupt-backup") log(`WARNING proxy restore incomplete: ${JSON.stringify(r)}`);
+  } catch (e) { log(`proxy restore failed: ${e.message}`); }
   proxyOn = false;
+}
+
+// Wait until the bridge reports Connected (or a terminal/timeout outcome).
+function waitConnected(b, ms = 30000) {
+  if (b.state === "connected") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const to = setTimeout(() => { cleanup(); resolve(false); }, ms);
+    const on = (ev) => {
+      if (ev.type !== "state") return;
+      if (ev.state === "connected") { cleanup(); resolve(true); }
+      if (ev.state === "error") { cleanup(); resolve(false); }
+    };
+    const cleanup = () => { clearTimeout(to); };
+    b.onEvent(on);
+  });
 }
 
 async function doConnect() {
@@ -43,8 +62,15 @@ async function doConnect() {
   await b.startSocks(cfg.socksPort).catch((e) => log(`socks start failed: ${e.message}`));
   await b.connect();
   if (cfg.proxyMode === "global" && process.platform === "win32") {
-    try { await sysproxy.enableGlobal(b.socksPort || cfg.socksPort); proxyOn = true; log("system proxy enabled (global)"); }
-    catch (e) { log(`system proxy enable failed: ${e.message}`); }
+    // Enable only once traffic can actually flow (M2-2): a proxy pointing at
+    // a dead carrier would blackhole the user's browsing.
+    const ok = await waitConnected(b);
+    if (ok) {
+      try { await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log); proxyOn = true; log(`system proxy enabled (global, 127.0.0.1:${b.socksPort || cfg.socksPort})`); }
+      catch (e) { log(`system proxy enable failed: ${e.message}`); }
+    } else {
+      log("system proxy NOT enabled: carrier did not reach Connected");
+    }
   }
 }
 async function doDisconnect() {
@@ -75,13 +101,29 @@ function createTray() {
   tray.on("double-click", () => { if (win) win.isVisible() ? win.hide() : win.show(); });
 }
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) { app.quit(); }
+// Emergency restore runs BEFORE the single-instance lock (NP-1114-05 side
+// item): if the main instance is hung while holding the lock, this short
+// process must still be able to put the user's proxy back.
+if (process.argv.includes("--restore-proxy")) {
+  app.whenReady().then(async () => {
+    try {
+      const r = await sysproxy.restore((m) => console.log(m));
+      console.log(`restore-proxy: ${JSON.stringify(r)}`);
+    } catch (e) { console.error(`restore-proxy failed: ${e.message}`); }
+    app.quit();
+  });
+} else if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
 else {
   app.on("second-instance", () => { if (win) { win.show(); win.focus(); } });
   app.whenReady().then(async () => {
-    if (process.argv.includes("--restore-proxy")) { await restoreProxyQuietly(); app.quit(); return; }
-    if (process.platform === "win32") { try { if (await sysproxy.selfHealOnStartup()) log("startup self-heal: proxy restored"); } catch { /* ignore */ } }
+    if (process.platform === "win32") {
+      try {
+        const h = await sysproxy.selfHealOnStartup(log);
+        if (h.mode && h.mode !== "none" && h.mode !== "not-windows") log(`startup proxy check: ${JSON.stringify(h)}`);
+      } catch { /* ignore */ }
+    }
     createWindow(); createTray();
   });
   app.on("window-all-closed", (e) => { if (e) e.preventDefault?.(); }); // tray-resident

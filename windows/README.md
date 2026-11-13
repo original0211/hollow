@@ -1,7 +1,11 @@
-# Hollow Windows client (MVP skeleton)
+# Hollow Windows client
 
-Implements the plan in `../../files/m2/windows-mvp-plan.md` (goal workspace) /
-NP-1114-01: Electron shell, M1 core reused byte-identical via a vendored copy.
+Implements the plan in `../../files/m2/windows-mvp-plan.md` (goal workspace).
+Status: **M2-1 + M2-2 landed** (NP-1114-03 / NP-1114-05) — full bridge state
+machine and the hardened system proxy (iron snapshot rule, atomic verified
+backups, exact-match startup self-heal). Electron shell, M1 core reused
+byte-identical via a vendored copy (integrity proven by
+`tools/verify-vendor.mjs` on every check run).
 
 Layout:
 - `src/main.js` — Electron main: window + tray + single instance + `--restore-proxy`.

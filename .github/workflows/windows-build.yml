@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - "windows/**"
+      - "shared/**"
+      - "cli/src/**"
       - ".github/workflows/windows-build.yml"
 
 jobs:
