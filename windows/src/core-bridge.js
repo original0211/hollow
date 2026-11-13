@@ -20,7 +20,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000 }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -28,9 +28,13 @@ export class CoreBridge {
     this.rotationMs = rotationMs;
     this.backoffBaseMs = backoffBaseMs;
     this.backoffCapMs = backoffCapMs;
+    // Edge-IP selection (M2-4): read at every carrier attempt, so changing it
+    // takes effect on the NEXT carrier (rotation/reconnect) and never tears
+    // down the live one.
+    this.edgeIp = edgeIp;
     this.makeTransport = makeTransport || (async () => {
       const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5 randomized keepalive
-      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs });
+      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: this.edgeIp, userAgent: "HollowClient/0.1" });
       return {
         send: (b) => raw.send(b), close: () => raw.close(), closeCarrier: () => raw.close(),
         onMessage: (cb) => raw.onMessage(cb), onClose: (cb) => raw.onClose(cb),
@@ -192,11 +196,16 @@ export class CoreBridge {
     if (this.state !== "disconnected") this._setState("disconnected");
   }
 
+  setEdgeIp(ip) {
+    this.edgeIp = ip || null;
+    this.log(ip ? `edge ip selected: ${ip} (applies to the next carrier)` : "edge ip: default resolution");
+  }
   snapshot() {
     return {
       state: this.state, detail: this.stateDetail,
       connectedSince: this.connectedSince,
       socksPort: this.socksPort, queuedNow: this.queuedNow,
+      edgeIp: this.edgeIp,
       stats: { ...this.stats },
     };
   }

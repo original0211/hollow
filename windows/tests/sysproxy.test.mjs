@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createSysProxy, parseRegQuery, writtenFor, NO_PROXY, BYPASS } from "../src/sysproxy.js";
+import { createSysProxy, parseRegQuery, writtenFor, writtenForPac, NO_PROXY, BYPASS } from "../src/sysproxy.js";
 
 function fakeRegistry(initial = {}) {
   const store = new Map(Object.entries({ ProxyEnable: 0, ...initial }));
@@ -179,11 +179,56 @@ test("atomicity: backup file is complete valid JSON with no tmp residue", async 
   assert.equal(data.written.ProxyOverride, BYPASS);
 });
 
-test("parseRegQuery: DWORD hex canonicalizes; SZ passes through; absent is null", () => {
-  const sample = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n    ProxyEnable    REG_DWORD    0x1\r\n";
+test("parseRegQuery: DWORD hex canonicalizes; SZ passes through; absent is null", () => {  const sample = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n    ProxyEnable    REG_DWORD    0x1\r\n";
   assert.equal(parseRegQuery(sample, "ProxyEnable"), 1);
   assert.equal(parseRegQuery(sample.replace("0x1", "0x0"), "ProxyEnable"), 0);
   const sz = "    ProxyServer    REG_SZ    127.0.0.1:1080";
   assert.equal(parseRegQuery(sz, "ProxyServer"), "127.0.0.1:1080");
   assert.equal(parseRegQuery("ERROR: The system was unable to find the specified registry key or value.", "ProxyServer"), null);
+});
+
+test("PAC form (M2-4): enable -> restore roundtrip is verbatim, mode switch covered", async () => {
+  const { reg, sp, backupFile } = setup({ ...USER_STATE });
+  const pacUrl = "http://127.0.0.1:18080/proxy.pac";
+  await sp.enablePac(pacUrl);
+  assert.deepEqual(reg.snapshot(), writtenForPac(pacUrl));
+  const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
+  assert.deepEqual(backup.original, USER_STATE);
+  assert.deepEqual(backup.written, writtenForPac(pacUrl));
+  const r = await sp.restore();
+  assert.equal(r.restored, true);
+  assert.deepEqual(reg.snapshot(), USER_STATE); // verbatim — incl. the user's own PAC URL
+});
+
+test("PAC form: exact written state at startup self-heals; PAC partial with our URL degrades", async () => {
+  const pacUrl = "http://127.0.0.1:18080/proxy.pac";
+  const a = setup({ ...USER_STATE });
+  await a.sp.enablePac(pacUrl);
+  const freshA = createSysProxy({ adapter: a.reg, dir: a.dir, log: () => {} });
+  const heal = await freshA.selfHealOnStartup();
+  assert.equal(heal.healed, true);
+  assert.equal(heal.mode, "self-heal");
+  assert.deepEqual(a.reg.snapshot(), USER_STATE);
+
+  const b = setup({ ...USER_STATE });
+  await b.sp.enablePac(pacUrl);
+  await b.reg.set("ProxyEnable", 1); // partial: one key flipped, PAC URL still ours
+  const freshB = createSysProxy({ adapter: b.reg, dir: b.dir, log: () => {} });
+  const deg = await freshB.selfHealOnStartup();
+  assert.equal(deg.mode, "degraded-partial-state");
+  assert.deepEqual(b.reg.snapshot(), { ...NO_PROXY, ProxyEnable: 0 });
+});
+
+test("mode switch mid-session: held backup follows the new written form, original fixed", async () => {
+  const { reg, sp, backupFile } = setup({ ...USER_STATE });
+  await sp.enableGlobal(1080);
+  const pacUrl = "http://127.0.0.1:18081/proxy.pac";
+  await sp.enablePac(pacUrl); // user switched to PAC and reconnected
+  const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
+  assert.deepEqual(backup.original, USER_STATE);
+  assert.deepEqual(backup.written, writtenForPac(pacUrl));
+  assert.deepEqual(reg.snapshot(), writtenForPac(pacUrl));
+  const r = await sp.restore();
+  assert.equal(r.restored, true);
+  assert.deepEqual(reg.snapshot(), USER_STATE);
 });

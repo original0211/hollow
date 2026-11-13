@@ -1,10 +1,12 @@
 # Hollow Windows client
 
 Implements the plan in `../../files/m2/windows-mvp-plan.md` (goal workspace).
-Status: **M2-1 + M2-2 + M2-3 landed** (NP-1114-03 / NP-1114-05 /
-NP-1114-07) — full bridge state machine, the hardened system proxy (iron
+Status: **M2-1 … M2-4 landed** (NP-1114-03 / NP-1114-05 /
+NP-1114-07 / NP-1114-11) — full bridge state machine, the hardened system proxy (iron
 snapshot rule, atomic verified backups, exact-match startup self-heal),
-and config & pairing (below). Electron shell, M1 core reused byte-identical
+config & pairing (below), edge-IP selection with /meta landing
+identification, and the PAC proxy sub-mode (loopback PAC endpoint +
+sysproxy PAC form under the same snapshot/restore discipline). Electron shell, M1 core reused byte-identical
 via a vendored copy (integrity proven by `tools/verify-vendor.mjs` on every
 check run).
 

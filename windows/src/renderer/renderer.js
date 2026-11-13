@@ -30,7 +30,11 @@ async function refresh() {
   const s = await window.hollow.getState();
   snapshot = { ...snapshot, ...s };
   if (Array.isArray(s.logs)) { logEl.textContent = ""; s.logs.forEach(appendLog); }
-  if (s.settings) $("worker-url").value = s.settings.workerUrl || "";
+  if (s.settings) {
+    $("worker-url").value = s.settings.workerUrl || "";
+    $("proxy-mode").value = s.settings.proxyMode || "off";
+    $("direct-hosts").value = (s.settings.directHosts || []).join("\n");
+  }
   if (s.psk) {
     $("psk-status").textContent = s.psk.state === "corrupt"
       ? "⚠ PSK 文件已损坏——应用不会自动重建；请重新导入配置或删除 psk.bin 后重启"
@@ -100,9 +104,67 @@ $("btn-qr").addEventListener("click", async () => {
 $("btn-connect").addEventListener("click", async () => { try { await window.hollow.connect(); } catch (e) { appendLog("connect error: " + e.message); } refresh(); });
 $("btn-disconnect").addEventListener("click", async () => { try { await window.hollow.disconnect(); } catch (e) { appendLog("disconnect error: " + e.message); } refresh(); });
 $("btn-save").addEventListener("click", async () => {
-  const r = await window.hollow.saveSettings({ workerUrl: $("worker-url").value.trim() });
-  appendLog("settings saved: " + r.workerUrl);
+  const r = await window.hollow.saveSettings({
+    workerUrl: $("worker-url").value.trim(),
+    proxyMode: $("proxy-mode").value,
+    directHosts: $("direct-hosts").value.split("\n"),
+  });
+  appendLog("settings saved: " + r.workerUrl + " / proxy " + r.proxyMode);
 });
+// ---- edge selection (M2-4) ----
+let edgeState = { edges: [], results: {}, edgeMode: "default", preferredEdgeIp: null };
+function renderEdges() {
+  const list = $("edge-list");
+  list.textContent = "";
+  for (const e of edgeState.edges) {
+    const r = edgeState.results[e.ip];
+    const row = document.createElement("div");
+    const label = document.createElement("span");
+    label.textContent = `${e.ip} — ${r ? (r.ok ? `${r.colo || "?"} / ${r.country || "?"} · ${r.medianMs} ms · ${String(r.at).slice(0, 16).replace("T", " ")}` : "不可用（" + (r.error || "失败") + "）") : "未测速"}` + (edgeState.preferredEdgeIp === e.ip ? " · 已指定" : "");
+    const btn = document.createElement("button");
+    btn.textContent = "指定";
+    btn.addEventListener("click", async () => {
+      await window.hollow.setEdgeSelection({ mode: "manual", ip: e.ip });
+      edgeState.edgeMode = "manual"; edgeState.preferredEdgeIp = e.ip;
+      syncEdgeRadios(); renderEdges();
+    });
+    row.appendChild(label); row.appendChild(btn);
+    list.appendChild(row);
+  }
+  $("edge-status").textContent = edgeState.edges.length ? "" : "名单为空";
+}
+function syncEdgeRadios() {
+  document.querySelectorAll("input[name='edge-mode']").forEach((el) => { el.checked = el.value === edgeState.edgeMode; });
+}
+document.querySelectorAll("input[name='edge-mode']").forEach((el) => {
+  el.addEventListener("change", async () => {
+    await window.hollow.setEdgeSelection({ mode: el.value });
+    edgeState.edgeMode = el.value;
+    renderEdges();
+  });
+});
+$("btn-measure").addEventListener("click", async () => {
+  $("edge-status").textContent = "测速中（每候选 3 次握手，约需 1–3 分钟）…";
+  const r = await window.hollow.measureEdges();
+  if (r.ok) { edgeState.results = r.results; $("edge-status").textContent = "测速完成"; }
+  else $("edge-status").textContent = "测速失败：" + (r.error || "");
+  renderEdges();
+});
+$("btn-refresh-edges").addEventListener("click", async () => {
+  const r = await window.hollow.refreshEdges();
+  if (r.edges) edgeState.edges = r.edges;
+  $("edge-status").textContent = r.ok ? "名单已从服务器刷新" : "刷新失败，已用内置名单：" + (r.error || "");
+  renderEdges();
+});
+window.hollow.onEdgeProgress(({ ip, result }) => { edgeState.results[ip] = result; renderEdges(); });
+window.hollow.onMeta((m) => {
+  $("landing").textContent = `落地：${m.colo || "?"} / ${m.country || "?"}${m.edgeIp ? "（经优选 IP " + m.edgeIp + "）" : "（默认路由）"}`;
+});
+(async () => {
+  const s = await window.hollow.getEdges();
+  edgeState = { ...edgeState, ...s };
+  syncEdgeRadios(); renderEdges();
+})();
 window.hollow.onLog(appendLog);
 window.hollow.onEvent((ev) => {
   if (ev.type === "state") { snapshot.state = ev.state; snapshot.detail = ev.detail || ""; if (ev.state !== "connected") snapshot.connectedSince = null; refresh(); }

@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 
 export const CLIENT_UA = "HollowClient/0.1"; // §2-2: custom, no proxy/vpn/tunnel words
 
-export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null } = {}) {
+export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null, edgeIp = null } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
     if (url.protocol !== "wss:" && url.protocol !== "ws:") {
@@ -18,10 +18,15 @@ export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null
     const key = crypto.randomBytes(16).toString("base64");
     const lib = url.protocol === "wss:" ? https : http;
     const req = lib.request({
-      hostname: url.hostname,
+      // Edge-IP selection (M2-4): the TCP/TLS connection goes to the chosen
+      // anycast IP, while SNI, the Host header and certificate verification
+      // stay on the URL hostname — the edge cannot tell it was picked by IP.
+      hostname: edgeIp || url.hostname,
+      servername: url.hostname,
       port: url.port || (url.protocol === "wss:" ? 443 : 80),
       path: url.pathname + url.search,
       headers: {
+        ...(edgeIp ? { Host: url.host } : {}),
         Connection: "Upgrade",
         Upgrade: "websocket",
         "Sec-WebSocket-Key": key,

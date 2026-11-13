@@ -9,6 +9,24 @@ import { connect } from "cloudflare:sockets";
 // the unauthenticated response surface and must be logged per spec §10.
 const STATIC_PAGE = "<!doctype html><html><head><title>ok</title></head><body><p>ok</p></body></html>\n";
 
+// NP-1114-11 (M2-4) deliberate exceptions to the static-page surface, kept
+// minimal and read-only, flagged for the M2-5 red-team sweep of server
+// changes: /meta echoes the request's own landing (colo/country) for the
+// client's edge-IP identification; /edges.json serves the curated candidate
+// list so shipped clients can refresh it without an app update.
+const EDGES = [
+  { ip: "104.16.85.20", note: "Cloudflare anycast (104.16/16)" },
+  { ip: "104.17.164.30", note: "Cloudflare anycast (104.17/16)" },
+  { ip: "104.18.12.149", note: "Cloudflare anycast (104.18/16)" },
+  { ip: "104.19.152.10", note: "Cloudflare anycast (104.19/16)" },
+  { ip: "104.20.24.10", note: "Cloudflare anycast (104.20/16)" },
+  { ip: "104.21.56.100", note: "Cloudflare anycast (104.21/16)" },
+  { ip: "104.22.10.10", note: "Cloudflare anycast (104.22/16)" },
+  { ip: "172.64.80.100", note: "Cloudflare anycast (172.64/16)" },
+  { ip: "172.67.74.152", note: "Cloudflare anycast (172.67/16)" },
+  { ip: "104.24.10.20", note: "Cloudflare anycast (104.24/16)" },
+];
+
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -36,6 +54,14 @@ function cfTransport(serverWs) {
 
 export default {
   async fetch(request, env) {
+    const reqUrl = new URL(request.url);
+    if (request.method === "GET" && reqUrl.pathname === "/meta") {
+      const cf = request.cf || {};
+      return Response.json({ colo: cf.colo || null, country: cf.country || null });
+    }
+    if (request.method === "GET" && reqUrl.pathname === "/edges.json") {
+      return Response.json({ version: 1, edges: EDGES });
+    }
     if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
       return new Response(STATIC_PAGE, {
         headers: { "content-type": "text/html; charset=utf-8" },

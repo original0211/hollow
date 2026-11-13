@@ -22,6 +22,7 @@
     <div class="state" id="state">状态：—</div>
     <div class="sub" id="detail"></div>
     <div class="sub" id="stats"></div>
+    <div class="sub" id="landing"></div>
     <button class="primary" id="btn-connect">连接</button>
     <button id="btn-disconnect">断开</button>
   </div>
@@ -38,7 +39,27 @@
     <h2>设置</h2>
     <label>Worker 地址</label>
     <input type="text" id="worker-url" spellcheck="false">
+    <label>系统代理模式</label>
+    <select id="proxy-mode">
+      <option value="off">关闭（仅 SOCKS）</option>
+      <option value="global">全局</option>
+      <option value="pac">PAC 分流</option>
+    </select>
+    <label>PAC 直连域名名单（一行一个，直连不走代理；内网/localhost 恒直连）</label>
+    <textarea id="direct-hosts" rows="3" spellcheck="false"></textarea>
     <button id="btn-save">保存</button>
+  </div>
+  <div class="card">
+    <h2>优选 IP（落地以实测 colo 为准，不承诺国家）</h2>
+    <div>
+      <label><input type="radio" name="edge-mode" value="default"> 跟随默认解析</label>
+      <label><input type="radio" name="edge-mode" value="auto"> 自动最优（按最近测速）</label>
+      <label><input type="radio" name="edge-mode" value="manual"> 手动指定（点列表中的「指定」）</label>
+    </div>
+    <button id="btn-measure">测速全部候选</button>
+    <button id="btn-refresh-edges">从服务器刷新名单</button>
+    <div class="sub" id="edge-status"></div>
+    <div id="edge-list"></div>
   </div>
   <div class="card">
     <h2>导入 / 导出</h2>

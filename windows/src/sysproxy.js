@@ -29,6 +29,10 @@ export const VALUE_NAMES = ["ProxyEnable", "ProxyServer", "ProxyOverride", "Auto
 export const BYPASS = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
 export const NO_PROXY = { ProxyEnable: 0, ProxyServer: null, ProxyOverride: null, AutoConfigURL: null };
 export const writtenFor = (port) => ({ ProxyEnable: 1, ProxyServer: `127.0.0.1:${port}`, ProxyOverride: BYPASS, AutoConfigURL: null });
+// PAC form (M2-4): manual proxy off, AutoConfigURL points at the app's
+// loopback PAC endpoint. The snapshot/self-heal machinery is form-agnostic —
+// it records and restores whichever written state was applied.
+export const writtenForPac = (pacUrl) => ({ ProxyEnable: 0, ProxyServer: null, ProxyOverride: null, AutoConfigURL: pacUrl });
 
 const eq4 = (a, b) => VALUE_NAMES.every((n) => (a?.[n] ?? null) === (b?.[n] ?? null));
 const pick4 = (o) => Object.fromEntries(VALUE_NAMES.map((n) => [n, o?.[n] ?? null]));
@@ -69,27 +73,26 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
     return { ok: mismatches.length === 0, mismatches, current: cur };
   }
 
-  async function enableGlobal(port) {
+  // Shared enable path for both written forms (global / PAC). The held
+  // backup's ORIGINAL never moves; the recorded written state follows what
+  // this session actually applies (RF-06-02: e.g. the port SOCKS bound).
+  async function enableWithWritten(wantWritten) {
     const held = readBackup(dir);
     let written;
     if (held.kind === "ok") {
       log("proxy: backup already held — snapshot kept verbatim (iron rule), enabling with recorded state");
       written = held.data.written;
-      // RF-06-02: the recorded written state must name the port SOCKS
-      // actually bound this time. Only the written port field may move —
-      // the snapshotted original is never touched.
-      const want = writtenFor(port);
-      if (written.ProxyServer !== want.ProxyServer) {
-        written = { ...written, ProxyServer: want.ProxyServer };
+      if (!eq4(written, wantWritten)) {
+        written = wantWritten;
         writeBackupAtomic(dir, { ...held.data, written });
-        log("proxy: held backup written-port updated to the actually bound port (original untouched)");
+        log("proxy: held backup written state updated to this session's form (original untouched)");
       }
     } else if (held.kind === "corrupt") {
       log("proxy: WARNING existing backup unreadable — keeping it untouched; restore will degrade safely");
-      written = writtenFor(port);
+      written = wantWritten;
     } else {
       const original = await readCurrent();
-      written = writtenFor(port);
+      written = wantWritten;
       writeBackupAtomic(dir, { version: 2, takenAt: now(), original, written });
       log("proxy: snapshot saved");
     }
@@ -98,6 +101,8 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
     if (!v.ok) throw new Error(`proxy enable verification failed on: ${v.mismatches.join(",")}`);
     return written;
   }
+  const enableGlobal = (port) => enableWithWritten(writtenFor(port));
+  const enablePac = (pacUrl) => enableWithWritten(writtenForPac(pacUrl));
 
   // Shared restore tail: apply + verify; drop the backup only when verified.
   async function finishRestore(expected, mode) {
@@ -149,7 +154,8 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
     // leave a trace for manual handling (--restore-proxy still works).
     const hasFingerprint =
       (cur.ProxyServer !== null && cur.ProxyServer === written.ProxyServer) ||
-      (cur.ProxyOverride !== null && cur.ProxyOverride === written.ProxyOverride);
+      (cur.ProxyOverride !== null && cur.ProxyOverride === written.ProxyOverride) ||
+      (cur.AutoConfigURL !== null && cur.AutoConfigURL === written.AutoConfigURL); // PAC form (M2-4): our loopback PAC URL is equally distinctive
     if (!hasFingerprint) {
       log("proxy: startup found a FOREIGN proxy state (no Hollow fingerprint) with a backup held — registry left untouched; manual handling advised (--restore-proxy remains available)");
       return { healed: false, mode: "foreign-state" };
@@ -159,7 +165,7 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
     return { healed: r.restored, mode: r.mode, verified: r.verified };
   }
 
-  return { enableGlobal, restore, selfHealOnStartup, readCurrent };
+  return { enableGlobal, enablePac, restore, selfHealOnStartup, readCurrent };
 }
 
 // ---- win32 adapter (reg.exe + PowerShell WinINET refresh) ----
@@ -208,6 +214,11 @@ export async function enableGlobal(port, log) {
   const sp = defaultSysProxy(log);
   if (!sp) throw new Error("system proxy control is Windows-only");
   return sp.enableGlobal(port);
+}
+export async function enablePac(pacUrl, log) {
+  const sp = defaultSysProxy(log);
+  if (!sp) throw new Error("system proxy control is Windows-only");
+  return sp.enablePac(pacUrl);
 }
 export async function restore(log) {
   const sp = defaultSysProxy(log);

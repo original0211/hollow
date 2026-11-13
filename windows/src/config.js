@@ -25,8 +25,13 @@ const DEFAULTS = {
   workerUrl: "wss://newproto-hollow.newproto.workers.dev/",
   keyId: 1,
   socksPort: 1080,
-  proxyMode: "off", // off | global | pac (pac lands in M2-4)
-  preferredEdgeIp: null, // plan §5, M2-4
+  proxyMode: "off", // off | global | pac (M2-4)
+  directHosts: [], // PAC direct list (M2-4)
+  pacPort: 18080, // preferred loopback port for the PAC endpoint (M2-4)
+  edgeMode: "default", // default | auto | manual (M2-4)
+  edgeResults: {}, // last per-IP measurement cache (M2-4)
+  edgeListCache: null, // last /edges.json refresh (M2-4)
+  preferredEdgeIp: null, // plan §5, M2-4 (manual selection)
   exitRegion: null, // plan §7 reserve: read but ignored until the spec supplement lands
 };
 

@@ -18,7 +18,14 @@ contextBridge.exposeInMainWorld("hollow", {
   importCancel: () => ipcRenderer.invoke("hollow:importCancel"),
   exportToFile: (includePsk) => ipcRenderer.invoke("hollow:exportToFile", { includePsk }),
   qrOwnConfig: (includePsk) => ipcRenderer.invoke("hollow:qrOwnConfig", { includePsk }),
+  // edge selection (M2-4)
+  getEdges: () => ipcRenderer.invoke("hollow:getEdges"),
+  refreshEdges: () => ipcRenderer.invoke("hollow:refreshEdges"),
+  measureEdges: () => ipcRenderer.invoke("hollow:measureEdges"),
+  setEdgeSelection: (sel) => ipcRenderer.invoke("hollow:setEdgeSelection", sel),
   onLog: (cb) => ipcRenderer.on("hollow:log", (_e, line) => cb(line)),
   onEvent: (cb) => ipcRenderer.on("hollow:event", (_e, ev) => cb(ev)),
   onImport: (cb) => ipcRenderer.on("hollow:import", (_e, data) => cb(data)),
+  onMeta: (cb) => ipcRenderer.on("hollow:meta", (_e, data) => cb(data)),
+  onEdgeProgress: (cb) => ipcRenderer.on("hollow:edgeProgress", (_e, data) => cb(data)),
 });

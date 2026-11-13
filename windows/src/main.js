@@ -12,6 +12,8 @@ import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
 import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
 import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels } from "./pairing.js";
+import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
+import { buildPac, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -36,7 +38,7 @@ function getBridge() {
       return null;
     }
     bridgeError = null;
-    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log });
+    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp() });
     let restoring = false;
     bridge.onEvent((ev) => {
       // RF-06-03: if the bridge lands in its Error terminal state while the
@@ -46,7 +48,17 @@ function getBridge() {
       if (ev.type === "state" && ev.state === "error" && proxyOn && !restoring) {
         restoring = true;
         log("bridge entered Error terminal state — restoring system proxy");
-        restoreProxyQuietly().finally(() => { restoring = false; });
+        teardownProxy().finally(() => { restoring = false; });
+      }
+      // Landing identification (M2-4): on each fresh Connected, read /meta
+      // through the same edge selection and surface where we landed.
+      if (ev.type === "state" && ev.state === "connected") {
+        fetchMeta(cfg.workerUrl, { edgeIp: bridge ? bridge.edgeIp : null })
+          .then((m) => {
+            log(`landing: colo ${m.colo || "?"} / country ${m.country || "?"}${bridge && bridge.edgeIp ? ` via edge ${bridge.edgeIp}` : " (default route)"}`);
+            if (win && !win.isDestroyed()) win.webContents.send("hollow:meta", { ...m, edgeIp: bridge ? bridge.edgeIp : null });
+          })
+          .catch(() => log("landing identification failed (/meta unreachable) — continuing without it"));
       }
     });
     bridge.onEvent((ev) => {
@@ -87,20 +99,57 @@ async function doConnect() {
   if (!b) return; // PSK error already logged + surfaced via getState
   await b.startSocks(cfg.socksPort).catch((e) => log(`socks start failed: ${e.message}`));
   await b.connect();
-  if (cfg.proxyMode === "global" && process.platform === "win32") {
+  if ((cfg.proxyMode === "global" || cfg.proxyMode === "pac") && process.platform === "win32") {
     // Enable only once traffic can actually flow (M2-2): a proxy pointing at
     // a dead carrier would blackhole the user's browsing.
     const ok = await waitConnected(b);
     if (ok) {
-      try { await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log); proxyOn = true; log(`system proxy enabled (global, 127.0.0.1:${b.socksPort || cfg.socksPort})`); }
-      catch (e) { log(`system proxy enable failed: ${e.message}`); }
+      try {
+        if (cfg.proxyMode === "global") {
+          await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
+          log(`system proxy enabled (global, 127.0.0.1:${b.socksPort || cfg.socksPort})`);
+        } else {
+          await startPac(b);
+          await sysproxy.enablePac(pacServer.url, log);
+          log(`system proxy enabled (PAC, ${pacServer.url})`);
+        }
+        proxyOn = true;
+      } catch (e) { log(`system proxy enable failed: ${e.message}`); }
     } else {
       log("system proxy NOT enabled: carrier did not reach Connected");
     }
   }
 }
-async function doDisconnect() {
+
+// PAC endpoint (M2-4): serves the live PAC (SOCKS port + direct list are
+// read per request, so edits apply without a restart).
+let pacServer = null;
+async function startPac(b) {
+  if (pacServer) return pacServer;
+  pacServer = await startPacServer({
+    preferredPort: cfg.pacPort || 18080,
+    log,
+    getPac: () => buildPac({ socksPort: (bridge && bridge.socksPort) || cfg.socksPort, directHosts: cfg.directHosts || [] }),
+  });
+  return pacServer;
+}
+async function stopPac() {
+  if (pacServer) { const s = pacServer; pacServer = null; await s.close().catch(() => {}); }
+}
+// One teardown for every exit path (disconnect, quit, RF-06-03 error path):
+// stop serving PAC, then give the registry back.
+async function teardownProxy() {
+  await stopPac();
   if (proxyOn) await restoreProxyQuietly();
+}
+function resolveEdgeIp() {
+  if (cfg.edgeMode === "manual") return cfg.preferredEdgeIp || null;
+  if (cfg.edgeMode === "auto") return bestEdge(cfg.edgeResults || {});
+  return null;
+}
+
+async function doDisconnect() {
+  await teardownProxy();
   if (bridge) await bridge.disconnect();
 }
 
@@ -178,21 +227,68 @@ else {
 ipcMain.handle("hollow:getState", () => ({
   ...(bridge ? bridge.snapshot() : { state: bridgeError ? "error" : "disconnected", detail: bridgeError || "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
   logs: logs.slice(-80),
-  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir() },
+  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null },
   psk: pskStatus(),
   pskFileExists: fs.existsSync(path.join(configDir(), "psk.bin")),
 }));
 ipcMain.handle("hollow:connect", async () => { await doConnect(); return bridge.snapshot(); });
 ipcMain.handle("hollow:disconnect", async () => { await doDisconnect(); return bridge ? bridge.snapshot() : { state: "disconnected" }; });
-ipcMain.handle("hollow:saveSettings", async (_e, { workerUrl }) => {
-  if (typeof workerUrl === "string" && /^wss?:\/\//.test(workerUrl)) {
-    cfg = { ...cfg, workerUrl };
-    saveConfig(cfg);
-    // Apply on the next connect: drop a non-connected bridge so it rebuilds.
-    if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
-    log(`settings saved: workerUrl=${workerUrl}`);
+ipcMain.handle("hollow:saveSettings", async (_e, s) => {
+  if (typeof s.workerUrl === "string" && /^wss?:\/\//.test(s.workerUrl) && s.workerUrl !== cfg.workerUrl) {
+    cfg = { ...cfg, workerUrl: s.workerUrl };
+    log(`settings saved: workerUrl=${s.workerUrl}`);
   }
-  return { workerUrl: cfg.workerUrl };
+  if (["off", "global", "pac"].includes(s.proxyMode)) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
+  if (Array.isArray(s.directHosts)) {
+    cfg = { ...cfg, directHosts: s.directHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean).slice(0, 200) };
+    log(`settings saved: ${cfg.directHosts.length} direct hosts`);
+  }
+  saveConfig(cfg);
+  // Apply on the next connect: drop a non-connected bridge so it rebuilds.
+  if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
+  return { workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts };
+});
+
+// ---- Edge-IP selection (M2-4) ----
+function edgeList() { return cfg.edgeListCache || BUILTIN_EDGES; }
+ipcMain.handle("hollow:getEdges", () => ({
+  edges: edgeList(), results: cfg.edgeResults || {},
+  edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null,
+  activeEdgeIp: bridge ? bridge.edgeIp : resolveEdgeIp(),
+}));
+ipcMain.handle("hollow:refreshEdges", async () => {
+  try {
+    const list = await fetchRemoteEdges(cfg.workerUrl);
+    cfg = { ...cfg, edgeListCache: list };
+    saveConfig(cfg);
+    log(`edge list refreshed from /edges.json (${list.length} candidates)`);
+    return { ok: true, edges: list };
+  } catch (e) {
+    log(`edge list refresh failed (${e.message}) — keeping the built-in list`);
+    return { ok: false, error: e.message, edges: edgeList() };
+  }
+});
+ipcMain.handle("hollow:measureEdges", async () => {
+  let psk;
+  try { psk = loadOrCreatePsk(); } catch (e) { return { ok: false, error: e.message }; }
+  log("edge measurement started (3 handshakes per candidate)");
+  const results = await measureEdges({
+    workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, edges: edgeList(),
+    onProgress: (ip, r) => { if (win && !win.isDestroyed()) win.webContents.send("hollow:edgeProgress", { ip, result: r }); },
+  });
+  cfg = { ...cfg, edgeResults: results };
+  saveConfig(cfg);
+  if (bridge) bridge.setEdgeIp(resolveEdgeIp());
+  log(`edge measurement done: best=${bestEdge(results) || "none"}`);
+  return { ok: true, results };
+});
+ipcMain.handle("hollow:setEdgeSelection", (_e, { mode, ip }) => {
+  if (["default", "auto", "manual"].includes(mode)) cfg = { ...cfg, edgeMode: mode };
+  if (typeof ip === "string" && ip) cfg = { ...cfg, preferredEdgeIp: ip };
+  saveConfig(cfg);
+  if (bridge) bridge.setEdgeIp(resolveEdgeIp());
+  log(`edge selection: mode=${cfg.edgeMode}${cfg.edgeMode === "manual" ? ` ip=${cfg.preferredEdgeIp}` : ""} (applies to the next carrier)`);
+  return { edgeMode: cfg.edgeMode, preferredEdgeIp: cfg.preferredEdgeIp, activeEdgeIp: resolveEdgeIp() };
 });
 
 // ---- Pairing & import (M2-3) ----
