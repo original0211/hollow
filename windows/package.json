@@ -21,6 +21,10 @@
       ]
     }
   },
+  "dependencies": {
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4"
+  },
   "description": "Hollow Windows client (MVP skeleton, NP-1114-01). Electron shell around the M1-verified JS core.",
   "devDependencies": {
     "electron": "^34.0.0",
@@ -30,7 +34,7 @@
   "name": "hollow-windows",
   "private": true,
   "scripts": {
-    "check": "node tools/prepare-vendor.mjs && node tools/verify-vendor.mjs && node --check src/main.js && node --check src/preload.js && node --check src/core-bridge.js && node --check src/sysproxy.js && node --check src/config.js && node --check smoke.mjs && node --test --test-force-exit tests/bridge.test.mjs tests/sysproxy.test.mjs",
+    "check": "node tools/prepare-vendor.mjs && node tools/verify-vendor.mjs && node --check src/main.js && node --check src/preload.js && node --check src/core-bridge.js && node --check src/sysproxy.js && node --check src/config.js && node --check src/pairing.js && node --check smoke.mjs && node --test --test-force-exit tests/bridge.test.mjs tests/sysproxy.test.mjs tests/pairing.test.mjs",
     "dist": "node tools/prepare-vendor.mjs && electron-builder --win portable",
     "prepare-vendor": "node tools/prepare-vendor.mjs",
     "smoke": "node tools/prepare-vendor.mjs && node smoke.mjs",
