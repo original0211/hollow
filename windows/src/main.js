@@ -11,7 +11,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
 import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
-import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels } from "./pairing.js";
+import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl } from "./pairing.js";
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
 import { buildPac, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
@@ -234,9 +234,14 @@ ipcMain.handle("hollow:getState", () => ({
 ipcMain.handle("hollow:connect", async () => { await doConnect(); return bridge.snapshot(); });
 ipcMain.handle("hollow:disconnect", async () => { await doDisconnect(); return bridge ? bridge.snapshot() : { state: "disconnected" }; });
 ipcMain.handle("hollow:saveSettings", async (_e, s) => {
-  if (typeof s.workerUrl === "string" && /^wss?:\/\//.test(s.workerUrl) && s.workerUrl !== cfg.workerUrl) {
-    cfg = { ...cfg, workerUrl: s.workerUrl };
-    log(`settings saved: workerUrl=${s.workerUrl}`);
+  if (typeof s.workerUrl === "string" && s.workerUrl !== cfg.workerUrl) {
+    // Same validation as the import path (NP-1114-12): wss only, ws only for
+    // localhost — the settings page must not be a laxer door than pairing.
+    try {
+      validateWorkerUrl(s.workerUrl);
+      cfg = { ...cfg, workerUrl: s.workerUrl };
+      log(`settings saved: workerUrl=${s.workerUrl}`);
+    } catch (e) { log(`settings workerUrl rejected: ${e.message} (kept ${cfg.workerUrl})`); }
   }
   if (["off", "global", "pac"].includes(s.proxyMode)) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
   if (Array.isArray(s.directHosts)) {
