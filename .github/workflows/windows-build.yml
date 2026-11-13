@@ -19,6 +19,8 @@ jobs:
           node-version: "20"
       - name: Root test suite (M1 core, untouched)
         run: npm test
+      - name: Windows deps (unit tests import the pairing libs)
+        run: npm --prefix windows install --no-audit --no-fund
       - name: Windows skeleton syntax + vendor prep
         run: npm --prefix windows run check
 
