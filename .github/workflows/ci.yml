@@ -16,4 +16,8 @@ jobs:
       - name: Syntax check
         run: node --check worker/src/index.js && node --check cli/src/cli.js
       - name: Smoke tests
-        run: node --test
+        # Via the package script (scoped file list + --test-force-exit).
+        # A bare `node --test` also discovers windows/tests/, whose bridge
+        # suite only terminates under force-exit in its own workflow —
+        # bare discovery hung this job (found NP-1114-23).
+        run: npm test
