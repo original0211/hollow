@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Hollow</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", sans-serif; margin: 20px; color: #1c1c1e; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #6b6b70; font-size: 12px; margin-bottom: 16px; }
+  .card { border: 1px solid #d9d9de; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .state { font-size: 16px; font-weight: 600; }
+  button { padding: 8px 18px; border-radius: 8px; border: 1px solid #b9b9c0; background: #f5f5f7; cursor: pointer; margin-right: 8px; }
+  button.primary { background: #2b7a78; color: #fff; border-color: #2b7a78; }
+  pre { background: #111; color: #c8e6c9; padding: 10px; border-radius: 8px; height: 220px; overflow: auto; font-size: 11px; white-space: pre-wrap; }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>Hollow</h1>
+  <div class="sub">Windows MVP 骨架（NP-1114-01）· 系统代理第一步</div>
+  <div class="card">
+    <div class="state" id="state">状态：—</div>
+    <div id="stats" class="sub"></div>
+    <button class="primary" id="btn-connect">连接</button>
+    <button id="btn-disconnect">断开</button>
+  </div>
+  <div class="card">
+    <div>服务端配对（把 V 写入 Worker secret <span class="mono">PSK_V_HEX</span>）</div>
+    <div class="mono" id="verifier">—</div>
+  </div>
+  <div class="card"><div>活动日志</div><pre id="log"></pre></div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

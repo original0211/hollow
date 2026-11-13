@@ -22,3 +22,6 @@ build/
 # logs & os noise
 *.log
 .DS_Store
+windows/vendor/
+windows/node_modules/
+windows/dist/
