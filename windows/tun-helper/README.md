@@ -45,6 +45,31 @@ knowledge of the Hollow protocol — it moves bytes only.**
 - **Go 1.27** (module directive in `go.mod`); go-winio for the pipe;
   `golang.zx2c4.com/wintun` for the adapter bindings.
 
+## T-2 additions (NP-1114-20)
+
+- `internal/netcfg` — the routing takeover under the Self-Heal Discipline
+  Spec (`../../files/m2/self-heal-discipline-spec.md`, the single source
+  of truth shared with the JS sysproxy layer): snapshot-before-touch with
+  the iron rule, add-before-delete set changes (spec R5), verified
+  restore, four-state startup self-heal, and the route planner (exclusion
+  /32s via the physical gateway BEFORE the /1 takeover routes; restore in
+  the reverse order). The original default route is never modified.
+  Address plan (spec §1.3): adapter IPv4 `10.99.0.1/24`, IPv6 `fd00::1/64`;
+  the pump's in-stack anchors are the same addresses (`HelperAddr`,
+  `HelperAddr6`).
+- IPC verb `set_exclusions` refreshes the candidate/exclusion set while
+  TUN is up; `enable_tun` takes the initial set. Every teardown path
+  (disable / restore / dead-man) restores the takeover.
+- `--restore-tun` is the emergency command (spec §6): run elevated, it
+  unwinds per the held snapshot (or the fingerprint set when corrupt) and
+  verifies by re-reading the table.
+- IPv6 phase-1 fast reject: the pump's stack is dual-family; v6 TCP/UDP
+  is counted (`droppedV6` in status) and silently dropped — never proxied,
+  never answered. v6 takeover routes are in the netcfg plan.
+- The Windows System adapter (route.exe/netsh) is compile-verified only;
+  its real-machine behavior list lives in
+  `../../files/m2/real-machine-tun-t2-addendum.md`.
+
 ## Netstack integration notes (learned the hard way, NP-1114-19)
 
 - The helper NIC must own at least one address (the adapter's own IP):

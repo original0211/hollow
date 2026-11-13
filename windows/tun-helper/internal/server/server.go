@@ -20,6 +20,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"hollow/tun-helper/internal/clock"
 	"hollow/tun-helper/internal/ipc"
+	"hollow/tun-helper/internal/netcfg"
 	"hollow/tun-helper/internal/pump"
 )
 
@@ -35,6 +36,12 @@ type Deps struct {
 	// PumpConfig carries data-plane tuning; SocksAddr is set per enable.
 	PumpConfig pump.Config
 	Logger     *log.Logger
+	// Netcfg, when set, owns the routing takeover discipline (T-2): it is
+	// self-healed at startup, enabled with the candidate/exclusion set on
+	// enable_tun, refreshed by set_exclusions, and restored on every
+	// teardown path (disable / restore / dead-man). Nil disables netcfg
+	// (unit tests of the pure state machine, non-Windows builds).
+	Netcfg *netcfg.Engine
 }
 
 func (d *Deps) withDefaults() {
@@ -63,7 +70,17 @@ type Server struct {
 
 func New(deps Deps) *Server {
 	deps.withDefaults()
-	return &Server{deps: deps, mode: ipc.ModeOff, lastSeen: clock.NowMs()}
+	s := &Server{deps: deps, mode: ipc.ModeOff, lastSeen: clock.NowMs()}
+	if deps.Netcfg != nil {
+		// Startup self-heal (spec R4): a previous run may have died with
+		// the takeover live (kill -9, power loss). Heal before serving.
+		if res, err := deps.Netcfg.SelfHeal(); err != nil {
+			deps.Logger.Printf("netcfg self-heal error: %v", err)
+		} else if res.Mode != "none" {
+			deps.Logger.Printf("netcfg self-heal: mode=%s healed=%v", res.Mode, res.Healed)
+		}
+	}
+	return s
 }
 
 // Mode returns the current arbitrated mode.
@@ -85,6 +102,7 @@ type pumpStats struct {
 	TotalFlows  uint64 `json:"totalFlows"`
 	RefusedFull uint64 `json:"refusedFull"`
 	DroppedUDP  uint64 `json:"droppedUdp"`
+	DroppedV6   uint64 `json:"droppedV6"`
 }
 
 func (s *Server) status() Status {
@@ -93,12 +111,15 @@ func (s *Server) status() Status {
 	st := Status{Mode: s.mode, Elevated: s.deps.Elevated != nil && s.deps.Elevated()}
 	if s.pump != nil {
 		ps := s.pump.Stats()
-		st.Pump = &pumpStats{ActiveFlows: ps.ActiveFlows, TotalFlows: ps.TotalFlows, RefusedFull: ps.RefusedFull, DroppedUDP: ps.DroppedUDP}
+		st.Pump = &pumpStats{ActiveFlows: ps.ActiveFlows, TotalFlows: ps.TotalFlows, RefusedFull: ps.RefusedFull, DroppedUDP: ps.DroppedUDP, DroppedV6: ps.DroppedV6}
 	}
 	return st
 }
 
 // teardownLocked stops the pump and returns to off. Caller holds s.mu.
+// The netcfg takeover is restored on EVERY teardown path (disable,
+// restore command, dead-man) — a restore failure keeps the snapshot for
+// the next self-heal / --restore-tun and is logged, never hidden.
 func (s *Server) teardownLocked(reason string) {
 	if s.pump != nil {
 		s.pump.Close()
@@ -110,6 +131,13 @@ func (s *Server) teardownLocked(reason string) {
 	}
 	if s.mode == ipc.ModeTun {
 		s.mode = ipc.ModeOff
+	}
+	if s.deps.Netcfg != nil {
+		if res, err := s.deps.Netcfg.Restore(); err != nil {
+			s.deps.Logger.Printf("netcfg restore (%s) error: %v", reason, err)
+		} else if res.Mode != "none" {
+			s.deps.Logger.Printf("netcfg restore (%s): mode=%s verified=%v", reason, res.Mode, res.Verified)
+		}
 	}
 	s.deps.Logger.Printf("tun teardown: %s", reason)
 }
@@ -161,8 +189,33 @@ func (s *Server) dispatch(f *ipc.Frame) *ipc.Frame {
 			return fail(fmt.Errorf("start pump: %w", err))
 		}
 		s.pump, s.linkHold = pm, hold
+		if s.deps.Netcfg != nil {
+			if _, err := s.deps.Netcfg.Enable(p.Exclusions); err != nil {
+				// Fail closed: no takeover, no TUN. The netcfg snapshot
+				// (if written) stays for self-heal/--restore-tun.
+				s.pump.Close()
+				s.pump = nil
+				hold.Close()
+				s.linkHold = nil
+				return fail(fmt.Errorf("netcfg takeover: %w", err))
+			}
+		}
 		s.mode = ipc.ModeTun
 		s.deps.Logger.Printf("tun enabled (socks %s)", cfg.SocksAddr)
+	case ipc.VerbSetExclusions:
+		var p ipc.SetExclusionsParams
+		_ = json.Unmarshal(f.Params, &p)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.deps.Netcfg == nil {
+			return fail(fmt.Errorf("netcfg not available in this helper"))
+		}
+		if s.mode != ipc.ModeTun {
+			return fail(fmt.Errorf("set_exclusions requires TUN active"))
+		}
+		if _, err := s.deps.Netcfg.Enable(p.IPs); err != nil {
+			return fail(fmt.Errorf("set_exclusions: %w", err))
+		}
 	case ipc.VerbDisableTun:
 		s.mu.Lock()
 		s.teardownLocked("disable_tun")

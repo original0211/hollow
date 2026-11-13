@@ -17,11 +17,10 @@
 //
 // Value representation: canonical JS values — ProxyEnable: number 0/1,
 // others: string, or null when the registry value is absent.
-import fs from "node:fs";
-import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { configDir } from "./config.js";
+import { readSnapshot, removeSnapshot, writeSnapshotAtomic } from "./snapshot.js";
 
 const run = promisify(execFile);
 export const KEY_PATH = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
@@ -37,22 +36,14 @@ export const writtenForPac = (pacUrl) => ({ ProxyEnable: 0, ProxyServer: null, P
 const eq4 = (a, b) => VALUE_NAMES.every((n) => (a?.[n] ?? null) === (b?.[n] ?? null));
 const pick4 = (o) => Object.fromEntries(VALUE_NAMES.map((n) => [n, o?.[n] ?? null]));
 
-// ---- backup file (atomic) ----
-function backupPath(dir) { return path.join(dir, "proxy-backup.json"); }
-function writeBackupAtomic(dir, data) {
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `proxy-backup.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  fs.renameSync(tmp, backupPath(dir));
-}
+// ---- backup file (shared snapshot layer, self-heal spec §2/§3) ----
+const BACKUP_FILE = "proxy-backup.json";
+function writeBackupAtomic(dir, data) { writeSnapshotAtomic(dir, BACKUP_FILE, data); }
 function readBackup(dir) {
-  const file = backupPath(dir);
-  if (!fs.existsSync(file)) return { kind: "none" };
-  try {
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!data || data.version !== 2 || !data.original || !data.written) return { kind: "corrupt" };
-    return { kind: "ok", data: { ...data, original: pick4(data.original), written: pick4(data.written) } };
-  } catch { return { kind: "corrupt" }; }
+  return readSnapshot(dir, BACKUP_FILE, (data) => {
+    if (!data || data.version !== 2 || !data.original || !data.written) return null;
+    return { ...data, original: pick4(data.original), written: pick4(data.written) };
+  });
 }
 
 // ---- policy core (adapter-injected) ----
@@ -112,7 +103,7 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
       log(`proxy: RESTORE VERIFICATION FAILED (${mode}) on: ${v.mismatches.join(",")} — backup kept for retry`);
       return { restored: false, mode, verified: false, mismatches: v.mismatches };
     }
-    fs.rmSync(backupPath(dir), { force: true });
+    removeSnapshot(dir, BACKUP_FILE);
     log(`proxy: restored (${mode}) and verified`);
     return { restored: true, mode, verified: true };
   }
@@ -143,7 +134,7 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
       return { healed: r.restored, mode: "self-heal", verified: r.verified };
     }
     if (eq4(cur, original)) {
-      fs.rmSync(backupPath(dir), { force: true });
+      removeSnapshot(dir, BACKUP_FILE);
       log("proxy: startup found values already at the original state — stale backup dropped");
       return { healed: false, mode: "already-original" };
     }

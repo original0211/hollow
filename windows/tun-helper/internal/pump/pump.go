@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
 	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
+	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
@@ -38,6 +39,7 @@ type Config struct {
 	MTU         uint32        // default 1280
 	DialTimeout time.Duration // SOCKS connect timeout, default 10s
 	HelperAddr  string        // adapter's own IPv4 (default 10.99.0.1); the NIC needs an
+	HelperAddr6 string        // adapter's own IPv6 (default fd00::1, spec §1.3)
 	// assigned address before promiscuous acquisition will deliver
 	// foreign-destination packets to the transport layer at all.
 }
@@ -57,6 +59,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.HelperAddr == "" {
 		c.HelperAddr = "10.99.0.1"
+	}
+	if c.HelperAddr6 == "" {
+		c.HelperAddr6 = "fd00::1"
 	}
 }
 
@@ -85,6 +90,7 @@ type Stats struct {
 	TotalFlows  uint64
 	RefusedFull uint64
 	DroppedUDP  uint64
+	DroppedV6   uint64 // IPv6 fast-reject counter (notes v2 §2)
 }
 
 // Pump owns the netstack and the flow table.
@@ -98,6 +104,7 @@ type Pump struct {
 	total      uint64
 	refused    uint64
 	droppedUDP uint64
+	droppedV6  uint64
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -108,7 +115,7 @@ type Pump struct {
 func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 	cfg.withDefaults()
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        false,
 	})
@@ -141,15 +148,45 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 	if err := s.AddProtocolAddress(p.nicID, pa, stack.AddressProperties{}); err != nil {
 		return nil, fmt.Errorf("helper address: %v", err)
 	}
-	// A catch-all route so replies find their way back out.
-	s.SetRouteTable([]tcpip.Route{{Destination: headerSubnet(), NIC: p.nicID}})
+	// IPv6 anchor address (spec §1.3): fd00::1 exists so promiscuous
+	// acquisition can deliver v6 packets to the transport handlers below,
+	// where they are counted and dropped (phase-1 fast reject, notes v2
+	// §2). v6 is never proxied in phase 1.
+	var hb6 [16]byte
+	copy(hb6[:], net.ParseIP(p.cfg.HelperAddr6).To16())
+	pa6 := tcpip.ProtocolAddress{
+		Protocol: ipv6.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom16(hb6),
+			PrefixLen: 128,
+		},
+	}
+	if err := s.AddProtocolAddress(p.nicID, pa6, stack.AddressProperties{}); err != nil {
+		return nil, fmt.Errorf("helper address6: %v", err)
+	}
+	// Catch-all routes so replies (v4) find their way back out.
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: headerSubnet(), NIC: p.nicID},
+		{Destination: headerSubnet6(), NIC: p.nicID},
+	})
 	fwd := tcp.NewForwarder(s, 0, 4096, p.handleRequest)
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	isV6 := func(id stack.TransportEndpointID) bool { return len(id.LocalAddress.AsSlice()) == 16 }
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if isV6(id) {
+			atomic.AddUint64(&p.droppedV6, 1)
+			return true // consumed, no answer: fast reject (SYNs time out)
+		}
+		return fwd.HandlePacket(id, pkt)
+	})
 	// UDP phase-1 disposition (notes v2 §5): non-DNS UDP is dropped and
 	// counted; DNS handling arrives with T-3. Registering a counting
 	// handler makes the drop visible instead of silent.
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		atomic.AddUint64(&p.droppedUDP, 1)
+		if isV6(id) {
+			atomic.AddUint64(&p.droppedV6, 1)
+		} else {
+			atomic.AddUint64(&p.droppedUDP, 1)
+		}
 		return true
 	})
 	p.wg.Add(1)
@@ -159,6 +196,11 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 
 func headerSubnet() tcpip.Subnet {
 	sn, _ := tcpip.NewSubnet(tcpip.AddrFrom4([4]byte{0, 0, 0, 0}), tcpip.MaskFrom("\x00\x00\x00\x00"))
+	return sn
+}
+
+func headerSubnet6() tcpip.Subnet {
+	sn, _ := tcpip.NewSubnet(tcpip.AddrFrom16([16]byte{}), tcpip.MaskFrom(string(make([]byte, 16))))
 	return sn
 }
 
@@ -291,7 +333,7 @@ func (p *Pump) sweeper() {
 func (p *Pump) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP)}
+	return Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6)}
 }
 
 // Close tears down all flows and the stack.

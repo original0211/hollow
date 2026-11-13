@@ -32,9 +32,16 @@ export class CoreBridge {
     // takes effect on the NEXT carrier (rotation/reconnect) and never tears
     // down the live one.
     this.edgeIp = edgeIp;
+    // Bearer lock (TUN mode, notes v2 §3 / mandatory change C): while TUN
+    // is up, the bearer may ONLY dial IPs from the pinned candidate set
+    // (candidate set = exclusion set — every member has a /32 host route
+    // around the tunnel). null = unlocked; [] = locked with an empty set,
+    // which forbids dialing entirely (fail-closed: default-resolution
+    // dialing under TUN would loop the bearer into its own tunnel).
+    this.bearerLock = null;
     this.makeTransport = makeTransport || (async () => {
       const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5 randomized keepalive
-      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: this.edgeIp, userAgent: "HollowClient/0.1" });
+      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: this.effectiveEdgeIp(), userAgent: "HollowClient/0.1" });
       return {
         send: (b) => raw.send(b), close: () => raw.close(), closeCarrier: () => raw.close(),
         onMessage: (cb) => raw.onMessage(cb), onClose: (cb) => raw.onClose(cb),
@@ -109,6 +116,9 @@ export class CoreBridge {
     while (this._want) {
       let client = null;
       try {
+        if (this.bearerLock !== null && this.bearerLock.length === 0) {
+          throw new Error("bearer lock is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
+        }
         const transport = await this.makeTransport();
         if (!this._want) { try { transport.close(); } catch { /* ignore */ } break; }
         client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
@@ -200,12 +210,29 @@ export class CoreBridge {
     this.edgeIp = ip || null;
     this.log(ip ? `edge ip selected: ${ip} (applies to the next carrier)` : "edge ip: default resolution");
   }
+  // Engage/release the TUN bearer lock. ips is the pinned candidate set
+  // (already /32-excluded by the helper before this is called — spec R5
+  // sequencing lives with the caller).
+  setBearerLock(ips) {
+    this.bearerLock = ips === null ? null : [...new Set(ips)];
+    this.log(this.bearerLock === null
+      ? "bearer lock released"
+      : `bearer lock engaged: [${this.bearerLock.join(", ")}] (dial ip now ${this.effectiveEdgeIp() ?? "NONE — dialing forbidden"})`);
+  }
+  // The IP the next carrier will actually dial.
+  effectiveEdgeIp() {
+    if (this.bearerLock === null) return this.edgeIp;
+    if (this.bearerLock.length === 0) return null;
+    return this.bearerLock.includes(this.edgeIp) ? this.edgeIp : this.bearerLock[0];
+  }
   snapshot() {
     return {
       state: this.state, detail: this.stateDetail,
       connectedSince: this.connectedSince,
       socksPort: this.socksPort, queuedNow: this.queuedNow,
       edgeIp: this.edgeIp,
+      effectiveEdgeIp: this.effectiveEdgeIp(),
+      bearerLock: this.bearerLock === null ? null : [...this.bearerLock],
       stats: { ...this.stats },
     };
   }
