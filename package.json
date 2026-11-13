@@ -1,1 +1,14 @@
-{"description":"Hollow - new proxy protocol + clients on Cloudflare free tier. Scaffold only.","engines":{"node":">=20"},"name":"hollow","private":true,"scripts":{"check":"node --check worker/src/index.js && node --check cli/src/cli.js","test":"node --test --test-force-exit"},"type":"module","version":"0.0.1"}
+{
+  "description": "Hollow - new proxy protocol + clients on Cloudflare free tier. Scaffold only.",
+  "engines": {
+    "node": ">=20"
+  },
+  "name": "hollow",
+  "private": true,
+  "scripts": {
+    "check": "node --check worker/src/index.js && node --check cli/src/cli.js",
+    "test": "node --test --test-force-exit tests/protocol.test.mjs tests/smoke.test.mjs"
+  },
+  "type": "module",
+  "version": "0.0.1"
+}
