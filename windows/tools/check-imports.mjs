@@ -28,6 +28,29 @@ function exportsOf(file) {
 }
 
 const importRe = /import\s+(?:([A-Za-z_$][\w$]*)\s*,\s*)?(?:\{([^}]*)\})?\s*(?:[A-Za-z_$][\w$]*\s*)?from\s*["'](\.[^"']+)["']/g;
+const nsImportRe = /import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s+from\s*["'](\.[^"']+)["']/g;
+for (const f of fs.readdirSync(srcDir).filter((x) => x.endsWith(".js"))) {
+  const file = path.join(srcDir, f);
+  const src = fs.readFileSync(file, "utf8");
+  // Namespace imports (NP-1114-19, from the NP-1114-18 sweep): every
+  // `ns.member` used in the importing file must be exported by the target.
+  for (const m of src.matchAll(nsImportRe)) {
+    const [, ns, spec] = m;
+    const target = path.resolve(srcDir, spec);
+    if (!fs.existsSync(target)) { console.error(`unresolved import target in ${f}: ${spec}`); failures++; continue; }
+    const exps = exportsOf(target);
+    // Scan member uses with import statements stripped — otherwise the
+    // module path itself ("./sysproxy.js") reads as a member use.
+    const body = src.replace(/import\s[^;]*?from\s*["'][^"']+["'];?/g, "");
+    const useRe = new RegExp(`\\b${ns}\\.([A-Za-z_$][\\w$]*)`, "g");
+    const members = new Set();
+    for (const u of body.matchAll(useRe)) members.add(u[1]);
+    for (const member of members) {
+      checked++;
+      if (!exps.has(member)) { console.error(`missing export: ${f} uses ${ns}.${member} from ${spec}, not exported there`); failures++; }
+    }
+  }
+}
 for (const f of fs.readdirSync(srcDir).filter((x) => x.endsWith(".js"))) {
   const file = path.join(srcDir, f);
   const src = fs.readFileSync(file, "utf8");

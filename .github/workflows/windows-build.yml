@@ -23,6 +23,15 @@ jobs:
         run: npm --prefix windows install --no-audit --no-fund
       - name: Windows skeleton syntax + vendor prep
         run: npm --prefix windows run check
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: TUN helper (NP-1114-19) vet + tests + windows cross-build
+        working-directory: windows/tun-helper
+        run: |
+          go vet ./...
+          go test ./...
+          GOOS=windows go build ./...
 
   build:
     runs-on: windows-latest
@@ -38,9 +47,23 @@ jobs:
       - name: Build portable exe
         working-directory: windows
         run: npm run dist
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Build TUN helper + stage Wintun (pinned)
+        working-directory: windows/tun-helper
+        shell: pwsh
+        run: |
+          go build -o ../dist/hollow-tun-helper.exe ./cmd/hollow-tun-helper
+          Copy-Item third_party/wintun/wintun.dll ../dist/
+          Copy-Item third_party/wintun/LICENSE.txt ../dist/WINTUN-LICENSE.txt
+          ../dist/hollow-tun-helper.exe --check-dll
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: hollow-windows-portable
-          path: windows/dist/*.exe
+          path: |
+            windows/dist/*.exe
+            windows/dist/wintun.dll
+            windows/dist/WINTUN-LICENSE.txt
           if-no-files-found: error
