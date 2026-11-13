@@ -8,10 +8,11 @@
 import { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, dialog, clipboard } from "electron";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
 import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
-import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl } from "./pairing.js";
+import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl, validateHttpPath } from "./pairing.js";
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
 import { buildPac, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
@@ -58,7 +59,8 @@ function getBridge() {
       // Landing identification (M2-4): on each fresh Connected, read /meta
       // through the same edge selection and surface where we landed.
       if (ev.type === "state" && ev.state === "connected") {
-        fetchMeta(cfg.workerUrl, { edgeIp: bridge ? bridge.edgeIp : null })
+        if (!cfg.metaPath) { log("landing identification skipped: meta path not configured (pairing/config channel)"); return; }
+        fetchMeta(cfg.workerUrl, { edgeIp: bridge ? bridge.edgeIp : null, path: cfg.metaPath })
           .then((m) => {
             log(`landing: colo ${m.colo || "?"} / country ${m.country || "?"}${bridge && bridge.edgeIp ? ` via edge ${bridge.edgeIp}` : " (default route)"}`);
             if (win && !win.isDestroyed()) win.webContents.send("hollow:meta", { ...m, edgeIp: bridge ? bridge.edgeIp : null });
@@ -127,13 +129,24 @@ async function doConnect() {
 }
 
 // PAC endpoint (M2-4): serves the live PAC (SOCKS port + direct list are
-// read per request, so edits apply without a restart).
+// read per request, so edits apply without a restart). The URL carries a
+// per-install random segment (H-15-01): a generic loopback /proxy.pac URL
+// would be a weak fingerprint for the proxy self-heal judgement; the random
+// segment makes our written AutoConfigURL installation-specific.
 let pacServer = null;
+function ensurePacSeg() {
+  if (!cfg.pacSeg) {
+    cfg = { ...cfg, pacSeg: crypto.randomBytes(8).toString("hex") };
+    safeSave();
+  }
+  return cfg.pacSeg;
+}
 async function startPac(b) {
   if (pacServer) return pacServer;
   pacServer = await startPacServer({
     preferredPort: cfg.pacPort || 18080,
     log,
+    pathSeg: ensurePacSeg(),
     getPac: () => buildPac({ socksPort: (bridge && bridge.socksPort) || cfg.socksPort, directHosts: cfg.directHosts || [] }),
   });
   return pacServer;
@@ -232,7 +245,7 @@ else {
 ipcMain.handle("hollow:getState", () => ({
   ...(bridge ? bridge.snapshot() : { state: bridgeError ? "error" : "disconnected", detail: bridgeError || "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
   logs: logs.slice(-80),
-  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null },
+  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "" },
   psk: pskStatus(),
   pskFileExists: fs.existsSync(path.join(configDir(), "psk.bin")),
 }));
@@ -253,6 +266,19 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
     cfg = { ...cfg, directHosts: s.directHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean).slice(0, 200) };
     log(`settings saved: ${cfg.directHosts.length} direct hosts`);
   }
+  // Endpoint paths (NP-1114-15): manual entry is the other half of the
+  // config channel (the pairing payload is the first). Values are validated
+  // like payload paths and never echoed to the log.
+  for (const key of ["metaPath", "edgesPath"]) {
+    if (typeof s[key] === "string") {
+      const v = s[key].trim();
+      if (v === "") { cfg = { ...cfg, [key]: null }; log(`settings saved: ${key} cleared`); }
+      else {
+        try { validateHttpPath(v, key); cfg = { ...cfg, [key]: v }; log(`settings saved: ${key} set`); }
+        catch (e) { log(`settings ${key} rejected: ${e.message}`); }
+      }
+    }
+  }
   safeSave();
   // Apply on the next connect: drop a non-connected bridge so it rebuilds.
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
@@ -268,7 +294,7 @@ ipcMain.handle("hollow:getEdges", () => ({
 }));
 ipcMain.handle("hollow:refreshEdges", async () => {
   try {
-    const list = await fetchRemoteEdges(cfg.workerUrl);
+    const list = await fetchRemoteEdges(cfg.workerUrl, { path: cfg.edgesPath });
     cfg = { ...cfg, edgeListCache: list };
     safeSave();
     log(`edge list refreshed from /edges.json (${list.length} candidates)`);
@@ -283,7 +309,7 @@ ipcMain.handle("hollow:measureEdges", async () => {
   try { psk = loadOrCreatePsk(); } catch (e) { return { ok: false, error: e.message }; }
   log("edge measurement started (3 handshakes per candidate)");
   const results = await measureEdges({
-    workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, edges: edgeList(),
+    workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, edges: edgeList(), metaPath: cfg.metaPath,
     onProgress: (ip, r) => { if (win && !win.isDestroyed()) win.webContents.send("hollow:edgeProgress", { ip, result: r }); },
   });
   cfg = { ...cfg, edgeResults: results };
@@ -353,6 +379,10 @@ ipcMain.handle("hollow:importConfirm", async () => {
   const p = pendingImport; pendingImport = null;
   if (p.psk) { writePsk(p.psk); await tightenPskAcl(log); }
   cfg = { ...cfg, workerUrl: p.workerUrl, keyId: p.keyId };
+  // Endpoint paths ride the pairing channel (NP-1114-15): applied when the
+  // payload carries them, values never logged.
+  if (p.metaPath) cfg = { ...cfg, metaPath: p.metaPath };
+  if (p.edgesPath) cfg = { ...cfg, edgesPath: p.edgesPath };
   safeSave();
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
   bridgeError = null;
@@ -363,7 +393,7 @@ ipcMain.handle("hollow:importCancel", () => { pendingImport = null; log("import 
 ipcMain.handle("hollow:exportToFile", async (_e, { includePsk }) => {
   let psk = null;
   if (includePsk) { try { psk = loadPsk(); } catch { return { ok: false, error: "PSK file is corrupt" }; } }
-  const obj = buildExportObject({ workerUrl: cfg.workerUrl, keyId: cfg.keyId, psk });
+  const obj = buildExportObject({ workerUrl: cfg.workerUrl, keyId: cfg.keyId, psk, metaPath: cfg.metaPath, edgesPath: cfg.edgesPath });
   const r = await dialog.showSaveDialog(win, { defaultPath: includePsk ? "hollow-config-with-key.json" : "hollow-config.json", filters: [{ name: "Hollow config", extensions: ["json"] }] });
   if (r.canceled || !r.filePath) return { ok: false, error: "cancelled" };
   fs.writeFileSync(r.filePath, JSON.stringify(obj, null, 2) + "\n");
@@ -373,7 +403,7 @@ ipcMain.handle("hollow:exportToFile", async (_e, { includePsk }) => {
 ipcMain.handle("hollow:qrOwnConfig", async (_e, { includePsk }) => {
   let psk = null;
   if (includePsk) { try { psk = loadPsk(); } catch { return { ok: false, error: "PSK file is corrupt" }; } }
-  const link = buildLink({ workerUrl: cfg.workerUrl, keyId: cfg.keyId, psk });
+  const link = buildLink({ workerUrl: cfg.workerUrl, keyId: cfg.keyId, psk, metaPath: cfg.metaPath, edgesPath: cfg.edgesPath });
   return { ok: true, dataUrl: await qrDataUrl(link) };
 });
 ipcMain.handle("hollow:copyVerifier", () => {

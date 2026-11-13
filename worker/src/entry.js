@@ -9,22 +9,17 @@ import { connect } from "cloudflare:sockets";
 // the unauthenticated response surface and must be logged per spec §10.
 const STATIC_PAGE = "<!doctype html><html><head><title>ok</title></head><body><p>ok</p></body></html>\n";
 
-// NP-1114-11 (M2-4) deliberate exceptions to the static-page surface, kept
-// minimal and read-only, flagged for the M2-5 red-team sweep of server
-// changes: /meta echoes the request's own landing (colo/country) for the
-// client's edge-IP identification; /edges.json serves the curated candidate
-// list so shipped clients can refresh it without an app update.
+// NP-1114-11 added read-only meta + edges endpoints; the M2 red-team sweep
+// (NP-1114-15) tightened that disposition into its final form: both
+// endpoints live at unguessable paths carrying a deployment-random segment
+// held in the META_SEG secret (never in this repo), the edges payload is
+// IPs only, and every other non-Upgrade path still gets exactly the static
+// page — the formal tightening of the frozen §2-4 surface. Clients learn
+// the paths through the pairing/config channel.
 const EDGES = [
-  { ip: "104.16.85.20", note: "Cloudflare anycast (104.16/16)" },
-  { ip: "104.17.164.30", note: "Cloudflare anycast (104.17/16)" },
-  { ip: "104.18.12.149", note: "Cloudflare anycast (104.18/16)" },
-  { ip: "104.19.152.10", note: "Cloudflare anycast (104.19/16)" },
-  { ip: "104.20.24.10", note: "Cloudflare anycast (104.20/16)" },
-  { ip: "104.21.56.100", note: "Cloudflare anycast (104.21/16)" },
-  { ip: "104.22.10.10", note: "Cloudflare anycast (104.22/16)" },
-  { ip: "172.64.80.100", note: "Cloudflare anycast (172.64/16)" },
-  { ip: "172.67.74.152", note: "Cloudflare anycast (172.67/16)" },
-  { ip: "104.24.10.20", note: "Cloudflare anycast (104.24/16)" },
+  "104.16.85.20", "104.17.164.30", "104.18.12.149", "104.19.152.10",
+  "104.20.24.10", "104.21.56.100", "104.22.10.10", "104.24.10.20",
+  "172.64.80.100", "172.67.74.152",
 ];
 
 function hexToBytes(hex) {
@@ -55,12 +50,13 @@ function cfTransport(serverWs) {
 export default {
   async fetch(request, env) {
     const reqUrl = new URL(request.url);
-    if (request.method === "GET" && reqUrl.pathname === "/meta") {
+    const seg = env.META_SEG || null; // NP-1114-15: unguessable-path segment
+    if (seg && request.method === "GET" && reqUrl.pathname === `/${seg}/meta`) {
       const cf = request.cf || {};
       return Response.json({ colo: cf.colo || null, country: cf.country || null });
     }
-    if (request.method === "GET" && reqUrl.pathname === "/edges.json") {
-      return Response.json({ version: 1, edges: EDGES });
+    if (seg && request.method === "GET" && reqUrl.pathname === `/${seg}/edges.json`) {
+      return Response.json({ version: 2, edges: EDGES });
     }
     if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
       return new Response(STATIC_PAGE, {

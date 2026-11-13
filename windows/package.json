@@ -34,7 +34,7 @@
   "name": "hollow-windows",
   "private": true,
   "scripts": {
-    "check": "node tools/prepare-vendor.mjs && node tools/verify-vendor.mjs && node --check src/main.js && node --check src/preload.js && node --check src/core-bridge.js && node --check src/sysproxy.js && node --check src/config.js && node --check src/pairing.js && node --check src/edges.js && node --check src/pac.js && node --check smoke.mjs && node --test --test-force-exit tests/bridge.test.mjs tests/sysproxy.test.mjs tests/pairing.test.mjs tests/edges-pac.test.mjs tests/config.test.mjs",
+    "check": "node tools/prepare-vendor.mjs && node tools/verify-vendor.mjs && node tools/check-imports.mjs && node --check src/main.js && node --check src/preload.js && node --check src/core-bridge.js && node --check src/sysproxy.js && node --check src/config.js && node --check src/pairing.js && node --check src/edges.js && node --check src/pac.js && node --check smoke.mjs && node --test --test-force-exit tests/bridge.test.mjs tests/sysproxy.test.mjs tests/pairing.test.mjs tests/edges-pac.test.mjs tests/config.test.mjs",
     "dist": "node tools/prepare-vendor.mjs && electron-builder --win portable",
     "prepare-vendor": "node tools/prepare-vendor.mjs",
     "smoke": "node tools/prepare-vendor.mjs && node smoke.mjs",

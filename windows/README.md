@@ -23,7 +23,7 @@ Electron shell, M1 core reused byte-identical via a vendored copy
   and your editable direct-host list go DIRECT, everything else via SOCKS.
 - **Edge-IP selection**: curated Cloudflare anycast candidates (refreshable
   from the Worker's `/edges.json`), 3-handshake median RTT measurement,
-  per-IP landing identification via `/meta`, three selection modes
+  per-IP landing per-IP landing identification through the deployment-specific meta endpoint (path learned via pairing or Settings, never shipped in the repo), three selection modes
   (default / auto-best / manual). Labels show the measured landing colo —
   never a promised country.
 - **Pairing** (below): PSK generated locally, only its verifier V is ever

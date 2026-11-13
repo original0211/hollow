@@ -34,6 +34,8 @@ async function refresh() {
     $("worker-url").value = s.settings.workerUrl || "";
     $("proxy-mode").value = s.settings.proxyMode || "off";
     $("direct-hosts").value = (s.settings.directHosts || []).join("\n");
+    $("meta-path").value = s.settings.metaPath || "";
+    $("edges-path").value = s.settings.edgesPath || "";
   }
   if (s.psk) {
     $("psk-status").textContent = s.psk.state === "corrupt"
@@ -108,6 +110,8 @@ $("btn-save").addEventListener("click", async () => {
     workerUrl: $("worker-url").value.trim(),
     proxyMode: $("proxy-mode").value,
     directHosts: $("direct-hosts").value.split("\n"),
+    metaPath: $("meta-path").value,
+    edgesPath: $("edges-path").value,
   });
   appendLog("settings saved: " + r.workerUrl + " / proxy " + r.proxyMode);
 });

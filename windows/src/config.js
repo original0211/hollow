@@ -30,7 +30,10 @@ const DEFAULTS = {
   pacPort: 18080, // preferred loopback port for the PAC endpoint (M2-4)
   edgeMode: "default", // default | auto | manual (M2-4)
   edgeResults: {}, // last per-IP measurement cache (M2-4)
-  edgeListCache: null, // last /edges.json refresh (M2-4)
+  edgeListCache: null, // last edges refresh (M2-4)
+  metaPath: null, // deployment-specific endpoint paths (NP-1114-15), learned
+  edgesPath: null, // via the pairing payload or the settings page — never in the repo
+  pacSeg: null, // per-install random PAC path segment (H-15-01)
   preferredEdgeIp: null, // plan §5, M2-4 (manual selection)
   exitRegion: null, // plan §7 reserve: read but ignored until the spec supplement lands
 };

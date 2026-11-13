@@ -13,6 +13,12 @@ test("parseEdgesJson validates shape and caps entries", () => {
   assert.ok(BUILTIN_EDGES.length >= 8);
 });
 
+test("parseEdgesJson accepts the v2 IP-only payload (NP-1114-15)", () => {
+  const list = parseEdgesJson(JSON.stringify({ version: 2, edges: ["104.16.0.1", "bad-ip", "172.67.0.9"] }));
+  assert.deepEqual(list.map((e) => e.ip), ["104.16.0.1", "172.67.0.9"]);
+  assert.equal(list[0].note, "");
+});
+
 test("httpBaseOf + median", () => {
   assert.equal(httpBaseOf("wss://example.workers.dev/some/path"), "https://example.workers.dev");
   assert.equal(median([9, 1, 5]), 5);
@@ -61,6 +67,17 @@ test("buildPac: private/localhost/user hosts DIRECT, rest via SOCKS5 port", () =
   assert.equal(find("http://example.com/", "example.com"), "DIRECT");
   assert.equal(find("http://printer/", "printer"), "DIRECT");
   assert.equal(find("https://news.site/", "news.site"), "SOCKS5 127.0.0.1:1081");
+});
+
+test("PAC server with pathSeg (H-15-01): seg path serves, bare path 404s", async () => {
+  const srv = await startPacServer({ getPac: () => buildPac({ socksPort: 1080, directHosts: [] }), preferredPort: 18290, pathSeg: "ab12cd34ef56", log: () => {} });
+  try {
+    assert.ok(srv.url.endsWith("/ab12cd34ef56/proxy.pac"));
+    const res = await fetch(srv.url);
+    assert.equal(res.status, 200);
+    const bare = await fetch(`http://127.0.0.1:${srv.port}/proxy.pac`);
+    assert.equal(bare.status, 404);
+  } finally { await srv.close(); }
 });
 
 test("PAC server: serves on loopback with the PAC content type, 404 elsewhere", async () => {

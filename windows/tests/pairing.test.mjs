@@ -97,3 +97,21 @@ test("config: corrupt psk.bin is a hard error — file untouched, no regeneratio
   assert.deepEqual(pskAclArgs("C:\\x\\psk.bin", "alice"), ["C:\\x\\psk.bin", "/inheritance:r", "/grant:r", "alice:F", "/grant:r", "SYSTEM:F"]);
   delete process.env.HOLLOW_HOME;
 });
+
+test("endpoint paths ride the payload (NP-1114-15); preview shows presence only", () => {
+  const seg = "s3cr3t-seg-9f2";
+  const metaPath = `/${seg}/meta`;
+  const edgesPath = `/${seg}/edges.json`;
+  const viaLink = parseLink(buildLink({ workerUrl: URL_OK, psk: PSK, metaPath, edgesPath }));
+  assert.equal(viaLink.metaPath, metaPath);
+  assert.equal(viaLink.edgesPath, edgesPath);
+  const viaFile = parseExportObject(JSON.stringify(buildExportObject({ workerUrl: URL_OK, psk: PSK, metaPath, edgesPath })));
+  assert.equal(viaFile.metaPath, metaPath);
+  const pv = previewOf(viaLink, { currentPskExists: false, verifierOf: verifierHex });
+  assert.equal(pv.hasEndpointPaths, true);
+  assert.ok(!JSON.stringify(pv).includes(seg), "preview must not print the random segment");
+  assert.throws(() => buildLink({ workerUrl: URL_OK, metaPath: "no-slash" }), /malformed/);
+  assert.throws(() => buildLink({ workerUrl: URL_OK, metaPath: "/ok path with space" }), /malformed/);
+  const bare = parseLink(buildLink({ workerUrl: URL_OK }));
+  assert.equal(bare.metaPath, null);
+});

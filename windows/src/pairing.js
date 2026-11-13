@@ -16,7 +16,7 @@ function unb64url(s) {
   return new Uint8Array(Buffer.from(s, "base64url"));
 }
 
-function validateWorkerUrl(u) {
+export function validateWorkerUrl(u) {
   if (typeof u !== "string" || u.length > 512) throw new Error("worker url missing/too long");
   let parsed;
   try { parsed = new URL(u); } catch { throw new Error("worker url not a URL"); }
@@ -24,7 +24,13 @@ function validateWorkerUrl(u) {
   if (parsed.protocol === "ws:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")) return u;
   throw new Error("worker url must be wss:// (ws:// only for localhost)");
 }
-function validateFields({ workerUrl, keyId, psk }) {
+// Deployment endpoint paths (NP-1114-15): a leading slash plus a conservative
+// charset, nothing that could smuggle a host or a query into the request.
+export function validateHttpPath(p, label = "path") {
+  if (typeof p !== "string" || p.length > 200 || !/^\/[A-Za-z0-9\-._~\/]+$/.test(p)) throw new Error(`${label} malformed`);
+  return p;
+}
+function validateFields({ workerUrl, keyId, psk, metaPath = null, edgesPath = null }) {
   const url = validateWorkerUrl(workerUrl);
   const kid = keyId === undefined || keyId === null ? 1 : keyId;
   if (!Number.isInteger(kid) || kid < 0 || kid > 255) throw new Error("keyId out of range");
@@ -33,14 +39,20 @@ function validateFields({ workerUrl, keyId, psk }) {
     pskBytes = psk instanceof Uint8Array ? psk : unb64url(psk);
     if (pskBytes.length !== 32) throw new Error("psk must be 32 bytes");
   }
-  return { workerUrl: url, keyId: kid, psk: pskBytes };
+  return {
+    workerUrl: url, keyId: kid, psk: pskBytes,
+    metaPath: metaPath ? validateHttpPath(metaPath, "metaPath") : null,
+    edgesPath: edgesPath ? validateHttpPath(edgesPath, "edgesPath") : null,
+  };
 }
 
 // ---- link form: hollow://v1?worker=<enc>&keyId=<n>&psk=<b64url, optional>
-export function buildLink({ workerUrl, keyId = 1, psk = null }) {
-  const v = validateFields({ workerUrl, keyId, psk });
+export function buildLink({ workerUrl, keyId = 1, psk = null, metaPath = null, edgesPath = null }) {
+  const v = validateFields({ workerUrl, keyId, psk, metaPath, edgesPath });
   const q = new URLSearchParams({ worker: v.workerUrl, keyId: String(v.keyId) });
   if (v.psk) q.set("psk", b64url(v.psk));
+  if (v.metaPath) q.set("mp", v.metaPath);
+  if (v.edgesPath) q.set("ep", v.edgesPath);
   return `${LINK_PREFIX}?${q.toString()}`;
 }
 export function parseLink(text) {
@@ -51,14 +63,19 @@ export function parseLink(text) {
   const worker = u.searchParams.get("worker");
   const psk = u.searchParams.get("psk");
   const keyId = u.searchParams.get("keyId");
-  return validateFields({ workerUrl: worker, keyId: keyId ? Number(keyId) : 1, psk });
+  return validateFields({
+    workerUrl: worker, keyId: keyId ? Number(keyId) : 1, psk,
+    metaPath: u.searchParams.get("mp"), edgesPath: u.searchParams.get("ep"),
+  });
 }
 
 // ---- file form: .hollow.json ----
-export function buildExportObject({ workerUrl, keyId = 1, psk = null }) {
-  const v = validateFields({ workerUrl, keyId, psk });
+export function buildExportObject({ workerUrl, keyId = 1, psk = null, metaPath = null, edgesPath = null }) {
+  const v = validateFields({ workerUrl, keyId, psk, metaPath, edgesPath });
   const obj = { app: "hollow", version: 1, workerUrl: v.workerUrl, keyId: v.keyId };
   if (v.psk) obj.pskBase64 = Buffer.from(v.psk).toString("base64");
+  if (v.metaPath) obj.metaPath = v.metaPath;
+  if (v.edgesPath) obj.edgesPath = v.edgesPath;
   return obj;
 }
 export function parseExportObject(text) {
@@ -71,7 +88,7 @@ export function parseExportObject(text) {
     if (typeof obj.pskBase64 !== "string" || !/^[A-Za-z0-9+/=]+$/.test(obj.pskBase64)) throw new Error("bad pskBase64");
     psk = new Uint8Array(Buffer.from(obj.pskBase64, "base64"));
   }
-  return validateFields({ workerUrl: obj.workerUrl, keyId: obj.keyId, psk });
+  return validateFields({ workerUrl: obj.workerUrl, keyId: obj.keyId, psk, metaPath: obj.metaPath ?? null, edgesPath: obj.edgesPath ?? null });
 }
 
 // Any import surface feeds through here: link, file, QR text, OS-open link.
@@ -92,6 +109,9 @@ export function previewOf(parsed, { currentPskExists, verifierOf }) {
     hasPsk: !!parsed.psk,
     pskVerifier: parsed.psk ? verifierOf(parsed.psk) : null,
     overwritesPsk: !!(parsed.psk && currentPskExists),
+    // Endpoint paths carry a deployment-random segment (NP-1114-15): the
+    // preview confirms their presence without printing them.
+    hasEndpointPaths: !!(parsed.metaPath || parsed.edgesPath),
   };
 }
 

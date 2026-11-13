@@ -28,7 +28,9 @@ export function parseEdgesJson(text) {
   if (!obj || !Array.isArray(obj.edges)) throw new Error("edges payload malformed");
   const out = [];
   for (const e of obj.edges.slice(0, 64)) {
-    if (e && IPV4.test(e.ip || "")) out.push({ ip: e.ip, note: String(e.note || "").slice(0, 80) });
+    // v2 payload: bare IP strings (NP-1114-15 dropped the note field).
+    const ip = typeof e === "string" ? e : e?.ip;
+    if (ip && IPV4.test(ip)) out.push({ ip, note: typeof e === "object" && e ? String(e.note || "").slice(0, 80) : "" });
   }
   if (!out.length) throw new Error("edges payload empty");
   return out;
@@ -42,15 +44,18 @@ export const median = (xs) => {
   return s[Math.floor(s.length / 2)];
 };
 
-// GET /meta, optionally through a chosen edge IP (SNI/Host stay on the host).
-export function fetchMeta(workerUrl, { edgeIp = null, timeoutMs = 8000 } = {}) {
+// GET the meta endpoint, optionally through a chosen edge IP (SNI/Host stay
+// on the host). The path is deployment-specific (NP-1114-15) and arrives via
+// the pairing/config channel — there is intentionally no default.
+export function fetchMeta(workerUrl, { edgeIp = null, timeoutMs = 8000, path = null } = {}) {
+  if (!path) return Promise.reject(new Error("meta path not configured (pairing/config channel)"));
   return new Promise((resolve, reject) => {
     const u = new URL(workerUrl);
     const req = https.request({
       hostname: edgeIp || u.hostname,
       servername: u.hostname,
       port: u.port || 443,
-      path: "/meta",
+      path,
       headers: edgeIp ? { Host: u.host } : {},
       timeout: timeoutMs,
     }, (res) => {
@@ -65,10 +70,11 @@ export function fetchMeta(workerUrl, { edgeIp = null, timeoutMs = 8000 } = {}) {
     req.end();
   });
 }
-export function fetchRemoteEdges(workerUrl, { timeoutMs = 8000 } = {}) {
+export function fetchRemoteEdges(workerUrl, { timeoutMs = 8000, path = null } = {}) {
+  if (!path) return Promise.reject(new Error("edges path not configured (pairing/config channel)"));
   return new Promise((resolve, reject) => {
     const u = new URL(workerUrl);
-    const req = https.request({ hostname: u.hostname, port: u.port || 443, path: "/edges.json", timeout: timeoutMs }, (res) => {
+    const req = https.request({ hostname: u.hostname, port: u.port || 443, path, timeout: timeoutMs }, (res) => {
       let body = "";
       res.on("data", (d) => { body += d; });
       res.on("end", () => { try { resolve(parseEdgesJson(body)); } catch (e) { reject(e); } });
@@ -94,7 +100,7 @@ async function handshakeOnce(workerUrl, psk, keyId, edgeIp) {
 // Measure every candidate: 3 handshakes (median RTT) + one /meta landing.
 // Failures are recorded per candidate (fail-open at selection time, never
 // thrown as a whole). Deps injectable for tests.
-export async function measureEdges({ workerUrl, psk, keyId = 1, edges, probe = handshakeOnce, meta = fetchMeta, onProgress = null }) {
+export async function measureEdges({ workerUrl, psk, keyId = 1, edges, probe = handshakeOnce, meta = fetchMeta, metaPath = null, onProgress = null }) {
   const results = {};
   for (const { ip } of edges) {
     const samples = [];
@@ -105,7 +111,9 @@ export async function measureEdges({ workerUrl, psk, keyId = 1, edges, probe = h
     }
     let landing = null;
     if (samples.length === 3) {
-      try { landing = await meta(workerUrl, { edgeIp: ip }); } catch { /* landing unknown */ }
+      // fetchMeta itself rejects when no path is configured — landing then
+      // stays unknown (fail-open), exactly like an unreachable endpoint.
+      try { landing = await meta(workerUrl, { edgeIp: ip, path: metaPath }); } catch { /* landing unknown */ }
     }
     results[ip] = {
       ok: samples.length === 3,

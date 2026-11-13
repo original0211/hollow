@@ -28,11 +28,15 @@ ${hostRules}
 
 // Loopback PAC server. getPac() is consulted per request so port/list edits
 // take effect without a restart. Port increments like the SOCKS listener.
-export async function startPacServer({ getPac, preferredPort = 18080, log = () => {} }) {
+// pathSeg (H-15-01): when set, the PAC lives at /<seg>/proxy.pac and the
+// bare /proxy.pac path 404s — the written AutoConfigURL becomes
+// installation-specific instead of a generic fingerprint.
+export async function startPacServer({ getPac, preferredPort = 18080, log = () => {}, pathSeg = null }) {
+  const pacPath = pathSeg ? `/${pathSeg}/proxy.pac` : "/proxy.pac";
   let lastErr = null;
   for (let port = preferredPort; port < preferredPort + 20; port++) {
     const server = http.createServer((req, res) => {
-      if (req.url === "/proxy.pac") {
+      if (req.url === pacPath) {
         res.writeHead(200, { "content-type": "application/x-ns-proxy-autoconfig" });
         res.end(getPac());
       } else {
@@ -47,7 +51,7 @@ export async function startPacServer({ getPac, preferredPort = 18080, log = () =
       log(`pac server on 127.0.0.1:${port}`);
       return {
         port,
-        url: `http://127.0.0.1:${port}/proxy.pac`,
+        url: `http://127.0.0.1:${port}${pacPath}`,
         close: () => new Promise((res) => { try { server.close(() => res()); } catch { res(); } }),
       };
     } catch (e) {

@@ -47,6 +47,10 @@
     </select>
     <label>PAC 直连域名名单（一行一个，直连不走代理；内网/localhost 恒直连）</label>
     <textarea id="direct-hosts" rows="3" spellcheck="false"></textarea>
+    <label>高级 · 元数据端点路径（由部署决定，经配对或在此填写；留空 = 不启用落地识别）</label>
+    <input type="text" id="meta-path" spellcheck="false" placeholder="/…/meta">
+    <label>高级 · 名单端点路径</label>
+    <input type="text" id="edges-path" spellcheck="false" placeholder="/…/edges.json">
     <button id="btn-save">保存</button>
   </div>
   <div class="card">

@@ -189,7 +189,7 @@ test("parseRegQuery: DWORD hex canonicalizes; SZ passes through; absent is null"
 
 test("PAC form (M2-4): enable -> restore roundtrip is verbatim, mode switch covered", async () => {
   const { reg, sp, backupFile } = setup({ ...USER_STATE });
-  const pacUrl = "http://127.0.0.1:18080/proxy.pac";
+  const pacUrl = "http://127.0.0.1:18080/f00ba12c/proxy.pac"; // H-15-01 per-install segment shape
   await sp.enablePac(pacUrl);
   assert.deepEqual(reg.snapshot(), writtenForPac(pacUrl));
   const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
@@ -201,7 +201,7 @@ test("PAC form (M2-4): enable -> restore roundtrip is verbatim, mode switch cove
 });
 
 test("PAC form: exact written state at startup self-heals; PAC partial with our URL degrades", async () => {
-  const pacUrl = "http://127.0.0.1:18080/proxy.pac";
+  const pacUrl = "http://127.0.0.1:18080/f00ba12c/proxy.pac"; // H-15-01 per-install segment shape
   const a = setup({ ...USER_STATE });
   await a.sp.enablePac(pacUrl);
   const freshA = createSysProxy({ adapter: a.reg, dir: a.dir, log: () => {} });
