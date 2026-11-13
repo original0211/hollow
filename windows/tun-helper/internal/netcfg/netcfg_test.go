@@ -22,11 +22,12 @@ type fakeSystem struct {
 	adapterDNS string
 	mutCalls   int
 	failAt     int
+	failAt2    int // second one-shot injection (NP-1114-27: rollback-step failure)
 }
 
 func (f *fakeSystem) gate() error {
 	f.mutCalls++
-	if f.failAt > 0 && f.mutCalls == f.failAt {
+	if (f.failAt > 0 && f.mutCalls == f.failAt) || (f.failAt2 > 0 && f.mutCalls == f.failAt2) {
 		return errors.New("injected failure")
 	}
 	return nil
@@ -673,5 +674,42 @@ func TestEnableFailureRollsBackEverywhere(t *testing.T) {
 	}
 	if len(sys.addrs) != 0 || sys.adapterDNS != "" {
 		t.Fatalf("adapter still shaped after restore: %v %q", sys.addrs, sys.adapterDNS)
+	}
+}
+
+// NP-1114-27 (red-team registry item): a failure INSIDE the rollback
+// itself must surface as ROLLBACK INCOMPLETE with the residue listed
+// item by item — never a clean-looking error over a dirty system —
+// and the backup still stays on disk for the restore paths.
+func TestEnableRollbackFailureIsReportedItemized(t *testing.T) {
+	sys := newFake()
+	// Forward failure at mutating call 8 (the 8000::/1 route add);
+	// rollback then unwinds the 7 applied steps — fail call 10, the
+	// delete of the 128.0.0.0/1 takeover route.
+	sys.failAt = 8
+	sys.failAt2 = 10
+	e, dir := newEngine(t, sys)
+	_, err := e.Enable(testExclusions)
+	if err == nil {
+		t.Fatal("enable unexpectedly succeeded")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "ROLLBACK INCOMPLETE") {
+		t.Fatalf("double fault not reported as incomplete rollback: %v", err)
+	}
+	if !strings.Contains(msg, "route 128.0.0.0/1 still present after rollback") {
+		t.Fatalf("residue not itemized in the report: %v", err)
+	}
+	found := false
+	for _, r := range sys.routes {
+		if r.Dest == "128.0.0.0/1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the 128.0.0.0/1 route to actually remain, routes=%v", sys.routes)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, SnapshotFile)); serr != nil {
+		t.Fatal("backup must be kept after an incomplete rollback")
 	}
 }
