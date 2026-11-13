@@ -1,0 +1,1 @@
+{"description":"newproto (codename) - new proxy protocol + clients on Cloudflare free tier. Scaffold only.","engines":{"node":">=20"},"name":"newproto","private":true,"scripts":{"check":"node --check worker/src/index.js && node --check cli/src/cli.js","test":"node --test"},"type":"module","version":"0.0.1"}

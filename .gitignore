@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# wrangler / cloudflare local state
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# local secrets — never commit (keys are generated locally by the user)
+.env
+.env.*
+*.key
+key*.json
+*.pem
+*.secret
+secrets/
+
+# build output
+dist/
+build/
+
+# logs & os noise
+*.log
+.DS_Store
