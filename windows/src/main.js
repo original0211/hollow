@@ -382,18 +382,28 @@ ipcMain.handle("hollow:testConnection", async () => {
   let psk;
   try { psk = loadOrCreatePsk(); } catch (e) { return { ok: false, error: e.message }; }
   const t0 = Date.now();
+  let transport = null, client = null, timer = null;
   try {
     const { HollowClient } = await import("../vendor/shared/client-core.js");
     const { connectWs } = await import("../vendor/cli/src/ws-client.js");
-    const transport = await connectWs(cfg.workerUrl, { userAgent: "HollowClient/0.1" });
-    const client = new HollowClient({ transport, psk, keyId: cfg.keyId });
+    const work = (async () => {
+      transport = await connectWs(cfg.workerUrl, { userAgent: "HollowClient/0.1" });
+      client = new HollowClient({ transport, psk, keyId: cfg.keyId });
+      await client.handshake();
+    })();
+    work.catch(() => {}); // the race owns the outcome; silence late rejections
     await Promise.race([
-      client.handshake(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("handshake timeout (15s)")), 15000)),
+      work,
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("handshake timeout (15s)")), 15000); }),
     ]);
-    client.close();
     return { ok: true, ms: Date.now() - t0 };
   } catch (e) {
     return { ok: false, error: e.message, ms: Date.now() - t0 };
+  } finally {
+    clearTimeout(timer);
+    // NP-1114-12: close the underlying connection on EVERY path — on timeout
+    // the attempt may still be mid-flight and must not leave a dangling socket.
+    try { client?.close(); } catch { /* ignore */ }
+    try { transport?.close(); } catch { /* ignore */ }
   }
 });

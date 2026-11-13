@@ -58,6 +58,7 @@ test("preview shows worker + verifier, never the PSK (correction 4 surface)", ()
   assert.equal(pv.pskVerifier, verifierHex(PSK));
   const serialized = JSON.stringify(pv);
   assert.ok(!serialized.includes(Buffer.from(PSK).toString("base64url")), "preview must not contain the PSK");
+  assert.ok(!serialized.includes(Buffer.from(PSK).toString("base64")), "preview must not contain the PSK (standard base64, NP-1114-12)");
   assert.ok(!serialized.includes(Buffer.from(PSK).toString("hex")), "preview must not contain the PSK (hex)");
 });
 
