@@ -1,6 +1,7 @@
 package netcfg
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -304,7 +305,8 @@ func TestFingerprintNegative(t *testing.T) {
 func TestSnapshotAtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	snap := &Snapshot{Version: SnapshotVersion, TakenAt: "2026-11-14T00:00:00Z",
-		Written: State{Adapter: AdapterCfg{Name: AdapterName}}}
+		Original: State{Adapter: AdapterCfg{Name: AdapterName}, DefaultGateway: "192.168.1.1", AddedRoutes: []Route{}},
+		Written:  State{Adapter: AdapterCfg{Name: AdapterName}, DefaultGateway: "192.168.1.1", AddedRoutes: []Route{}}}
 	if err := WriteSnapshotAtomic(dir, snap); err != nil {
 		t.Fatal(err)
 	}
@@ -394,5 +396,181 @@ func TestTakeoverAndRestoreOrdering(t *testing.T) {
 	rops := PlanRestore(written)
 	if !rops[0].Route.IsTakeover() || rops[len(rops)-1].Route.IsTakeover() {
 		t.Fatalf("restore must remove /1s first, exclusions last: %v", rops)
+	}
+}
+
+// M-12 (RF-21-01 expansion): dual-family REAL route-print formats. The
+// written routes must be recognized 3/3 (and in the full set) even
+// though read-back spells the interface as an IP (v4) or omits it (v6).
+func TestParseRealFormatsRecognized(t *testing.T) {
+	v4sample := `
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.50     35
+          0.0.0.0        128.0.0.0        10.99.0.1       10.99.0.1     35
+        128.0.0.0        128.0.0.0        10.99.0.1       10.99.0.1     35
+        203.0.113.7  255.255.255.255      192.168.1.1     192.168.1.50     36
+      192.168.1.0    255.255.255.0         On-link      192.168.1.50    291
+===========================================================================
+Persistent Routes:
+  None
+`
+	v6sample := `
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+ 15     45 ::/1                     fd00::1
+ 15     45 8000::/1                 fd00::1
+  1    331 ::1/128                  On-link
+ 15     45 fd00::/64                On-link
+`
+	live := append(ParseRoutePrint(v4sample), ParseRoutePrint6(v6sample)...)
+	desired, err := DesiredRoutes([]string{"203.0.113.7"}, "192.168.1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := State{AddedRoutes: desired}
+	present := OurRoutesPresent(live, written)
+	if len(present) != len(desired) {
+		t.Fatalf("recognized %d of %d written routes: present=%v live=%v", len(present), len(desired), present, live)
+	}
+	if unrec := UnrecognizedRoutes(live, written); len(unrec) != 0 {
+		t.Fatalf("false unrecognized: %v", unrec)
+	}
+	// The red-team yardstick in miniature: three representative routes
+	// (one /32, one v4 /1, one v6 /1) must read back 3/3.
+	trio := State{AddedRoutes: []Route{desired[0], desired[1], desired[3]}}
+	if got := OurRoutesPresent(live, trio); len(got) != 3 {
+		t.Fatalf("trio recognized %d/3", len(got))
+	}
+}
+
+// RF-21-01: a route that comes back in an unaccountable form (same dest,
+// different gateway) makes restore UNVERIFIED — backup kept, never
+// reported as restored.
+func TestRestoreUnrecognizedNotVerified(t *testing.T) {
+	sys := newFake()
+	e, dir := newEngine(t, sys)
+	if _, err := e.Enable(testExclusions); err != nil {
+		t.Fatal(err)
+	}
+	// Mutate one takeover row into an unrecognized form.
+	for i, r := range sys.routes {
+		if r.Dest == "0.0.0.0/1" {
+			sys.routes[i].Gateway = "10.99.0.2"
+		}
+	}
+	res, err := e.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verified || res.Restored || len(res.Unrecognized) != 1 {
+		t.Fatalf("restore = %+v, want unverified with 1 unrecognized", res)
+	}
+	if _, err := os.Stat(filepath.Join(dir, SnapshotFile)); err != nil {
+		t.Fatal("backup must be kept when read-back is unrecognized")
+	}
+}
+
+// RF-21-01: self-heal classifies the same situation as unknown-state and
+// touches nothing.
+func TestSelfHealUnknownState(t *testing.T) {
+	sys := newFake()
+	e, dir := newEngine(t, sys)
+	if _, err := e.Enable(testExclusions); err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range sys.routes {
+		if r.Dest == "8000::/1" {
+			sys.routes[i].Gateway = "fe80::1"
+		}
+	}
+	before := len(sys.routes)
+	res, err := e.SelfHeal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Mode != "unknown-state" {
+		t.Fatalf("mode = %s, want unknown-state", res.Mode)
+	}
+	if len(sys.routes) != before {
+		t.Fatal("unknown state must leave the table untouched")
+	}
+	if _, err := os.Stat(filepath.Join(dir, SnapshotFile)); err != nil {
+		t.Fatal("backup must be kept in unknown state")
+	}
+}
+
+// RF-21-04: structurally incomplete snapshots classify CORRUPT — each
+// missing load-bearing field on its own is enough.
+func TestSnapshotStructuralVariantsCorrupt(t *testing.T) {
+	base := func() Snapshot {
+		return Snapshot{
+			Version: SnapshotVersion, TakenAt: "2026-11-14T00:00:00Z",
+			Original: State{Adapter: AdapterCfg{Name: AdapterName}, DefaultGateway: "192.168.1.1", AddedRoutes: []Route{}},
+			Written:  State{Adapter: AdapterCfg{Name: AdapterName}, DefaultGateway: "192.168.1.1", AddedRoutes: []Route{{Dest: "0.0.0.0/1", Gateway: AdapterIPv4, Interface: AdapterName}}},
+		}
+	}
+	write := func(s Snapshot) string {
+		dir := t.TempDir()
+		raw, _ := json.Marshal(s)
+		if err := os.WriteFile(filepath.Join(dir, SnapshotFile), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	if st, _ := ReadSnapshot(write(base())); st != SnapOK {
+		t.Fatalf("control snapshot classified %v, want SnapOK", st)
+	}
+	variants := map[string]func(*Snapshot){
+		"wrong version":         func(s *Snapshot) { s.Version = 99 },
+		"missing takenAt":       func(s *Snapshot) { s.TakenAt = "" },
+		"original adapter name": func(s *Snapshot) { s.Original.Adapter.Name = "" },
+		"original gateway":      func(s *Snapshot) { s.Original.DefaultGateway = "" },
+		"written adapter name":  func(s *Snapshot) { s.Written.Adapter.Name = "Other" },
+		"written gateway":       func(s *Snapshot) { s.Written.DefaultGateway = "" },
+		"written routes null":   func(s *Snapshot) { s.Written.AddedRoutes = nil },
+		"original routes null":  func(s *Snapshot) { s.Original.AddedRoutes = nil },
+	}
+	for name, mutate := range variants {
+		s := base()
+		mutate(&s)
+		if st, _ := ReadSnapshot(write(s)); st != SnapCorrupt {
+			t.Errorf("variant %q classified %v, want SnapCorrupt", name, st)
+		}
+	}
+}
+
+// RF-21-05: a v6 exclusion is stripped (logged, reason given), the v4
+// remainder enables cleanly, and no /128 ever lands in the written set.
+func TestEnableStripsV6Exclusions(t *testing.T) {
+	sys := newFake()
+	e, _ := newEngine(t, sys)
+	var logs []string
+	e.Log = func(s string) { logs = append(logs, s) }
+	snap, err := e.Enable([]string{"203.0.113.7", "2001:db8::25"})
+	if err != nil {
+		t.Fatalf("enable with a v6 exclusion must not fail wholesale: %v", err)
+	}
+	for _, r := range snap.Written.AddedRoutes {
+		if r.Dest == "2001:db8::25/128" {
+			t.Fatalf("stripped v6 exclusion landed in written set: %+v", r)
+		}
+	}
+	found := false
+	for _, r := range snap.Written.AddedRoutes {
+		if r.Dest == "203.0.113.7/32" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("v4 exclusion lost alongside the v6 strip")
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "2001:db8::25") || !strings.Contains(joined, "RF-21-05") {
+		t.Fatalf("strip not logged with reason; logs: %q", joined)
 	}
 }

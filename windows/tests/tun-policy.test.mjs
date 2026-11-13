@@ -134,3 +134,27 @@ test("watch: helper dead before a sleep (both clocks jump) IS stale after wake",
   c.mono += 8 * 3600 * 1000; // sleep-inclusive mono platform
   assert.equal(w.check(), "stale");
 });
+
+test("RF-21-05: v6 candidates are stripped with reasons; the v4 plan proceeds intact", () => {
+  const plan = planTunEnable({
+    edgeMode: "manual",
+    preferredEdgeIp: "203.0.113.7",
+    candidates: ["203.0.113.7", "2606:4700:4700::1111", "198.51.100.9"],
+    resolvedIps: [],
+  });
+  assert.equal(plan.ok, true);
+  assert.equal(plan.bearerIp, "203.0.113.7");
+  assert.deepEqual([...plan.pins].sort(), ["198.51.100.9", "203.0.113.7"]);
+  assert.equal(plan.stripped.length, 1);
+  assert.equal(plan.stripped[0].ip, "2606:4700:4700::1111");
+  assert.match(plan.stripped[0].reason, /RF-21-05/);
+
+  const refresh = planCandidateRefresh(plan.pins, ["203.0.113.7", "2001:db8::1"], "203.0.113.7");
+  assert.deepEqual(refresh.pinsToSend, ["203.0.113.7"]);
+  assert.equal(refresh.stripped.length, 1);
+  assert.equal(refresh.bearerStillValid, true);
+
+  const v6Bearer = planTunEnable({ edgeMode: "manual", preferredEdgeIp: "2001:db8::9", candidates: ["203.0.113.7"] });
+  assert.equal(v6Bearer.ok, false);
+  assert.equal(v6Bearer.stripped.length, 1);
+});

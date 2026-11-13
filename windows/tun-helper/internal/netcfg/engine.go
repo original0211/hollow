@@ -2,6 +2,7 @@ package netcfg
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -64,6 +65,19 @@ func (e *Engine) currentOur(written State) ([]Route, error) {
 // one ledger (spec/定版稿 §3). Iron rule: a held snapshot's Original is
 // never rewritten; only Written follows the live form.
 func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
+	// RF-21-05 (defense in depth behind the app policy layer): IPv6
+	// exclusions are stripped with a logged reason — never a bare error
+	// that sinks the whole enable, never a /128 the netsh surface cannot
+	// be trusted with this phase.
+	v4only := exclusions[:0:0]
+	for _, ex := range exclusions {
+		if strings.Contains(ex, ":") {
+			e.logf("netcfg: STRIPPED ipv6 exclusion %s — TUN exclusions are IPv4 /32 only this phase (RF-21-05)", ex)
+			continue
+		}
+		v4only = append(v4only, ex)
+	}
+	exclusions = v4only
 	gw, err := e.Sys.DefaultGateway()
 	if err != nil {
 		return nil, fmt.Errorf("default gateway: %w", err)
@@ -82,6 +96,13 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 	switch kind {
 	case SnapOK:
 		e.logf("netcfg: backup already held — snapshot kept verbatim (iron rule)")
+		cur, err := e.Sys.CurrentRoutes()
+		if err != nil {
+			return nil, err
+		}
+		if unrec := UnrecognizedRoutes(cur, held.Written); len(unrec) > 0 {
+			return nil, fmt.Errorf("netcfg: unrecognized route forms share our destinations (%v) — unknown state, refusing to proceed", unrec)
+		}
 		if routeSetsEqual(held.Written.AddedRoutes, desired) {
 			// Ensure the routes are actually live (self-repair of a
 			// half-applied earlier attempt), then done.
@@ -180,6 +201,10 @@ type RestoreResult struct {
 	Mode     string // none | snapshot | degraded-corrupt-backup | degraded-partial-state
 	Verified bool
 	Missing  []string // route dests still present after a failed verify
+	// Unrecognized lists live routes sharing a written destination that
+	// read back in a form we cannot account for (RF-21-01). Non-empty
+	// means UNKNOWN state: verification failed by definition, backup kept.
+	Unrecognized []string
 }
 
 // Restore unwinds the takeover per the held snapshot.
@@ -198,20 +223,33 @@ func (e *Engine) Restore() (RestoreResult, error) {
 
 // finishRestore removes the written set and verifies by re-reading the
 // table; the backup is dropped ONLY on a verified clean table (R3).
+// Verification requires BOTH: none of the written routes remain, AND no
+// unrecognized same-destination forms remain (RF-21-01: unreadable state
+// is unknown state, never "restored").
 func (e *Engine) finishRestore(written State, mode string) (RestoreResult, error) {
 	if err := e.applyOps(PlanRestore(written)); err != nil {
 		return RestoreResult{Mode: mode}, err
 	}
-	present, err := e.currentOur(written)
+	cur, err := e.Sys.CurrentRoutes()
 	if err != nil {
 		return RestoreResult{Mode: mode}, err
+	}
+	present := OurRoutesPresent(cur, written)
+	unrec := UnrecognizedRoutes(cur, written)
+	if len(unrec) > 0 {
+		dests := []string{}
+		for _, r := range unrec {
+			dests = append(dests, r.Dest)
+		}
+		e.logf("netcfg: READ-BACK UNRECOGNIZED (%s) — routes in unknown forms remain: %v — state treated as UNKNOWN, backup kept, NOT verified", mode, dests)
+		return RestoreResult{Restored: false, Mode: mode, Verified: false, Unrecognized: dests}, nil
 	}
 	if len(present) > 0 {
 		missing := []string{}
 		for _, r := range present {
 			missing = append(missing, r.Dest)
 		}
-		e.logf("netcfg: RESTORE VERIFICATION FAILED (%s) — routes still present: %v — backup kept for retry", mode, missing)
+		e.logf("netcfg: RESTORE VERIFICATION FAILED (%s) on: %v — backup kept for retry", mode, missing)
 		return RestoreResult{Restored: false, Mode: mode, Verified: false, Missing: missing}, nil
 	}
 	RemoveSnapshot(e.Dir)
@@ -242,7 +280,7 @@ func (e *Engine) degradedRestore(mode string, written *State) (RestoreResult, er
 // HealResult mirrors sysproxy's startup outcomes (spec R4).
 type HealResult struct {
 	Healed   bool
-	Mode     string // none | self-heal | already-original | degraded-partial-state | foreign-state | degraded-corrupt-backup
+	Mode     string // none | self-heal | already-original | degraded-partial-state | foreign-state | degraded-corrupt-backup | unknown-state
 	Verified bool
 }
 
@@ -260,6 +298,12 @@ func (e *Engine) SelfHeal() (HealResult, error) {
 	cur, err := e.Sys.CurrentRoutes()
 	if err != nil {
 		return HealResult{}, err
+	}
+	// RF-21-01: unrecognized same-destination forms poison every other
+	// judgement — classify UNKNOWN, touch nothing, keep the backup.
+	if unrec := UnrecognizedRoutes(cur, held.Written); len(unrec) > 0 {
+		e.logf("netcfg: startup found UNRECOGNIZED route forms sharing our destinations: %v — state UNKNOWN; table untouched, backup kept (--restore-tun remains available)", unrec)
+		return HealResult{Mode: "unknown-state"}, nil
 	}
 	present := OurRoutesPresent(cur, held.Written)
 	switch {

@@ -45,6 +45,32 @@ type Route struct {
 
 func (r Route) Key() string { return r.Dest + "|" + r.Gateway + "|" + r.Interface }
 
+// CanonicalKey reduces a route to the form used for ALL comparisons
+// (RF-21-01): on a real machine the same route reads back with the
+// interface spelled differently — `route print -4` shows the interface
+// IP, our snapshot records the adapter NAME, `route print -6` has no
+// interface column at all. Comparing raw keys across those spellings
+// makes written state unrecognizable (and "unrecognized" must never be
+// read as "restored"). The canonical form keeps dest + gateway exact
+// (the security-relevant anchors) and classifies the interface:
+// "tun" for anything pointing at our adapter (by name or by either of
+// its addresses), "phys" for everything else (the recorded form leaves
+// it empty; read-back shows the physical NIC's IP).
+func (r Route) CanonicalKey() string {
+	return r.Dest + "|" + r.Gateway + "|" + ifaceClass(r)
+}
+
+func ifaceClass(r Route) string {
+	if r.Interface == AdapterName || r.Gateway == AdapterIPv4 || r.Gateway == AdapterIPv6 ||
+		r.Interface == AdapterIPv4 || r.Interface == AdapterIPv6 {
+		return "tun"
+	}
+	return "phys"
+}
+
+// SameRoute compares two routes in canonical form.
+func SameRoute(a, b Route) bool { return a.CanonicalKey() == b.CanonicalKey() }
+
 func (r Route) IsTakeover() bool {
 	for _, p := range append(append([]string{}, TakeoverV4...), TakeoverV6...) {
 		if r.Dest == p {
@@ -211,7 +237,7 @@ func exclusionSet(ips []string, gw string) ([]Route, error) {
 
 func containsRoute(rs []Route, want Route) bool {
 	for _, r := range rs {
-		if r.Key() == want.Key() {
+		if SameRoute(r, want) {
 			return true
 		}
 	}
@@ -233,7 +259,7 @@ func HasFingerprint(current []Route) bool {
 }
 
 // OurRoutesPresent filters the live table down to routes that belong to
-// the snapshot's written set (exact key match).
+// the snapshot's written set (canonical-form match, RF-21-01).
 func OurRoutesPresent(current []Route, written State) []Route {
 	out := []Route{}
 	for _, r := range written.AddedRoutes {
@@ -242,6 +268,54 @@ func OurRoutesPresent(current []Route, written State) []Route {
 		}
 	}
 	return out
+}
+
+// UnrecognizedRoutes returns live routes that look like OUR written
+// routes read back in a form we cannot account for (RF-21-01): same
+// destination as a written route, pointing at our adapter by some
+// spelling (our addresses as gateway/interface, the adapter name, or a
+// link-local gateway — netsh may rewrite a v6 next-hop to the adapter's
+// link-local), yet not canonically matching. A foreign route that merely
+// shares a destination via a foreign gateway is NOT unrecognized — it is
+// simply not ours. Callers must treat a non-empty result as UNKNOWN
+// state: never as "restored", never as grounds to drop the backup.
+func UnrecognizedRoutes(current []Route, written State) []Route {
+	out := []Route{}
+	for _, live := range current {
+		sharesDest := false
+		for _, w := range written.AddedRoutes {
+			if live.Dest == w.Dest {
+				sharesDest = true
+				break
+			}
+		}
+		if sharesDest && pointsAtUs(live) && !routeInSet(live, written.AddedRoutes) {
+			out = append(out, live)
+		}
+	}
+	return out
+}
+
+// pointsAtUs reports whether a route's next hop/interface is attributable
+// to our adapter in any spelling.
+func pointsAtUs(r Route) bool {
+	if r.Gateway == AdapterIPv4 || r.Gateway == AdapterIPv6 ||
+		r.Interface == AdapterName || r.Interface == AdapterIPv4 || r.Interface == AdapterIPv6 {
+		return true
+	}
+	if a, err := netip.ParseAddr(r.Gateway); err == nil && a.IsLinkLocalUnicast() {
+		return true
+	}
+	return false
+}
+
+func routeInSet(r Route, set []Route) bool {
+	for _, w := range set {
+		if SameRoute(r, w) {
+			return true
+		}
+	}
+	return false
 }
 
 func routeSetsEqual(a, b []Route) bool {

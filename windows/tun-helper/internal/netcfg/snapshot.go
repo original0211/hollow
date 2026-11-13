@@ -49,7 +49,14 @@ func ReadSnapshot(dir string) (SnapKind, *Snapshot) {
 	if err := json.Unmarshal(raw, &snap); err != nil {
 		return SnapCorrupt, nil
 	}
-	if snap.Version != SnapshotVersion || snap.Written.Adapter.Name == "" {
+	// Structural completeness (spec §2, RF-21-04): a snapshot missing any
+	// load-bearing field is CORRUPT, not "a bit empty" — acting on a
+	// truncated state that was never fully written is how backups get
+	// destroyed on partial information.
+	if snap.Version != SnapshotVersion || snap.TakenAt == "" ||
+		snap.Original.Adapter.Name != AdapterName || snap.Original.DefaultGateway == "" ||
+		snap.Written.Adapter.Name != AdapterName || snap.Written.DefaultGateway == "" ||
+		snap.Written.AddedRoutes == nil || snap.Original.AddedRoutes == nil {
 		return SnapCorrupt, nil
 	}
 	return SnapOK, &snap
