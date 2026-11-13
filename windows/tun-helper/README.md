@@ -70,6 +70,24 @@ knowledge of the Hollow protocol — it moves bytes only.**
   its real-machine behavior list lives in
   `../../files/m2/real-machine-tun-t2-addendum.md`.
 
+## T-3 additions (NP-1114-22)
+
+- `internal/dns` — the tunnelled resolver (notes v2 §4, mandatory change
+  E): queries arriving at the adapter's resolver address (10.99.0.1:53)
+  are forwarded as DNS-over-TCP to `ResolverAddr` (default 1.1.1.1:53)
+  through the app's SOCKS — i.e. inside the Hollow tunnel, resolved at
+  the exit. ONE persistent upstream connection, multiplexed by message
+  ID (collisions rewritten and mapped back); per-query timeout 5s →
+  SERVFAIL, no retries; every failure path ends in SERVFAIL — the
+  resolver's only dialer is SOCKS, so falling back to a physical DNS is
+  impossible by construction. Carrier rotation breaks the stream;
+  in-flight queries SERVFAIL and the next query redials. Query contents
+  are never logged; the status surface carries dnsQueries / dnsResolved /
+  dnsServfail / dnsConns counters (dnsConns is the reuse proof).
+- netcfg's Written adapter config now carries the DNS field
+  (`10.99.0.1`); the netsh assignment itself is T-4 adapter wiring, with
+  the real-machine checks in `../../files/m2/real-machine-tun-t3-addendum.md`.
+
 ## Netstack integration notes (learned the hard way, NP-1114-19)
 
 - The helper NIC must own at least one address (the adapter's own IP):

@@ -72,7 +72,11 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	adapter := AdapterCfg{Name: AdapterName, IPv4: AdapterIPv4PF, IPv6: AdapterIPv6PF, DNS: []string{}}
+	// DNS field (T-3): the adapter's resolver is the helper's own address —
+	// queries land in the pump and leave through the tunnel. The field is
+	// part of Written; original keeps whatever the adapter had (empty in
+	// phase 1: we never touch the physical adapters' DNS, spec §1.2).
+	adapter := AdapterCfg{Name: AdapterName, IPv4: AdapterIPv4PF, IPv6: AdapterIPv6PF, DNS: []string{AdapterIPv4}}
 
 	kind, held := ReadSnapshot(e.Dir)
 	switch kind {

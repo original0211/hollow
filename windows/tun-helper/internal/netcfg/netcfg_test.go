@@ -80,6 +80,14 @@ func TestRoundtripVerbatim(t *testing.T) {
 	if snap.Original.DefaultGateway != "192.168.1.1" || len(snap.Original.AddedRoutes) != 0 {
 		t.Fatalf("original polluted: %+v", snap.Original)
 	}
+	// T-3: the written adapter config carries the resolver address; the
+	// original side must NOT (we never rewrote the user's DNS).
+	if len(snap.Written.Adapter.DNS) != 1 || snap.Written.Adapter.DNS[0] != AdapterIPv4 {
+		t.Fatalf("written DNS = %v, want [%s]", snap.Written.Adapter.DNS, AdapterIPv4)
+	}
+	if len(snap.Original.Adapter.DNS) != 0 {
+		t.Fatalf("original DNS polluted: %v", snap.Original.Adapter.DNS)
+	}
 	res, err := e.Restore()
 	if err != nil || !res.Restored || !res.Verified || res.Mode != "snapshot" {
 		t.Fatalf("restore = %+v, %v", res, err)

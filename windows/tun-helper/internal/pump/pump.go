@@ -29,6 +29,8 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
 	"github.com/sagernet/gvisor/pkg/waiter"
+
+	"hollow/tun-helper/internal/dns"
 )
 
 // Config tunes the pump. Zero values get the production defaults.
@@ -42,6 +44,8 @@ type Config struct {
 	HelperAddr6 string        // adapter's own IPv6 (default fd00::1, spec §1.3)
 	// assigned address before promiscuous acquisition will deliver
 	// foreign-destination packets to the transport layer at all.
+	ResolverAddr string        // DNS upstream reached through the tunnel (default 1.1.1.1:53)
+	DNSTimeout   time.Duration // per-query DNS timeout (default 5s, notes v2 §4)
 }
 
 func (c *Config) withDefaults() {
@@ -62,6 +66,12 @@ func (c *Config) withDefaults() {
 	}
 	if c.HelperAddr6 == "" {
 		c.HelperAddr6 = "fd00::1"
+	}
+	if c.ResolverAddr == "" {
+		c.ResolverAddr = "1.1.1.1:53"
+	}
+	if c.DNSTimeout <= 0 {
+		c.DNSTimeout = 5 * time.Second
 	}
 }
 
@@ -91,6 +101,10 @@ type Stats struct {
 	RefusedFull uint64
 	DroppedUDP  uint64
 	DroppedV6   uint64 // IPv6 fast-reject counter (notes v2 §2)
+	DNSQueries  uint64
+	DNSResolved uint64
+	DNSServfail uint64
+	DNSConns    uint64 // upstream connections ever made (reuse proof, spec §4)
 }
 
 // Pump owns the netstack and the flow table.
@@ -105,6 +119,7 @@ type Pump struct {
 	refused    uint64
 	droppedUDP uint64
 	droppedV6  uint64
+	resolver   *dns.Resolver
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -178,17 +193,13 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 		}
 		return fwd.HandlePacket(id, pkt)
 	})
-	// UDP phase-1 disposition (notes v2 §5): non-DNS UDP is dropped and
-	// counted; DNS handling arrives with T-3. Registering a counting
-	// handler makes the drop visible instead of silent.
-	s.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		if isV6(id) {
-			atomic.AddUint64(&p.droppedV6, 1)
-		} else {
-			atomic.AddUint64(&p.droppedUDP, 1)
-		}
-		return true
-	})
+	// UDP disposition (notes v2 §4/§5): packets to the resolver address
+	// (adapter IP, port 53) become DNS sessions tunnelled through SOCKS;
+	// everything else — and all of IPv6 — is dropped and counted. The DNS
+	// resolver has no path around the tunnel (fail-closed by construction).
+	p.resolver = dns.NewResolver(p.dnsDialer(), cfg.DNSTimeout)
+	udpFwd := udp.NewForwarder(s, p.handleUDP)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 	p.wg.Add(1)
 	go p.sweeper()
 	return p, nil
@@ -202,6 +213,78 @@ func headerSubnet() tcpip.Subnet {
 func headerSubnet6() tcpip.Subnet {
 	sn, _ := tcpip.NewSubnet(tcpip.AddrFrom16([16]byte{}), tcpip.MaskFrom(string(make([]byte, 16))))
 	return sn
+}
+
+// dnsDialer adapts the resolver's upstream dial to SOCKS: the DNS
+// connection itself travels inside the Hollow tunnel.
+func (p *Pump) dnsDialer() dns.DialFunc {
+	return func() (net.Conn, error) {
+		host, portStr, err := net.SplitHostPort(p.cfg.ResolverAddr)
+		if err != nil {
+			return nil, err
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return nil, fmt.Errorf("resolver addr %q is not an IP", p.cfg.ResolverAddr)
+		}
+		var port int
+		if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+			return nil, err
+		}
+		return socks5Connect(p.cfg.SocksAddr, ip, uint16(port), p.cfg.DialTimeout)
+	}
+}
+
+// handleUDP is the UDP forwarder entry: DNS-to-resolver sessions are
+// created; every other datagram is dropped + counted (no endpoint is
+// created for it, which IS the drop).
+func (p *Pump) handleUDP(req *udp.ForwarderRequest) bool {
+	id := req.ID()
+	if len(id.LocalAddress.AsSlice()) == 16 {
+		atomic.AddUint64(&p.droppedV6, 1)
+		return true
+	}
+	if id.LocalPort != 53 || id.LocalAddress != tcpip.AddrFrom4Slice(net.ParseIP(p.cfg.HelperAddr).To4()) {
+		atomic.AddUint64(&p.droppedUDP, 1)
+		return true
+	}
+	var wq waiter.Queue
+	ep, terr := req.CreateEndpoint(&wq)
+	if terr != nil {
+		atomic.AddUint64(&p.droppedUDP, 1)
+		return true
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.serveDNSSession(gonet.NewUDPConn(&wq, ep))
+	}()
+	return true
+}
+
+// serveDNSSession pumps datagrams between one client source and the
+// resolver. Exchanges run concurrently (a slow upstream must not head-of-
+// line block the source); session writes are serialized.
+func (p *Pump) serveDNSSession(conn *gonet.UDPConn) {
+	defer conn.Close()
+	var writeMu sync.Mutex
+	buf := make([]byte, 65535)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			return // idle for 60s or stack closing
+		}
+		query := append([]byte(nil), buf[:n]...)
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			resp := p.resolver.Exchange(query)
+			writeMu.Lock()
+			_, _ = conn.Write(resp)
+			writeMu.Unlock()
+		}()
+	}
 }
 
 // NewChannelPair returns two channel endpoints wired to each other for
@@ -333,11 +416,19 @@ func (p *Pump) sweeper() {
 func (p *Pump) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6)}
+	st := Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6)}
+	if p.resolver != nil {
+		ds := p.resolver.Stats()
+		st.DNSQueries, st.DNSResolved, st.DNSServfail, st.DNSConns = ds.Queries, ds.Resolved, ds.Servfail, ds.UpstreamConns
+	}
+	return st
 }
 
 // Close tears down all flows and the stack.
 func (p *Pump) Close() {
+	if p.resolver != nil {
+		p.resolver.Close()
+	}
 	close(p.stopCh)
 	p.mu.Lock()
 	all := make([]*flow, 0, len(p.flows))

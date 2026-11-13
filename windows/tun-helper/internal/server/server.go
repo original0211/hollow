@@ -103,6 +103,10 @@ type pumpStats struct {
 	RefusedFull uint64 `json:"refusedFull"`
 	DroppedUDP  uint64 `json:"droppedUdp"`
 	DroppedV6   uint64 `json:"droppedV6"`
+	DNSQueries  uint64 `json:"dnsQueries"`
+	DNSResolved uint64 `json:"dnsResolved"`
+	DNSServfail uint64 `json:"dnsServfail"`
+	DNSConns    uint64 `json:"dnsConns"`
 }
 
 func (s *Server) status() Status {
@@ -111,7 +115,7 @@ func (s *Server) status() Status {
 	st := Status{Mode: s.mode, Elevated: s.deps.Elevated != nil && s.deps.Elevated()}
 	if s.pump != nil {
 		ps := s.pump.Stats()
-		st.Pump = &pumpStats{ActiveFlows: ps.ActiveFlows, TotalFlows: ps.TotalFlows, RefusedFull: ps.RefusedFull, DroppedUDP: ps.DroppedUDP, DroppedV6: ps.DroppedV6}
+		st.Pump = &pumpStats{ActiveFlows: ps.ActiveFlows, TotalFlows: ps.TotalFlows, RefusedFull: ps.RefusedFull, DroppedUDP: ps.DroppedUDP, DroppedV6: ps.DroppedV6, DNSQueries: ps.DNSQueries, DNSResolved: ps.DNSResolved, DNSServfail: ps.DNSServfail, DNSConns: ps.DNSConns}
 	}
 	return st
 }
