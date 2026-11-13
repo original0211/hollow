@@ -66,6 +66,17 @@ type Server struct {
 	linkHold io.Closer
 	lastSeen int64 // clock.NowMs() of the last frame from the app
 	seq      uint64
+
+	// Connection generations (RF-21-03①): the dead-man's switch is a
+	// SERVER-level concern, not a per-connection one — when the app dies
+	// the pipe breaks and a per-connection watchdog dies with it, leaving
+	// the takeover up forever. connGen increments per connection;
+	// activeGen is the live connection's generation (0 = none);
+	// connLostAt is when the latest generation disconnected.
+	connGen      uint64
+	activeGen    uint64
+	connLostAt   int64
+	watchdogOnce sync.Once
 }
 
 func New(deps Deps) *Server {
@@ -235,11 +246,53 @@ func (s *Server) dispatch(f *ipc.Frame) *ipc.Frame {
 	return reply
 }
 
+// watchdog is the server-level dead-man's switch (RF-21-03①). While TUN
+// is up it judges liveness two ways: a live connection is judged by its
+// frame freshness; NO connection (the app died, the pipe broke) is
+// judged by the time since the latest generation disconnected — a newer
+// generation connecting inside the threshold cancels the pending
+// teardown by definition (activeGen != 0 switches the basis back).
+func (s *Server) watchdog() {
+	t := time.NewTicker(s.deps.FreshnessThreshold / 4)
+	defer t.Stop()
+	for range t.C {
+		s.mu.Lock()
+		if s.mode == ipc.ModeTun {
+			now := clock.NowMs()
+			basis := s.lastSeen
+			reason := "dead-man: app heartbeat stale"
+			if s.activeGen == 0 {
+				basis = s.connLostAt
+				reason = "dead-man: connection lost and not re-established"
+			}
+			if !clock.Freshness(now, basis, s.deps.FreshnessThreshold.Milliseconds()) {
+				s.teardownLocked(reason)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 // ServeConn runs the protocol over one app connection until it closes:
-// reads requests, writes replies + heartbeats, and runs the dead-man's
-// watchdog while TUN is active.
+// reads requests, writes replies + heartbeats. The dead-man's switch is
+// server-level (see watchdog) so it survives this connection's death.
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer conn.Close()
+	s.watchdogOnce.Do(func() { go s.watchdog() })
+	s.mu.Lock()
+	s.connGen++
+	gen := s.connGen
+	s.activeGen = gen
+	s.lastSeen = clock.NowMs()
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.activeGen == gen {
+			s.activeGen = 0
+			s.connLostAt = clock.NowMs()
+		}
+		s.mu.Unlock()
+	}()
 	var writeMu sync.Mutex
 	write := func(f *ipc.Frame) {
 		writeMu.Lock()
@@ -265,30 +318,6 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 				s.mu.Unlock()
 				yes := true
 				write(&ipc.Frame{Event: "heartbeat", Seq: seq, Uptime: clock.NowMs(), OK: &yes})
-			}
-		}
-	}()
-
-	// Dead-man's watchdog: TUN up + app silent beyond the threshold on the
-	// sleep-excluded clock => tear down without waiting to be told.
-	go func() {
-		t := time.NewTicker(s.deps.FreshnessThreshold / 4)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				s.mu.Lock()
-				stale := s.mode == ipc.ModeTun && !clock.Freshness(clock.NowMs(), s.lastSeen, s.deps.FreshnessThreshold.Milliseconds())
-				if stale {
-					s.teardownLocked("dead-man: app heartbeat stale")
-				}
-				s.mu.Unlock()
-				if stale {
-					yes := true
-					write(&ipc.Frame{Event: "deadman_teardown", OK: &yes})
-				}
 			}
 		}
 	}()

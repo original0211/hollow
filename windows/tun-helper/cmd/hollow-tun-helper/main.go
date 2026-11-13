@@ -27,7 +27,7 @@ import (
 	"hollow/tun-helper/internal/tun"
 )
 
-const helperVersion = "0.3.1 (T-3+RF21)"
+const helperVersion = "0.4.0 (T-4)"
 
 func exeDir() string {
 	exe, err := os.Executable()

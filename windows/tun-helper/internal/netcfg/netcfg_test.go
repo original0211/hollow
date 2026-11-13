@@ -2,6 +2,7 @@ package netcfg
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,20 @@ type fakeSystem struct {
 	dns      map[string][]string
 	dropDels map[string]bool // dests whose DelRoute silently no-ops (M-6)
 	ops      []Op            // recorded mutation order (M-15/M-16)
+	// Adapter shaping state + failure injection (T-4): failAt is the
+	// 1-based index of the mutating call that errors once (-1 disables).
+	addrs      map[string]bool
+	adapterDNS string
+	mutCalls   int
+	failAt     int
+}
+
+func (f *fakeSystem) gate() error {
+	f.mutCalls++
+	if f.failAt > 0 && f.mutCalls == f.failAt {
+		return errors.New("injected failure")
+	}
+	return nil
 }
 
 func newFake() *fakeSystem {
@@ -22,6 +37,8 @@ func newFake() *fakeSystem {
 		gw:       "192.168.1.1",
 		dns:      map[string][]string{"Wi-Fi": {"192.168.1.1"}},
 		dropDels: map[string]bool{},
+		addrs:    map[string]bool{},
+		failAt:   -1,
 	}
 }
 
@@ -32,6 +49,9 @@ func (f *fakeSystem) CurrentRoutes() ([]Route, error) {
 }
 
 func (f *fakeSystem) AddRoute(r Route) error {
+	if err := f.gate(); err != nil {
+		return err
+	}
 	f.ops = append(f.ops, Op{Kind: "add", Route: r})
 	if !containsRoute(f.routes, r) {
 		f.routes = append(f.routes, r)
@@ -40,6 +60,9 @@ func (f *fakeSystem) AddRoute(r Route) error {
 }
 
 func (f *fakeSystem) DelRoute(r Route) error {
+	if err := f.gate(); err != nil {
+		return err
+	}
 	f.ops = append(f.ops, Op{Kind: "del", Route: r})
 	if f.dropDels[r.Dest] {
 		return nil // silently dropped write (M-6)
@@ -56,7 +79,43 @@ func (f *fakeSystem) DelRoute(r Route) error {
 	return nil
 }
 
-func (f *fakeSystem) DefaultGateway() (string, error)           { return f.gw, nil }
+func (f *fakeSystem) DefaultGateway() (string, error) { return f.gw, nil }
+
+func (f *fakeSystem) SetAdapterAddr(cidr string) error {
+	if err := f.gate(); err != nil {
+		return err
+	}
+	f.ops = append(f.ops, Op{Kind: "addr-add", Value: cidr})
+	f.addrs[cidr] = true
+	return nil
+}
+
+func (f *fakeSystem) DelAdapterAddr(cidr string) error {
+	if err := f.gate(); err != nil {
+		return err
+	}
+	f.ops = append(f.ops, Op{Kind: "addr-del", Value: cidr})
+	delete(f.addrs, cidr)
+	return nil
+}
+
+func (f *fakeSystem) SetAdapterDNS(server string) error {
+	if err := f.gate(); err != nil {
+		return err
+	}
+	f.ops = append(f.ops, Op{Kind: "dns-set", Value: server})
+	f.adapterDNS = server
+	return nil
+}
+
+func (f *fakeSystem) ClearAdapterDNS() error {
+	if err := f.gate(); err != nil {
+		return err
+	}
+	f.ops = append(f.ops, Op{Kind: "dns-clear"})
+	f.adapterDNS = ""
+	return nil
+}
 func (f *fakeSystem) PhysicalDNS() (map[string][]string, error) { return f.dns, nil }
 
 func newEngine(t *testing.T, sys *fakeSystem) (*Engine, string) {
@@ -572,5 +631,47 @@ func TestEnableStripsV6Exclusions(t *testing.T) {
 	joined := strings.Join(logs, "\n")
 	if !strings.Contains(joined, "2001:db8::25") || !strings.Contains(joined, "RF-21-05") {
 		t.Fatalf("strip not logged with reason; logs: %q", joined)
+	}
+}
+
+// T-4 hard criterion (NP-1114-25 item 1): if ANY enable step fails, the
+// whole takeover rolls back — table and adapter return to the
+// pre-enable state, the backup stays on disk, an error is reported.
+// Injected at every step position of the fresh-enable plan.
+func TestEnableFailureRollsBackEverywhere(t *testing.T) {
+	// Fresh plan: 2 addr + 5 routes + 1 dns = 8 mutating steps.
+	for failAt := 1; failAt <= 8; failAt++ {
+		sys := newFake()
+		sys.failAt = failAt
+		e, dir := newEngine(t, sys)
+		if _, err := e.Enable(testExclusions); err == nil {
+			t.Fatalf("failAt=%d: enable unexpectedly succeeded", failAt)
+		}
+		if len(sys.routes) != 0 {
+			t.Fatalf("failAt=%d: routes remain after rollback: %v", failAt, sys.routes)
+		}
+		if len(sys.addrs) != 0 || sys.adapterDNS != "" {
+			t.Fatalf("failAt=%d: adapter still shaped: addrs=%v dns=%q", failAt, sys.addrs, sys.adapterDNS)
+		}
+		if _, err := os.Stat(filepath.Join(dir, SnapshotFile)); err != nil {
+			t.Fatalf("failAt=%d: backup must be kept on failed enable", failAt)
+		}
+	}
+	// And the success path leaves the adapter shaped as designed.
+	sys := newFake()
+	e, _ := newEngine(t, sys)
+	if _, err := e.Enable(testExclusions); err != nil {
+		t.Fatal(err)
+	}
+	if !sys.addrs[AdapterIPv4PF] || !sys.addrs[AdapterIPv6PF] || sys.adapterDNS != AdapterIPv4 {
+		t.Fatalf("adapter shaping missing after enable: addrs=%v dns=%q", sys.addrs, sys.adapterDNS)
+	}
+	// Restore unshapes through the same plan (dns-clear + addr-dels last).
+	res, err := e.Restore()
+	if err != nil || !res.Verified {
+		t.Fatalf("restore = %+v, %v", res, err)
+	}
+	if len(sys.addrs) != 0 || sys.adapterDNS != "" {
+		t.Fatalf("adapter still shaped after restore: %v %q", sys.addrs, sys.adapterDNS)
 	}
 }

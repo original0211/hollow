@@ -171,3 +171,58 @@ func TestHeartbeatsFlow(t *testing.T) {
 		}
 	}
 }
+
+// RF-21-03①: the app DIES (pipe breaks, no graceful close). The
+// server-level watchdog must tear TUN down on its own — a
+// per-connection watchdog would have died with the connection.
+func TestDeadManAfterConnectionLoss(t *testing.T) {
+	_, helperEP := pump.NewChannelPair(1280)
+	srv := New(testDeps(helperEP))
+	c := newTestClient(t, srv)
+	if r := c.request(t, ipc.VerbEnableTun, ipc.EnableTunParams{SocksPort: 11080}); !*r.OK {
+		t.Fatalf("enable: %+v", r)
+	}
+	c.conn.Close() // app process death: pipe gone, no more frames ever
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Mode() == ipc.ModeOff {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("TUN survived the app's death — generation watchdog failed")
+}
+
+// RF-21-03①: a NEW generation connecting inside the threshold cancels
+// the pending teardown; when that generation also dies, teardown follows.
+func TestReconnectNewGenerationCancelsTeardown(t *testing.T) {
+	_, helperEP := pump.NewChannelPair(1280)
+	srv := New(testDeps(helperEP))
+	c1 := newTestClient(t, srv)
+	if r := c1.request(t, ipc.VerbEnableTun, ipc.EnableTunParams{SocksPort: 11080}); !*r.OK {
+		t.Fatalf("enable: %+v", r)
+	}
+	c1.conn.Close()
+	// Reconnect well inside the 400ms threshold and stay active.
+	time.Sleep(100 * time.Millisecond)
+	c2 := newTestClient(t, srv)
+	stop := time.Now().Add(900 * time.Millisecond)
+	for time.Now().Before(stop) {
+		if r := c2.request(t, ipc.VerbPing, nil); !*r.OK {
+			t.Fatalf("ping on new generation: %+v", r)
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	if srv.Mode() != ipc.ModeTun {
+		t.Fatal("new generation was torn down despite being alive")
+	}
+	c2.conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Mode() == ipc.ModeOff {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("second generation's death did not tear down")
+}

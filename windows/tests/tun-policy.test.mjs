@@ -50,10 +50,13 @@ test("plan: default-resolution UI choice is disabled under TUN", () => {
 
 // ---- planCandidateRefresh ----
 
-test("refresh: adds before retirements are the caller's concern; bearer validity computed", () => {
+test("refresh: two-phase — union first (old bearer survives), retire only after confirm", () => {
   const r = planCandidateRefresh(["1.1.1.1", "8.8.8.8"], ["8.8.8.8", "9.9.9.9"], "1.1.1.1");
   assert.deepEqual(r.added, ["9.9.9.9"]);
   assert.deepEqual(r.retired, ["1.1.1.1"]);
+  assert.deepEqual([...r.pinsToSend].sort(), ["1.1.1.1", "8.8.8.8", "9.9.9.9"]); // phase 1 keeps the live bearer's /32
+  assert.deepEqual([...r.finalPins].sort(), ["8.8.8.8", "9.9.9.9"]); // phase 2 retires it, post-confirm only
+  assert.deepEqual(r.retiredAfterConfirm, ["1.1.1.1"]);
   assert.equal(r.bearerStillValid, false);
   assert.equal(r.nextBearerIp, "8.8.8.8");
   const r2 = planCandidateRefresh(["1.1.1.1"], ["1.1.1.1", "9.9.9.9"], "1.1.1.1");
@@ -150,7 +153,8 @@ test("RF-21-05: v6 candidates are stripped with reasons; the v4 plan proceeds in
   assert.match(plan.stripped[0].reason, /RF-21-05/);
 
   const refresh = planCandidateRefresh(plan.pins, ["203.0.113.7", "2001:db8::1"], "203.0.113.7");
-  assert.deepEqual(refresh.pinsToSend, ["203.0.113.7"]);
+  assert.deepEqual(refresh.finalPins, ["203.0.113.7"]);
+  assert.ok(refresh.pinsToSend.includes("198.51.100.9")); // phase-1 union keeps it until confirm
   assert.equal(refresh.stripped.length, 1);
   assert.equal(refresh.bearerStillValid, true);
 

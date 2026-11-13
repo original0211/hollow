@@ -40,6 +40,11 @@ func (f *fakeNetcfgSystem) PhysicalDNS() (map[string][]string, error) {
 	return map[string][]string{"Wi-Fi": {"192.168.1.1"}}, nil
 }
 
+func (f *fakeNetcfgSystem) SetAdapterAddr(cidr string) error  { return nil }
+func (f *fakeNetcfgSystem) DelAdapterAddr(cidr string) error  { return nil }
+func (f *fakeNetcfgSystem) SetAdapterDNS(server string) error { return nil }
+func (f *fakeNetcfgSystem) ClearAdapterDNS() error            { return nil }
+
 // T-2 wiring: enable_tun lands the takeover (exclusions + /1s),
 // set_exclusions refreshes the set live, disable_tun unwinds everything.
 func TestNetcfgWiringEnableRefreshDisable(t *testing.T) {

@@ -23,6 +23,17 @@ function render() {
   if (snapshot.connectedSince) parts.push("已连接 " + fmtDuration(Date.now() - snapshot.connectedSince));
   if (snapshot.socksPort) parts.push("SOCKS 127.0.0.1:" + snapshot.socksPort);
   if (snapshot.stats) parts.push(`今日 载体 ${snapshot.stats.carriers} · 流 ${snapshot.stats.streams}`);
+  const tunEl = $("tun-status");
+  if (tunEl) {
+    const tv = snapshot.tun;
+    if (tv && tv.active) {
+      tunEl.style.display = "block";
+      const grace = tv.graceRemainingMs !== null && tv.graceRemainingMs !== undefined ? ` · 重连宽限剩余 ${Math.ceil(tv.graceRemainingMs / 1000)}s` : "";
+      tunEl.textContent = `TUN：助手${tv.helperAlive ? "存活" : "未连接"} · 模式 ${tv.mode} · DNS 查询 ${tv.dns.queries}/解析 ${tv.dns.resolved}/SERVFAIL ${tv.dns.servfail}（连接 ${tv.dns.conns}） · UDP 丢弃 ${tv.droppedUdp}${grace} · ${tv.notices.join(" · ")}`;
+    } else {
+      tunEl.style.display = "none";
+    }
+  }
   $("stats").textContent = parts.join(" · ");
   $("queued-banner").style.display = snapshot.queuedNow > 0 ? "block" : "none";
 }
@@ -35,6 +46,11 @@ async function refresh() {
     $("proxy-mode").value = s.settings.proxyMode || "off";
     $("direct-hosts").value = (s.settings.directHosts || []).join("\n");
     $("meta-path").value = s.settings.metaPath || "";
+    const tunMode = s.settings.proxyMode === "tun";
+    const defRadio = $("edge-mode-default");
+    if (defRadio) defRadio.disabled = tunMode;
+    const note = $("edge-default-note");
+    if (note) note.style.display = tunMode ? "block" : "none";
     $("edges-path").value = s.settings.edgesPath || "";
   }
   if (s.psk) {

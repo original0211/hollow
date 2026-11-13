@@ -14,6 +14,12 @@ type System interface {
 	DelRoute(r Route) error
 	DefaultGateway() (string, error)
 	PhysicalDNS() (map[string][]string, error)
+	// Adapter shaping (T-4): address assignment + resolver pointing on
+	// OUR adapter only. Idempotent like the route ops.
+	SetAdapterAddr(cidr string) error
+	DelAdapterAddr(cidr string) error
+	SetAdapterDNS(server string) error
+	ClearAdapterDNS() error
 }
 
 // Engine executes the discipline (spec §3) over a System.
@@ -39,15 +45,95 @@ func (e *Engine) now() time.Time {
 
 func (e *Engine) applyOps(ops []Op) error {
 	for _, op := range ops {
-		var err error
-		if op.Kind == "add" {
-			err = e.Sys.AddRoute(op.Route)
-		} else {
-			err = e.Sys.DelRoute(op.Route)
+		if err := e.applyOp(op); err != nil {
+			return err
 		}
-		if err != nil {
-			return fmt.Errorf("%s route %s: %w", op.Kind, op.Route.Dest, err)
+	}
+	return nil
+}
+
+func (e *Engine) applyOp(op Op) error {
+	var err error
+	switch op.Kind {
+	case "add":
+		err = e.Sys.AddRoute(op.Route)
+	case "del":
+		err = e.Sys.DelRoute(op.Route)
+	case "addr-add":
+		err = e.Sys.SetAdapterAddr(op.Value)
+	case "addr-del":
+		err = e.Sys.DelAdapterAddr(op.Value)
+	case "dns-set":
+		err = e.Sys.SetAdapterDNS(op.Value)
+	case "dns-clear":
+		err = e.Sys.ClearAdapterDNS()
+	default:
+		err = fmt.Errorf("unknown op kind %q", op.Kind)
+	}
+	if err != nil {
+		return fmt.Errorf("%s %s%s: %w", op.Kind, op.Route.Dest, op.Value, err)
+	}
+	return nil
+}
+
+func inverseOp(op Op) Op {
+	switch op.Kind {
+	case "add":
+		return Op{Kind: "del", Route: op.Route}
+	case "del":
+		return Op{Kind: "add", Route: op.Route}
+	case "addr-add":
+		return Op{Kind: "addr-del", Value: op.Value}
+	case "addr-del":
+		return Op{Kind: "addr-add", Value: op.Value}
+	case "dns-set":
+		return Op{Kind: "dns-clear"}
+	case "dns-clear":
+		return Op{Kind: "dns-set", Value: AdapterIPv4}
+	}
+	return op
+}
+
+// applyOpsTx applies a plan transactionally (NP-1114-25 hard criterion):
+// ANY step failing rolls back every step already applied — in reverse,
+// through the same op machinery — and verifies by re-reading the route
+// table that none of the plan's route targets survive. A half-taken
+// system with only a backup left behind is exactly what this forbids.
+// The backup file itself is NOT touched here: callers keep it and report.
+func (e *Engine) applyOpsTx(ops []Op) error {
+	applied := make([]Op, 0, len(ops))
+	for _, op := range ops {
+		if err := e.applyOp(op); err != nil {
+			e.logf("netcfg: enable step failed (%v) — rolling back %d applied steps", err, len(applied))
+			rbErrs := []string{}
+			for i := len(applied) - 1; i >= 0; i-- {
+				if rerr := e.applyOp(inverseOp(applied[i])); rerr != nil {
+					rbErrs = append(rbErrs, rerr.Error())
+				}
+			}
+			// Read-back assertion: no route this plan added may remain.
+			if cur, cerr := e.Sys.CurrentRoutes(); cerr == nil {
+				added := []Route{}
+				for _, a := range applied {
+					if a.Kind == "add" {
+						added = append(added, a.Route)
+					}
+				}
+				for _, r := range added {
+					if containsRoute(cur, r) {
+						rbErrs = append(rbErrs, "route "+r.Dest+" still present after rollback")
+					}
+				}
+			} else {
+				rbErrs = append(rbErrs, "rollback read-back failed: "+cerr.Error())
+			}
+			if len(rbErrs) > 0 {
+				return fmt.Errorf("%w; ROLLBACK INCOMPLETE: %s", err, strings.Join(rbErrs, "; "))
+			}
+			e.logf("netcfg: rollback complete and verified — system back to pre-enable state, backup kept")
+			return fmt.Errorf("%w (rolled back cleanly)", err)
 		}
+		applied = append(applied, op)
 	}
 	return nil
 }
@@ -111,7 +197,10 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 				return nil, err
 			}
 			if !routeSetsEqual(present, held.Written.AddedRoutes) {
-				ops, _ := PlanTakeover(exclusions, gw)
+				// Re-apply the full plan (idempotent ops): shaping first
+				// (converges a pre-T-4 half-state), routes, then DNS.
+				routeOps, _ := PlanTakeover(exclusions, gw)
+				ops := append(append(PlanAdapterShape(), routeOps...), PlanAdapterDNS()...)
 				if err := e.applyOps(ops); err != nil {
 					return nil, err
 				}
@@ -135,7 +224,7 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 				ops = append([]Op{{Kind: "add", Route: r}}, ops...)
 			}
 		}
-		if err := e.applyOps(ops); err != nil {
+		if err := e.applyOpsTx(ops); err != nil {
 			return nil, err
 		}
 		held.Written.AddedRoutes = desired
@@ -150,8 +239,9 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 		// takeover anyway, and let Restore degrade. Never fabricate an
 		// Original we did not measure.
 		e.logf("netcfg: WARNING existing backup unreadable — keeping it untouched; restore will degrade safely")
-		ops, _ := PlanTakeover(exclusions, gw)
-		if err := e.applyOps(ops); err != nil {
+		routeOps, _ := PlanTakeover(exclusions, gw)
+		ops := append(append(PlanAdapterShape(), routeOps...), PlanAdapterDNS()...)
+		if err := e.applyOpsTx(ops); err != nil {
 			return nil, err
 		}
 		return &Snapshot{Version: SnapshotVersion, Written: State{DefaultGateway: gw, Adapter: adapter, AddedRoutes: desired}}, nil
@@ -180,9 +270,10 @@ func (e *Engine) Enable(exclusions []string) (*Snapshot, error) {
 			return nil, err
 		}
 		e.logf("netcfg: snapshot saved")
-		ops, _ := PlanTakeover(exclusions, gw)
-		if err := e.applyOps(ops); err != nil {
-			return nil, err // backup kept; restore/self-heal can unwind
+		routeOps, _ := PlanTakeover(exclusions, gw)
+		ops := append(append(PlanAdapterShape(), routeOps...), PlanAdapterDNS()...)
+		if err := e.applyOpsTx(ops); err != nil {
+			return nil, err // rolled back to pre-enable state; backup kept
 		}
 		present, err := e.currentOur(snap.Written)
 		if err != nil {

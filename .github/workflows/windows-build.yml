@@ -57,7 +57,16 @@ jobs:
           go build -o ../dist/hollow-tun-helper.exe ./cmd/hollow-tun-helper
           Copy-Item third_party/wintun/wintun.dll ../dist/
           Copy-Item third_party/wintun/LICENSE.txt ../dist/WINTUN-LICENSE.txt
+          Copy-Item third_party/gvisor/LICENSE.txt ../dist/GVISOR-LICENSE.txt
           ../dist/hollow-tun-helper.exe --check-dll
+      - name: Packaging self-check (licenses present — NP-1114-25 item 7)
+        shell: pwsh
+        working-directory: windows
+        run: |
+          foreach ($f in @("dist/WINTUN-LICENSE.txt", "dist/GVISOR-LICENSE.txt", "dist/wintun.dll", "dist/hollow-tun-helper.exe")) {
+            if (-not (Test-Path $f)) { Write-Error "MISSING from dist: $f"; exit 1 }
+          }
+          Write-Host "dist packaging check OK"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -66,4 +75,5 @@ jobs:
             windows/dist/*.exe
             windows/dist/wintun.dll
             windows/dist/WINTUN-LICENSE.txt
+            windows/dist/GVISOR-LICENSE.txt
           if-no-files-found: error

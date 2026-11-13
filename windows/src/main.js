@@ -16,6 +16,13 @@ import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bg
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
 import { buildPac, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
+import { HelperClient } from "./helper-client.js";
+import { HelperWatch } from "./helper-watch.js";
+import { planTunEnable, planCandidateRefresh, edgeModeDisabledInTun } from "./tun-policy.js";
+import { TunGraceSupervisor, createStaleRestoreHandler, tunStatusView, modeFamily } from "./tun-supervisor.js";
+import { readNetcfgBackup } from "./netcfg-backup.js";
+import { execFile } from "node:child_process";
+import dns from "node:dns/promises";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let cfg = loadConfig();
@@ -51,7 +58,8 @@ function getBridge() {
       // system proxy points at us, give the user's proxy back immediately —
       // a dead carrier must not blackhole their browsing. Reconnecting is
       // transient and deliberately does NOT restore.
-      if (ev.type === "state" && ev.state === "error" && proxyOn && !restoring) {
+      if (ev.type === "state" && tunOn) grace.noteBridgeStatus(ev.state);
+      if (ev.type === "state" && ev.state === "error" && proxyOn && !restoring && modeFamily(cfg.proxyMode) === "sysproxy") {
         restoring = true;
         log("bridge entered Error terminal state — restoring system proxy");
         teardownProxy().finally(() => { restoring = false; });
@@ -105,6 +113,25 @@ async function doConnect() {
   const b = getBridge();
   if (!b) return; // PSK error already logged + surfaced via getState
   await b.startSocks(cfg.socksPort).catch((e) => log(`socks start failed: ${e.message}`));
+  if (modeFamily(cfg.proxyMode) === "tun" && process.platform === "win32") {
+    // TUN (T-4): helper takeover + bearer pin BEFORE the bridge dials, so
+    // the carrier itself can only ever leave via its pinned /32.
+    try {
+      await enableTun(b);
+    } catch (e) {
+      log(`TUN enable failed: ${e.message} — not connecting (no silent fallback to a bare SOCKS)`);
+      return;
+    }
+    await b.connect();
+    const okTun = await waitConnected(b);
+    if (!okTun) {
+      log("TUN: carrier did not reach Connected — unwinding the takeover");
+      await disableTun();
+      return;
+    }
+    log("TUN mode active (system proxy untouched — routing takeover only)");
+    return;
+  }
   await b.connect();
   if ((cfg.proxyMode === "global" || cfg.proxyMode === "pac") && process.platform === "win32") {
     // Enable only once traffic can actually flow (M2-2): a proxy pointing at
@@ -167,9 +194,104 @@ function resolveEdgeIp() {
 }
 
 async function doDisconnect() {
+  if (tunOn) await disableTun();
   await teardownProxy();
   if (bridge) await bridge.disconnect();
 }
+
+// ---- TUN mode (T-4 integration, NP-1114-25) ----
+// The helper owns the routing takeover; this process owns the plan
+// (tun-policy), the grace orchestration (tun-supervisor) and the stale
+// action path. Mode families are mutually exclusive: proxyMode "tun"
+// never touches the sysproxy path and vice versa.
+let helperClient = null, helperWatch = null, helperStatusCache = null, tunOn = false;
+const grace = new TunGraceSupervisor({
+  monoNow: () => performance.now(),
+  onAutoRestore: (reason) => {
+    log(`TUN auto-restore: ${reason} — returning the system to its pre-TUN state`);
+    disableTun().catch((e) => log(`TUN auto-restore failed: ${e.message}`));
+  },
+});
+function helperExePath() {
+  // Packaged: staged next to the app in dist/. Dev: same relative shape.
+  return path.join(here, "..", "dist", "hollow-tun-helper.exe");
+}
+function runRestoreTunCli() {
+  return new Promise((resolve) => {
+    execFile(helperExePath(), ["--restore-tun"], { timeout: 30000 }, (err) => resolve(!err));
+  });
+}
+function getHelper() {
+  if (helperClient) return helperClient;
+  helperWatch = new HelperWatch({
+    wallNow: () => Date.now(),
+    monoNow: () => performance.now(),
+    onStale: () => {
+      void staleRestoreHandler();
+    },
+  });
+  const staleRestoreHandler = createStaleRestoreHandler({
+    isStale: () => helperWatch.check() === "stale",
+    pingIpc: () => helperClient ? helperClient.ping() : Promise.resolve(false),
+    ipcRestore: async () => {
+      if (!helperClient) return false;
+      try { await helperClient.request("restore", null, 5000); return true; } catch { return false; }
+    },
+    spawnRestoreCli: runRestoreTunCli,
+    log,
+    onOutcome: (r) => { if (win && !win.isDestroyed()) win.webContents.send("hollow:event", { type: "tun-stale", ...r }); },
+  });
+  helperClient = new HelperClient({
+    log,
+    onHeartbeat: () => helperWatch.noteHeartbeat(),
+    onClose: () => { helperStatusCache = null; },
+  });
+  return helperClient;
+}
+async function resolveWorkerIps() {
+  try {
+    const host = new URL(cfg.workerUrl).hostname;
+    const addrs = await dns.resolve4(host);
+    return addrs;
+  } catch { return []; }
+}
+async function enableTun(b) {
+  const h = getHelper();
+  await h.connect();
+  const plan = planTunEnable({
+    edgeMode: cfg.edgeMode || "default",
+    preferredEdgeIp: cfg.preferredEdgeIp || null,
+    autoBestIp: bestEdge(cfg.edgeResults || {}),
+    candidates: edgeList(),
+    resolvedIps: cfg.edgeMode === "default" || !(cfg.edgeMode) ? await resolveWorkerIps() : [],
+  });
+  for (const s of plan.stripped ?? []) log(`TUN candidate stripped: ${s.ip} (${s.reason})`);
+  if (!plan.ok) throw new Error(`TUN plan refused: ${plan.reason}`);
+  await h.request("enable_tun", { socksPort: b.socksPort || cfg.socksPort, exclusions: plan.pins });
+  b.setBearerLock(plan.pins);
+  if (b.state === "connected" || b.state === "reconnecting") b.setEdgeIp(plan.bearerIp);
+  tunOn = true;
+  grace.noteTunActive(true);
+  grace.noteBridgeStatus(b.state);
+  log(`TUN enabled: bearer pinned to ${plan.bearerIp}, ${plan.pins.length} exclusions`);
+}
+async function disableTun() {
+  grace.noteTunActive(false);
+  tunOn = false;
+  if (bridge) bridge.setBearerLock(null);
+  const h = getHelper();
+  try {
+    if (h.connected) await h.request("disable_tun", null, 8000);
+  } catch (e) { log(`helper disable_tun failed (${e.message}) — the helper dead-man switch remains as backstop`); }
+}
+setInterval(() => {
+  if (tunOn) {
+    grace.check();
+    if (helperWatch && helperWatch.check() === "stale") { /* onStale fires inside check() */ }
+    const h = getHelper();
+    if (h.connected) h.request("status", null, 2000).then((f) => { helperStatusCache = f.result ?? null; }).catch(() => {});
+  }
+}, 1000);
 
 function createWindow() {
   win = new BrowserWindow({
@@ -243,6 +365,8 @@ else {
 }
 
 ipcMain.handle("hollow:getState", () => ({
+  tun: tunStatusView({ proxyMode: cfg.proxyMode, helperAlive: !!(helperClient && helperClient.connected && helperWatch && !helperWatch.stale && helperWatch.gaps() !== null), helperStatus: helperStatusCache, graceRemainingMs: grace.graceRemainingMs() }),
+  netcfgBackup: (() => { try { const r = readNetcfgBackup(configDir()); return { kind: r.kind, problems: r.problems }; } catch { return { kind: "corrupt", problems: ["read failed"] }; } })(),
   ...(bridge ? bridge.snapshot() : { state: bridgeError ? "error" : "disconnected", detail: bridgeError || "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
   logs: logs.slice(-80),
   settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "" },
@@ -261,7 +385,7 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
       log(`settings saved: workerUrl=${s.workerUrl}`);
     } catch (e) { log(`settings workerUrl rejected: ${e.message} (kept ${cfg.workerUrl})`); }
   }
-  if (["off", "global", "pac"].includes(s.proxyMode)) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
+  if (["off", "global", "pac", "tun"].includes(s.proxyMode)) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
   if (Array.isArray(s.directHosts)) {
     cfg = { ...cfg, directHosts: s.directHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean).slice(0, 200) };
     log(`settings saved: ${cfg.directHosts.length} direct hosts`);

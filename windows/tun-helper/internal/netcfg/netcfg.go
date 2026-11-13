@@ -158,8 +158,41 @@ func DesiredRoutes(exclusions []string, physicalGW string) ([]Route, error) {
 
 // Op is one planned routing-table mutation.
 type Op struct {
-	Kind  string // "add" | "del"
+	Kind  string // "add" | "del" | "addr-add" | "addr-del" | "dns-set" | "dns-clear"
 	Route Route
+	// Value carries the payload for adapter ops: a CIDR for addr-add /
+	// addr-del, the resolver address for dns-set.
+	Value string
+}
+
+// PlanAdapterShape assigns the adapter's own addresses (notes v2 §1.3).
+// These ops must run BEFORE any route op: the /1 gateways (10.99.0.1,
+// fd00::1) are only on-link once the addresses exist (real-machine note
+// T-2-b; Enable rolls the whole plan back if any step fails, NP-1114-25).
+func PlanAdapterShape() []Op {
+	return []Op{
+		{Kind: "addr-add", Value: AdapterIPv4PF},
+		{Kind: "addr-add", Value: AdapterIPv6PF},
+	}
+}
+
+// PlanAdapterDNS points the adapter's resolver at the helper (T-3). It
+// runs AFTER the routes are in: DNS only matters once traffic is taken.
+func PlanAdapterDNS() []Op {
+	return []Op{{Kind: "dns-set", Value: AdapterIPv4}}
+}
+
+// planAdapterUnshape reverses shaping, in restore order: DNS first (stop
+// new queries landing on a resolver that is going away), then addresses.
+func planAdapterUnshape(written State) []Op {
+	if written.Adapter.IPv4 == "" {
+		return nil // this takeover never shaped an adapter (pre-T-4 backup)
+	}
+	return []Op{
+		{Kind: "dns-clear"},
+		{Kind: "addr-del", Value: AdapterIPv6PF},
+		{Kind: "addr-del", Value: AdapterIPv4PF},
+	}
 }
 
 // PlanTakeover orders a fresh takeover per spec R5: every exclusion /32
@@ -191,6 +224,9 @@ func PlanRestore(written State) []Op {
 			ops = append(ops, Op{Kind: "del", Route: r})
 		}
 	}
+	// Adapter unshaping rides the same plan (T-4): DNS cleared and
+	// addresses removed AFTER the routes that referenced them are gone.
+	ops = append(ops, planAdapterUnshape(written)...)
 	return ops
 }
 

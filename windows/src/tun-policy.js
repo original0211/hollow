@@ -76,14 +76,24 @@ export function planTunEnable({ edgeMode, preferredEdgeIp = null, autoBestIp = n
 // new set add-before-delete internally; the bridge may only switch its
 // bearer AFTER the helper confirms (the caller sequences: set_exclusions
 // -> await ok -> bridge.setBearerLock / setEdgeIp).
+// A live candidate-list refresh while TUN is up — TWO PHASES
+// (RF-21-03②): phase 1 sends the UNION (new pins added, NOTHING retired,
+// so the current bearer's /32 provably survives the switch); only after
+// the bridge confirms it has moved to nextBearerIp does phase 2 send the
+// final set, retiring the old pins. Deleting the old bearer's exclusion
+// before the bridge switched would route the live bearer through the
+// tunnel — the exact loop this prevents.
 export function planCandidateRefresh(oldSet, newSet, bearerIp) {
   const parts = partitionV6(newSet);
   const next = parts.v4;
+  const phase1Pins = uniq([...oldSet, ...next]);
   const bearerStillValid = bearerIp !== null && next.includes(bearerIp);
   return {
-    pinsToSend: next,
+    pinsToSend: phase1Pins, // phase 1: union — adds only, zero retirements
+    finalPins: next, // phase 2: send after the bridge confirms the switch
     added: next.filter((ip) => !oldSet.includes(ip)),
-    retired: oldSet.filter((ip) => !next.includes(ip)),
+    retired: oldSet.filter((ip) => !next.includes(ip)), // informational
+    retiredAfterConfirm: oldSet.filter((ip) => !next.includes(ip)),
     bearerStillValid,
     nextBearerIp: bearerStillValid ? bearerIp : (next[0] ?? null),
     stripped: parts.stripped,

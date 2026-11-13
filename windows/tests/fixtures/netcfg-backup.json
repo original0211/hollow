@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "takenAt": "2026-11-14T00:00:00Z",
+  "original": {
+    "defaultGateway": "192.168.1.1",
+    "physicalDns": {
+      "Wi-Fi": [
+        "192.168.1.1"
+      ]
+    },
+    "adapter": {
+      "name": "Hollow",
+      "ipv4": "",
+      "ipv6": "",
+      "dns": null
+    },
+    "addedRoutes": []
+  },
+  "written": {
+    "defaultGateway": "192.168.1.1",
+    "physicalDns": {
+      "Wi-Fi": [
+        "192.168.1.1"
+      ]
+    },
+    "adapter": {
+      "name": "Hollow",
+      "ipv4": "10.99.0.1/24",
+      "ipv6": "fd00::1/64",
+      "dns": [
+        "10.99.0.1"
+      ]
+    },
+    "addedRoutes": [
+      {
+        "dest": "203.0.113.7/32",
+        "gateway": "192.168.1.1"
+      },
+      {
+        "dest": "0.0.0.0/1",
+        "gateway": "10.99.0.1",
+        "interface": "Hollow"
+      },
+      {
+        "dest": "128.0.0.0/1",
+        "gateway": "10.99.0.1",
+        "interface": "Hollow"
+      },
+      {
+        "dest": "::/1",
+        "gateway": "fd00::1",
+        "interface": "Hollow"
+      },
+      {
+        "dest": "8000::/1",
+        "gateway": "fd00::1",
+        "interface": "Hollow"
+      }
+    ]
+  }
+}

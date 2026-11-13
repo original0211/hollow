@@ -135,3 +135,53 @@ func (winSystem) PhysicalDNS() (map[string][]string, error) {
 	}
 	return result, nil
 }
+
+// Adapter shaping over netsh (T-4). Idempotent philosophy matches the
+// route ops: setting an address/DNS that is already set is success.
+// COMPILE-VERIFIED ONLY from the sandbox — real netsh behavior is a
+// real-machine item (T-2-b / TUN volume).
+
+func (winSystem) SetAdapterAddr(cidr string) error {
+	ip, bits, is6 := splitDest(cidr)
+	if is6 {
+		_, err := runCmd("netsh", "interface", "ipv6", "add", "address", "interface="+AdapterName, "address="+ip)
+		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already") {
+			// netsh reports duplicates via output text more often than exit code.
+			out, _ := runCmd("netsh", "interface", "ipv6", "show", "addresses", "interface="+AdapterName)
+			if !strings.Contains(out, ip) {
+				return err
+			}
+			return nil
+		}
+		_ = bits
+		return nil
+	}
+	out, err := runCmd("netsh", "interface", "ipv4", "add", "address", "name="+AdapterName, ip, prefixToMask(bits))
+	if err != nil && !strings.Contains(out, "already") {
+		return fmt.Errorf("netsh add address: %w (%s)", err, out)
+	}
+	return nil
+}
+
+func (winSystem) DelAdapterAddr(cidr string) error {
+	ip, _, is6 := splitDest(cidr)
+	if is6 {
+		_, err := runCmd("netsh", "interface", "ipv6", "delete", "address", "interface="+AdapterName, "address="+ip)
+		return err
+	}
+	_, err := runCmd("netsh", "interface", "ipv4", "delete", "address", "name="+AdapterName, ip)
+	return err
+}
+
+func (winSystem) SetAdapterDNS(server string) error {
+	out, err := runCmd("netsh", "interface", "ipv4", "set", "dnsservers", "name="+AdapterName, "static", server, "primary")
+	if err != nil {
+		return fmt.Errorf("netsh set dnsservers: %w (%s)", err, out)
+	}
+	return nil
+}
+
+func (winSystem) ClearAdapterDNS() error {
+	_, err := runCmd("netsh", "interface", "ipv4", "delete", "dnsservers", "name="+AdapterName, "all")
+	return err
+}

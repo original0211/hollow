@@ -25,7 +25,7 @@ const DEFAULTS = {
   workerUrl: "wss://newproto-hollow.newproto.workers.dev/",
   keyId: 1,
   socksPort: 1080,
-  proxyMode: "off", // off | global | pac (M2-4)
+  proxyMode: "off", // off | global | pac | tun (M2-4; tun added T-4 — mode families off/sysproxy/tun are mutually exclusive)
   directHosts: [], // PAC direct list (M2-4)
   pacPort: 18080, // preferred loopback port for the PAC endpoint (M2-4)
   edgeMode: "default", // default | auto | manual (M2-4)
