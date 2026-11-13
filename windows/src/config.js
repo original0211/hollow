@@ -49,7 +49,12 @@ export function loadConfig() {
 export function saveConfig(cfg) {
   const dir = configDir();
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  // Atomic (M2-5 hardening): a crash or a file-lock hiccup mid-write must not
+  // leave a truncated config.json behind — write a sibling tmp, then rename.
+  const file = path.join(dir, "config.json");
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n");
+  fs.renameSync(tmp, file);
 }
 
 // ---- PSK ----
@@ -70,7 +75,12 @@ export function loadPsk() {
 export function writePsk(psk) {
   if (!(psk instanceof Uint8Array) || psk.length !== 32) throw new Error("psk must be 32 bytes");
   fs.mkdirSync(configDir(), { recursive: true });
-  fs.writeFileSync(pskFile(), Buffer.from(psk), { mode: 0o600 });
+  // Atomic for the same reason as saveConfig: a partial psk.bin would read
+  // back as corrupt (by design a hard error) — don't manufacture that state.
+  const file = pskFile();
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, Buffer.from(psk), { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
 // First run: generate + persist. A corrupt existing file throws (see above).
 export function loadOrCreatePsk() {

@@ -1,14 +1,34 @@
 # Hollow Windows client
 
 Implements the plan in `../../files/m2/windows-mvp-plan.md` (goal workspace).
-Status: **M2-1 … M2-4 landed** (NP-1114-03 / NP-1114-05 /
-NP-1114-07 / NP-1114-11) — full bridge state machine, the hardened system proxy (iron
-snapshot rule, atomic verified backups, exact-match startup self-heal),
-config & pairing (below), edge-IP selection with /meta landing
-identification, and the PAC proxy sub-mode (loopback PAC endpoint +
-sysproxy PAC form under the same snapshot/restore discipline). Electron shell, M1 core reused byte-identical
-via a vendored copy (integrity proven by `tools/verify-vendor.mjs` on every
-check run).
+Status: **v0.2.0 — M2 complete (sandbox side)**: M2-1 bridge (NP-1114-03),
+M2-2 system proxy (NP-1114-05), M2-3 config & pairing (NP-1114-07), M2-4
+edge-IP + PAC (NP-1114-11), M2-5 hardening (NP-1114-14). Real-machine
+acceptance is packaged separately (goal files: `m2/real-machine-acceptance-pack.md`).
+Electron shell, M1 core reused byte-identical via a vendored copy
+(integrity proven by `tools/verify-vendor.mjs` on every check run).
+
+## Feature map (v0.2.0)
+
+- **Connect**: bridge state machine with §8.4 backoff, 15-minute carrier
+  rotation, fatal-error classification; local SOCKS5 entry (port 1080,
+  auto-increments when taken); per-day stream/byte/queue stats.
+- **System proxy** (Windows): three modes — off / global / PAC — under one
+  snapshot discipline: the pre-existing registry state (all four WinINET
+  values) is snapshotted atomically before any write, restored byte-exact,
+  with startup self-heal (exact/written/foreign fingerprint states) and an
+  automatic restore when the carrier dies fatally. Emergency CLI:
+  `Hollow.exe --restore-proxy` (bypasses the single-instance lock).
+- **PAC mode**: loopback endpoint serves a generated PAC — LAN/localhost
+  and your editable direct-host list go DIRECT, everything else via SOCKS.
+- **Edge-IP selection**: curated Cloudflare anycast candidates (refreshable
+  from the Worker's `/edges.json`), 3-handshake median RTT measurement,
+  per-IP landing identification via `/meta`, three selection modes
+  (default / auto-best / manual). Labels show the measured landing colo —
+  never a promised country.
+- **Pairing** (below): PSK generated locally, only its verifier V is ever
+  shown; import by link / file / QR, always behind an in-app confirmation
+  that names the target Worker before anything is written.
 
 ## Pairing a fresh install (≤15 minutes)
 

@@ -18,6 +18,11 @@ import * as sysproxy from "./sysproxy.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let cfg = loadConfig();
+// Config persistence must never take the app down (M2-5 hardening): a locked
+// or temporarily unwritable config dir logs and keeps the in-memory state.
+function safeSave() {
+  try { saveConfig(cfg); } catch (e) { log(`config save failed (continuing in-memory): ${e.message}`); }
+}
 const logs = [];
 function log(m) {
   const line = `${new Date().toISOString()} ${m}`;
@@ -248,7 +253,7 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
     cfg = { ...cfg, directHosts: s.directHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean).slice(0, 200) };
     log(`settings saved: ${cfg.directHosts.length} direct hosts`);
   }
-  saveConfig(cfg);
+  safeSave();
   // Apply on the next connect: drop a non-connected bridge so it rebuilds.
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
   return { workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts };
@@ -265,7 +270,7 @@ ipcMain.handle("hollow:refreshEdges", async () => {
   try {
     const list = await fetchRemoteEdges(cfg.workerUrl);
     cfg = { ...cfg, edgeListCache: list };
-    saveConfig(cfg);
+    safeSave();
     log(`edge list refreshed from /edges.json (${list.length} candidates)`);
     return { ok: true, edges: list };
   } catch (e) {
@@ -282,7 +287,7 @@ ipcMain.handle("hollow:measureEdges", async () => {
     onProgress: (ip, r) => { if (win && !win.isDestroyed()) win.webContents.send("hollow:edgeProgress", { ip, result: r }); },
   });
   cfg = { ...cfg, edgeResults: results };
-  saveConfig(cfg);
+  safeSave();
   if (bridge) bridge.setEdgeIp(resolveEdgeIp());
   log(`edge measurement done: best=${bestEdge(results) || "none"}`);
   return { ok: true, results };
@@ -290,7 +295,7 @@ ipcMain.handle("hollow:measureEdges", async () => {
 ipcMain.handle("hollow:setEdgeSelection", (_e, { mode, ip }) => {
   if (["default", "auto", "manual"].includes(mode)) cfg = { ...cfg, edgeMode: mode };
   if (typeof ip === "string" && ip) cfg = { ...cfg, preferredEdgeIp: ip };
-  saveConfig(cfg);
+  safeSave();
   if (bridge) bridge.setEdgeIp(resolveEdgeIp());
   log(`edge selection: mode=${cfg.edgeMode}${cfg.edgeMode === "manual" ? ` ip=${cfg.preferredEdgeIp}` : ""} (applies to the next carrier)`);
   return { edgeMode: cfg.edgeMode, preferredEdgeIp: cfg.preferredEdgeIp, activeEdgeIp: resolveEdgeIp() };
@@ -348,7 +353,7 @@ ipcMain.handle("hollow:importConfirm", async () => {
   const p = pendingImport; pendingImport = null;
   if (p.psk) { writePsk(p.psk); await tightenPskAcl(log); }
   cfg = { ...cfg, workerUrl: p.workerUrl, keyId: p.keyId };
-  saveConfig(cfg);
+  safeSave();
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
   bridgeError = null;
   log("import applied (payload not logged)");

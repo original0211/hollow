@@ -10,7 +10,7 @@ function appendLog(line) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 function fmtDuration(ms) {
-  const s = Math.floor(ms / 1000);
+  const s = Math.max(0, Math.floor(ms / 1000)); // clock jumps must not render negative durations (M2-5)
   const hh = String(Math.floor(s / 3600)).padStart(2, "0");
   const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
   const ss = String(s % 60).padStart(2, "0");
