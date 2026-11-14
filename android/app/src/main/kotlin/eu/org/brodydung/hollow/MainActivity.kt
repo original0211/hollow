@@ -30,14 +30,14 @@ class MainActivity : Activity() {
             text = "核心通路：${Hollowcore.version()}\n回声自检：${Hollowcore.echo("m3-0")}\n状态：未连接（骨架）"
         }
         val startButton = Button(this).apply {
-            text = "开启 VPN（骨架）"
+            text = "开启 VPN"
             setOnClickListener { requestConsentOrStart() }
         }
         val stopButton = Button(this).apply {
             text = "停止"
             setOnClickListener {
                 startService(Intent(this@MainActivity, HollowVpnService::class.java).setAction(HollowVpnService.ACTION_STOP))
-                status.append("\n已发送停止（服务自拆）")
+                status.append("\n已停止（状态位已清除，不会被系统拉活）")
             }
         }
         setContentView(LinearLayout(this).apply {
@@ -61,8 +61,13 @@ class MainActivity : Activity() {
     }
 
     private fun startVpnService() {
-        startForegroundService(Intent(this, HollowVpnService::class.java)) // direct call: minSdk 26 has it
-        status.append("\n服务已启动（前台通知应出现）")
+        // Explicit user start: ACTION_START sets the restart state bit
+        // in the service (plan §2 restart policy). The intent itself is
+        // the "user pressed start" evidence.
+        startForegroundService(
+            Intent(this, HollowVpnService::class.java).setAction(HollowVpnService.ACTION_START)
+        )
+        status.append("\n服务已启动（前台通知应出现；无配置时服务会 fail-closed 自停）")
     }
 
     @Deprecated("Consent flow predates the Activity Result API; kept simple for the skeleton")

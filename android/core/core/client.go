@@ -373,6 +373,7 @@ func (c *HollowClient) onServerHello(bytes []byte) {
 		c.lastSentRecord = b
 		c.transport.Send(b)
 	})
+	c.sender.SetFlushScheduler(c.enqueue)
 	c.receiver = NewRecordReceiver(keys.KS2c, keys.IvS2c)
 	c.State = "wait-finished"
 }

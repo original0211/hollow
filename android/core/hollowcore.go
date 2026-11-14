@@ -1,19 +1,121 @@
-// Package hollowcore is the Android binding seam for the Hollow core.
-//
-// M3-0 scope: a minimal placeholder API proving the gomobile pathway
-// (Go module -> AAR -> Kotlin call). The protocol core port lands in
-// M3-1 behind this same seam; nothing here is protocol code yet.
+// Package hollowcore is the gomobile binding facade for the Hollow
+// Android core. The protocol implementation lives in ./core, the data
+// plane in ./pump + ./dns, and session orchestration in ./session;
+// this package keeps the bound surface small and JSON-shaped, exactly
+// as the M3-0 seam promised.
 package hollowcore
 
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"sync"
+
+	"hollow/androidcore/session"
+)
+
 // Version returns the core library identifier the shell displays on its
-// status placeholder — if this string renders on device, the whole
-// gomobile chain (bind, AAR packaging, JNI) is alive.
+// status screen — if this string renders on device, the whole gomobile
+// chain (bind, AAR packaging, JNI) is alive.
 func Version() string {
-	return "hollowcore 0.2.0 (M3-1 core)"
+	return "hollowcore 0.3.0 (M3-2 data plane)"
 }
 
 // Echo round-trips a string across the binding boundary (both
 // directions marshalled), the cheapest end-to-end seam check.
 func Echo(s string) string {
 	return "echo:" + s
+}
+
+// configJSON is the wire shape of the session configuration as stored
+// by the shell (pairing import writes it in M3-3):
+//
+//	{"wsUrl":"wss://…","pskHex":"…","keyId":1,"metaPath":"/…","hostBase":"https://…"}
+type configJSON struct {
+	WSURL    string `json:"wsUrl"`
+	PSKHex   string `json:"pskHex"`
+	KeyID    int    `json:"keyId"`
+	MetaPath string `json:"metaPath"`
+	HostBase string `json:"hostBase"`
+}
+
+var (
+	mu      sync.Mutex
+	current *session.Session
+)
+
+// StartVPN starts the single VPN session of this process (D6) on an
+// established TUN fd. protector is the shell's VpnService.protect
+// bridge; every egress socket of the session goes through it (D10).
+// A second StartVPN without StopVPN is an error, never a silent
+// replace — the service owns the lifecycle.
+func StartVPN(cfgJSONText string, tunFD int, protector session.Protector) error {
+	var cj configJSON
+	if err := json.Unmarshal([]byte(cfgJSONText), &cj); err != nil {
+		return err
+	}
+	psk, err := hex.DecodeString(cj.PSKHex)
+	if err != nil || len(psk) == 0 {
+		return errors.New("hollowcore: bad or empty pskHex")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if current != nil {
+		return errors.New("hollowcore: session already running")
+	}
+	s, err := session.Start(session.Config{
+		WSURL:    cj.WSURL,
+		PSK:      psk,
+		KeyID:    cj.KeyID,
+		MetaPath: cj.MetaPath,
+		HostBase: cj.HostBase,
+	}, tunFD, protector)
+	if err != nil {
+		return err
+	}
+	current = s
+	return nil
+}
+
+// StopVPN tears the running session down (no-op when none).
+func StopVPN() {
+	mu.Lock()
+	s := current
+	current = nil
+	mu.Unlock()
+	if s != nil {
+		s.Stop()
+	}
+}
+
+// VPNStatsJSON returns the pump counters as JSON for the status
+// surface ({} when no session runs).
+func VPNStatsJSON() string {
+	mu.Lock()
+	s := current
+	mu.Unlock()
+	if s == nil {
+		return "{}"
+	}
+	b, _ := json.Marshal(s.Stats())
+	return string(b)
+}
+
+// FetchMetaJSON performs the /meta landing-identification fetch over
+// the session's protected dialer and returns the decoded document as
+// JSON. Auxiliary (as on Windows): errors are the caller's to log.
+func FetchMetaJSON() (string, error) {
+	mu.Lock()
+	s := current
+	mu.Unlock()
+	if s == nil {
+		return "", errors.New("hollowcore: no session")
+	}
+	m, err := s.FetchMeta(context.Background())
+	if err != nil {
+		return "", err
+	}
+	b, _ := json.Marshal(m)
+	return string(b), nil
 }

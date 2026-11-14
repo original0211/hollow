@@ -9,7 +9,7 @@ D5 arm64-v8a only / D8 applicationId below).
 | Path | What |
 |---|---|
 | `core/` | Go module `hollow/androidcore` — the binding seam (`Version`/`Echo`) plus, since M3-1, the full protocol core port in `core/core/` (package `core`), locked to the JS canonical implementation by `core/testvectors/vectors-v0.1.2.json` (policy: `core/VECTORS.md`) |
-| `app/` | Kotlin shell: `MainActivity` (status placeholder + consent flow) and `HollowVpnService` (foreground skeleton; **no `establish()` until M3-2**) |
+| `app/` | Kotlin shell: `MainActivity` (status placeholder + consent flow) and `HollowVpnService` (specialUse foreground + the M3-2 data plane: `establish()` → fd handed to the Go session; restart gate per plan §2) |
 | `app/libs/hollowcore.aar` | gomobile output — build artifact, git-ignored, produced by the bind step below |
 
 Fixed parameters: applicationId `eu.org.brodydung.hollow`, minSdk 26,
@@ -55,6 +55,9 @@ APK silently).
   → system dialog) and starts the service, which promotes itself to
   the foreground with the `specialUse` type (see
   `files/m3/fgs-verification-record.md`).
-- The service does **not** establish a TUN interface in M3-0: with no
-  data plane yet, an established TUN would blackhole the device.
-  `Builder.establish()` and the fd pump arrive in M3-2.
+- Since M3-2 the service establishes the TUN (10.99.0.1/24 +
+  fd00::1/64, routes 0.0.0.0/0 and ::/0 — v6 enters the TUN and is
+  dropped there, never bypassed — DNS 10.99.0.1, MTU 1280) and hands
+  the fd to the Go session (`Hollowcore.startVPN`): pump + DNS +
+  protocol core run in-process; every egress socket is protect()ed
+  through the service bridge.

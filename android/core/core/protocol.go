@@ -263,18 +263,35 @@ type RecordSender struct {
 	send    func([]byte)
 	queue   [][]byte
 	timer   *time.Timer
+	// postFlush, when set, receives the flush closure to run on the
+	// owner's event loop. It exists because time.AfterFunc runs on its
+	// own goroutine: the JS original's setTimeout shared the client's
+	// single thread, so a direct Flush from the timer would race Push
+	// (caught by -race in NP-1114-33). Owners with an event loop MUST
+	// set this; single-goroutine owners may leave it nil.
+	postFlush func(func())
 }
 
 func NewRecordSender(key, iv []byte, send func([]byte)) *RecordSender {
 	return &RecordSender{key: key, iv: iv, send: send}
 }
 
+// SetFlushScheduler routes timer-fired flushes through the owner's
+// event loop (see postFlush).
+func (s *RecordSender) SetFlushScheduler(post func(func())) { s.postFlush = post }
+
 func (s *RecordSender) Push(frameBytes []byte, immediate bool) {
 	s.queue = append(s.queue, frameBytes)
 	if immediate {
 		s.Flush()
 	} else if s.timer == nil {
-		s.timer = time.AfterFunc(MergeWindow, s.Flush)
+		s.timer = time.AfterFunc(MergeWindow, func() {
+			if s.postFlush != nil {
+				s.postFlush(s.Flush)
+			} else {
+				s.Flush()
+			}
+		})
 	}
 }
 
