@@ -381,7 +381,11 @@ else {
   app.on("before-quit", async () => { try { await doDisconnect(); } catch { /* ignore */ } });
 }
 
-// Packaged-state UI smoke (NP-1114-35): env-gated self-probe used by CI
+// Packaged-state UI smoke (NP-1114-35): this guard exists because the
+// renderer/preload surface was a CI blind spot for the SECOND time
+// (first: NP-1114-12 class — checks that parse but never execute the
+// shipped surface). It runs the real main process and the real page:
+// env-gated self-probe used by CI
 // (tools/run-ui-smoke.mjs) against BOTH the source tree and the built
 // artifact. Loads the real window, waits for the first render, then
 // asserts the bridge is exposed and refresh() rewrote the placeholders.
@@ -403,7 +407,7 @@ async function runUiSmoke() {
       state: document.getElementById("state").textContent,
       verifier: document.getElementById("verifier").textContent,
     })`);
-    const healthy = probe.hollow === "object" && probe.state !== "状态：—" && probe.verifier !== "—";
+    const healthy = probe.hollow === "object" && probe.state !== "状态：—" && !probe.state.startsWith("界面桥未就绪") && probe.verifier !== "—";
     finish(healthy ? 0 : 1, { ...probe, healthy });
   } catch (e) {
     finish(2, { healthy: false, error: String((e && e.message) || e) });

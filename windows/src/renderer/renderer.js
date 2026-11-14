@@ -2,6 +2,15 @@
 // confirmation step. Untrusted strings (import previews, worker URLs) are
 // rendered exclusively via textContent — never innerHTML.
 const $ = (id) => document.getElementById(id);
+// Bridge defense (NP-1114-35): if the preload failed to load, window
+// .hollow is undefined and the old failure mode was total silent death
+// (a TypeError at the first top-level subscription killed every later
+// registration). Now: say so on the state card, then stop ALL further
+// initialization — a loud, honest error beats a dead page.
+if (!window.hollow) {
+  $("state").textContent = "界面桥未就绪（preload 未加载）——请重启应用；若反复出现请更新到最新版";
+  throw new Error("window.hollow missing — preload failed to load");
+}
 const logEl = $("log");
 let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "" };
 
