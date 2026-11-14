@@ -158,7 +158,7 @@ class HollowVpnService : VpnService() {
         val fd = pfd.detachFd()
         pfd.close()
         return try {
-            Hollowcore.startVPN(cfg, fd, ProtectorBridge())
+            Hollowcore.startVPN(cfg, fd.toLong(), ProtectorBridge())
             sessionRunning = true
             startNotifTicker()
             true
