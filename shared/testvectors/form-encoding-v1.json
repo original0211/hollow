@@ -1,0 +1,817 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "input": " ",
+      "encoded": "+"
+    },
+    {
+      "input": "a b",
+      "encoded": "a+b"
+    },
+    {
+      "input": "!",
+      "encoded": "%21"
+    },
+    {
+      "input": "a!b",
+      "encoded": "a%21b"
+    },
+    {
+      "input": "\"",
+      "encoded": "%22"
+    },
+    {
+      "input": "a\"b",
+      "encoded": "a%22b"
+    },
+    {
+      "input": "#",
+      "encoded": "%23"
+    },
+    {
+      "input": "a#b",
+      "encoded": "a%23b"
+    },
+    {
+      "input": "$",
+      "encoded": "%24"
+    },
+    {
+      "input": "a$b",
+      "encoded": "a%24b"
+    },
+    {
+      "input": "%",
+      "encoded": "%25"
+    },
+    {
+      "input": "a%b",
+      "encoded": "a%25b"
+    },
+    {
+      "input": "&",
+      "encoded": "%26"
+    },
+    {
+      "input": "a&b",
+      "encoded": "a%26b"
+    },
+    {
+      "input": "'",
+      "encoded": "%27"
+    },
+    {
+      "input": "a'b",
+      "encoded": "a%27b"
+    },
+    {
+      "input": "(",
+      "encoded": "%28"
+    },
+    {
+      "input": "a(b",
+      "encoded": "a%28b"
+    },
+    {
+      "input": ")",
+      "encoded": "%29"
+    },
+    {
+      "input": "a)b",
+      "encoded": "a%29b"
+    },
+    {
+      "input": "*",
+      "encoded": "*"
+    },
+    {
+      "input": "a*b",
+      "encoded": "a*b"
+    },
+    {
+      "input": "+",
+      "encoded": "%2B"
+    },
+    {
+      "input": "a+b",
+      "encoded": "a%2Bb"
+    },
+    {
+      "input": ",",
+      "encoded": "%2C"
+    },
+    {
+      "input": "a,b",
+      "encoded": "a%2Cb"
+    },
+    {
+      "input": "-",
+      "encoded": "-"
+    },
+    {
+      "input": "a-b",
+      "encoded": "a-b"
+    },
+    {
+      "input": ".",
+      "encoded": "."
+    },
+    {
+      "input": "a.b",
+      "encoded": "a.b"
+    },
+    {
+      "input": "/",
+      "encoded": "%2F"
+    },
+    {
+      "input": "a/b",
+      "encoded": "a%2Fb"
+    },
+    {
+      "input": "0",
+      "encoded": "0"
+    },
+    {
+      "input": "a0b",
+      "encoded": "a0b"
+    },
+    {
+      "input": "1",
+      "encoded": "1"
+    },
+    {
+      "input": "a1b",
+      "encoded": "a1b"
+    },
+    {
+      "input": "2",
+      "encoded": "2"
+    },
+    {
+      "input": "a2b",
+      "encoded": "a2b"
+    },
+    {
+      "input": "3",
+      "encoded": "3"
+    },
+    {
+      "input": "a3b",
+      "encoded": "a3b"
+    },
+    {
+      "input": "4",
+      "encoded": "4"
+    },
+    {
+      "input": "a4b",
+      "encoded": "a4b"
+    },
+    {
+      "input": "5",
+      "encoded": "5"
+    },
+    {
+      "input": "a5b",
+      "encoded": "a5b"
+    },
+    {
+      "input": "6",
+      "encoded": "6"
+    },
+    {
+      "input": "a6b",
+      "encoded": "a6b"
+    },
+    {
+      "input": "7",
+      "encoded": "7"
+    },
+    {
+      "input": "a7b",
+      "encoded": "a7b"
+    },
+    {
+      "input": "8",
+      "encoded": "8"
+    },
+    {
+      "input": "a8b",
+      "encoded": "a8b"
+    },
+    {
+      "input": "9",
+      "encoded": "9"
+    },
+    {
+      "input": "a9b",
+      "encoded": "a9b"
+    },
+    {
+      "input": ":",
+      "encoded": "%3A"
+    },
+    {
+      "input": "a:b",
+      "encoded": "a%3Ab"
+    },
+    {
+      "input": ";",
+      "encoded": "%3B"
+    },
+    {
+      "input": "a;b",
+      "encoded": "a%3Bb"
+    },
+    {
+      "input": "<",
+      "encoded": "%3C"
+    },
+    {
+      "input": "a<b",
+      "encoded": "a%3Cb"
+    },
+    {
+      "input": "=",
+      "encoded": "%3D"
+    },
+    {
+      "input": "a=b",
+      "encoded": "a%3Db"
+    },
+    {
+      "input": ">",
+      "encoded": "%3E"
+    },
+    {
+      "input": "a>b",
+      "encoded": "a%3Eb"
+    },
+    {
+      "input": "?",
+      "encoded": "%3F"
+    },
+    {
+      "input": "a?b",
+      "encoded": "a%3Fb"
+    },
+    {
+      "input": "@",
+      "encoded": "%40"
+    },
+    {
+      "input": "a@b",
+      "encoded": "a%40b"
+    },
+    {
+      "input": "A",
+      "encoded": "A"
+    },
+    {
+      "input": "aAb",
+      "encoded": "aAb"
+    },
+    {
+      "input": "B",
+      "encoded": "B"
+    },
+    {
+      "input": "aBb",
+      "encoded": "aBb"
+    },
+    {
+      "input": "C",
+      "encoded": "C"
+    },
+    {
+      "input": "aCb",
+      "encoded": "aCb"
+    },
+    {
+      "input": "D",
+      "encoded": "D"
+    },
+    {
+      "input": "aDb",
+      "encoded": "aDb"
+    },
+    {
+      "input": "E",
+      "encoded": "E"
+    },
+    {
+      "input": "aEb",
+      "encoded": "aEb"
+    },
+    {
+      "input": "F",
+      "encoded": "F"
+    },
+    {
+      "input": "aFb",
+      "encoded": "aFb"
+    },
+    {
+      "input": "G",
+      "encoded": "G"
+    },
+    {
+      "input": "aGb",
+      "encoded": "aGb"
+    },
+    {
+      "input": "H",
+      "encoded": "H"
+    },
+    {
+      "input": "aHb",
+      "encoded": "aHb"
+    },
+    {
+      "input": "I",
+      "encoded": "I"
+    },
+    {
+      "input": "aIb",
+      "encoded": "aIb"
+    },
+    {
+      "input": "J",
+      "encoded": "J"
+    },
+    {
+      "input": "aJb",
+      "encoded": "aJb"
+    },
+    {
+      "input": "K",
+      "encoded": "K"
+    },
+    {
+      "input": "aKb",
+      "encoded": "aKb"
+    },
+    {
+      "input": "L",
+      "encoded": "L"
+    },
+    {
+      "input": "aLb",
+      "encoded": "aLb"
+    },
+    {
+      "input": "M",
+      "encoded": "M"
+    },
+    {
+      "input": "aMb",
+      "encoded": "aMb"
+    },
+    {
+      "input": "N",
+      "encoded": "N"
+    },
+    {
+      "input": "aNb",
+      "encoded": "aNb"
+    },
+    {
+      "input": "O",
+      "encoded": "O"
+    },
+    {
+      "input": "aOb",
+      "encoded": "aOb"
+    },
+    {
+      "input": "P",
+      "encoded": "P"
+    },
+    {
+      "input": "aPb",
+      "encoded": "aPb"
+    },
+    {
+      "input": "Q",
+      "encoded": "Q"
+    },
+    {
+      "input": "aQb",
+      "encoded": "aQb"
+    },
+    {
+      "input": "R",
+      "encoded": "R"
+    },
+    {
+      "input": "aRb",
+      "encoded": "aRb"
+    },
+    {
+      "input": "S",
+      "encoded": "S"
+    },
+    {
+      "input": "aSb",
+      "encoded": "aSb"
+    },
+    {
+      "input": "T",
+      "encoded": "T"
+    },
+    {
+      "input": "aTb",
+      "encoded": "aTb"
+    },
+    {
+      "input": "U",
+      "encoded": "U"
+    },
+    {
+      "input": "aUb",
+      "encoded": "aUb"
+    },
+    {
+      "input": "V",
+      "encoded": "V"
+    },
+    {
+      "input": "aVb",
+      "encoded": "aVb"
+    },
+    {
+      "input": "W",
+      "encoded": "W"
+    },
+    {
+      "input": "aWb",
+      "encoded": "aWb"
+    },
+    {
+      "input": "X",
+      "encoded": "X"
+    },
+    {
+      "input": "aXb",
+      "encoded": "aXb"
+    },
+    {
+      "input": "Y",
+      "encoded": "Y"
+    },
+    {
+      "input": "aYb",
+      "encoded": "aYb"
+    },
+    {
+      "input": "Z",
+      "encoded": "Z"
+    },
+    {
+      "input": "aZb",
+      "encoded": "aZb"
+    },
+    {
+      "input": "[",
+      "encoded": "%5B"
+    },
+    {
+      "input": "a[b",
+      "encoded": "a%5Bb"
+    },
+    {
+      "input": "\\",
+      "encoded": "%5C"
+    },
+    {
+      "input": "a\\b",
+      "encoded": "a%5Cb"
+    },
+    {
+      "input": "]",
+      "encoded": "%5D"
+    },
+    {
+      "input": "a]b",
+      "encoded": "a%5Db"
+    },
+    {
+      "input": "^",
+      "encoded": "%5E"
+    },
+    {
+      "input": "a^b",
+      "encoded": "a%5Eb"
+    },
+    {
+      "input": "_",
+      "encoded": "_"
+    },
+    {
+      "input": "a_b",
+      "encoded": "a_b"
+    },
+    {
+      "input": "`",
+      "encoded": "%60"
+    },
+    {
+      "input": "a`b",
+      "encoded": "a%60b"
+    },
+    {
+      "input": "a",
+      "encoded": "a"
+    },
+    {
+      "input": "aab",
+      "encoded": "aab"
+    },
+    {
+      "input": "b",
+      "encoded": "b"
+    },
+    {
+      "input": "abb",
+      "encoded": "abb"
+    },
+    {
+      "input": "c",
+      "encoded": "c"
+    },
+    {
+      "input": "acb",
+      "encoded": "acb"
+    },
+    {
+      "input": "d",
+      "encoded": "d"
+    },
+    {
+      "input": "adb",
+      "encoded": "adb"
+    },
+    {
+      "input": "e",
+      "encoded": "e"
+    },
+    {
+      "input": "aeb",
+      "encoded": "aeb"
+    },
+    {
+      "input": "f",
+      "encoded": "f"
+    },
+    {
+      "input": "afb",
+      "encoded": "afb"
+    },
+    {
+      "input": "g",
+      "encoded": "g"
+    },
+    {
+      "input": "agb",
+      "encoded": "agb"
+    },
+    {
+      "input": "h",
+      "encoded": "h"
+    },
+    {
+      "input": "ahb",
+      "encoded": "ahb"
+    },
+    {
+      "input": "i",
+      "encoded": "i"
+    },
+    {
+      "input": "aib",
+      "encoded": "aib"
+    },
+    {
+      "input": "j",
+      "encoded": "j"
+    },
+    {
+      "input": "ajb",
+      "encoded": "ajb"
+    },
+    {
+      "input": "k",
+      "encoded": "k"
+    },
+    {
+      "input": "akb",
+      "encoded": "akb"
+    },
+    {
+      "input": "l",
+      "encoded": "l"
+    },
+    {
+      "input": "alb",
+      "encoded": "alb"
+    },
+    {
+      "input": "m",
+      "encoded": "m"
+    },
+    {
+      "input": "amb",
+      "encoded": "amb"
+    },
+    {
+      "input": "n",
+      "encoded": "n"
+    },
+    {
+      "input": "anb",
+      "encoded": "anb"
+    },
+    {
+      "input": "o",
+      "encoded": "o"
+    },
+    {
+      "input": "aob",
+      "encoded": "aob"
+    },
+    {
+      "input": "p",
+      "encoded": "p"
+    },
+    {
+      "input": "apb",
+      "encoded": "apb"
+    },
+    {
+      "input": "q",
+      "encoded": "q"
+    },
+    {
+      "input": "aqb",
+      "encoded": "aqb"
+    },
+    {
+      "input": "r",
+      "encoded": "r"
+    },
+    {
+      "input": "arb",
+      "encoded": "arb"
+    },
+    {
+      "input": "s",
+      "encoded": "s"
+    },
+    {
+      "input": "asb",
+      "encoded": "asb"
+    },
+    {
+      "input": "t",
+      "encoded": "t"
+    },
+    {
+      "input": "atb",
+      "encoded": "atb"
+    },
+    {
+      "input": "u",
+      "encoded": "u"
+    },
+    {
+      "input": "aub",
+      "encoded": "aub"
+    },
+    {
+      "input": "v",
+      "encoded": "v"
+    },
+    {
+      "input": "avb",
+      "encoded": "avb"
+    },
+    {
+      "input": "w",
+      "encoded": "w"
+    },
+    {
+      "input": "awb",
+      "encoded": "awb"
+    },
+    {
+      "input": "x",
+      "encoded": "x"
+    },
+    {
+      "input": "axb",
+      "encoded": "axb"
+    },
+    {
+      "input": "y",
+      "encoded": "y"
+    },
+    {
+      "input": "ayb",
+      "encoded": "ayb"
+    },
+    {
+      "input": "z",
+      "encoded": "z"
+    },
+    {
+      "input": "azb",
+      "encoded": "azb"
+    },
+    {
+      "input": "{",
+      "encoded": "%7B"
+    },
+    {
+      "input": "a{b",
+      "encoded": "a%7Bb"
+    },
+    {
+      "input": "|",
+      "encoded": "%7C"
+    },
+    {
+      "input": "a|b",
+      "encoded": "a%7Cb"
+    },
+    {
+      "input": "}",
+      "encoded": "%7D"
+    },
+    {
+      "input": "a}b",
+      "encoded": "a%7Db"
+    },
+    {
+      "input": "~",
+      "encoded": "%7E"
+    },
+    {
+      "input": "a~b",
+      "encoded": "a%7Eb"
+    },
+    {
+      "input": "é",
+      "encoded": "%C3%A9"
+    },
+    {
+      "input": "ü",
+      "encoded": "%C3%BC"
+    },
+    {
+      "input": "中",
+      "encoded": "%E4%B8%AD"
+    },
+    {
+      "input": "文",
+      "encoded": "%E6%96%87"
+    },
+    {
+      "input": "🙂",
+      "encoded": "%F0%9F%99%82"
+    },
+    {
+      "input": "é",
+      "encoded": "e%CC%81"
+    },
+    {
+      "input": "€",
+      "encoded": "%E2%82%AC"
+    },
+    {
+      "input": "/m~abc/seg-1",
+      "encoded": "%2Fm%7Eabc%2Fseg-1"
+    },
+    {
+      "input": "%7E",
+      "encoded": "%257E"
+    },
+    {
+      "input": "100%",
+      "encoded": "100%25"
+    },
+    {
+      "input": "&=",
+      "encoded": "%26%3D"
+    },
+    {
+      "input": "wss://x/?a=b&c=d",
+      "encoded": "wss%3A%2F%2Fx%2F%3Fa%3Db%26c%3Dd"
+    },
+    {
+      "input": "key=va lue&x=1",
+      "encoded": "key%3Dva+lue%26x%3D1"
+    }
+  ]
+}

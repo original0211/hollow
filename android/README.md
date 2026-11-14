@@ -25,7 +25,7 @@ locally the same steps:
 #       Android SDK platform 34 · build-tools 34.0.0 · NDK 27.0.12077973
 #       gomobile golang.org/x/mobile v0.0.0-20261011034528-197770444867
 go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20261011034528-197770444867
-cd core && go test ./... && gomobile init
+cd core && ./run-tests.sh && gomobile init   # run-tests.sh: lock suites (core/pairing) always -count=1 — their fixtures live outside the Go package graph and the test cache cannot see them change (NP-1114-41)
 gomobile bind -target=android/arm64 -androidapi=26 -o ../app/libs/hollowcore.aar .
 cd .. && gradle :app:assembleDebug
 ```
