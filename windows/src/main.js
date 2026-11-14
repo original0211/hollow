@@ -32,7 +32,14 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // single source of truth. Pre-existing hollow-windows dirs hold only
 // Chromium caches (Hollow data always lived in configDir()) and are
 // ignored — no migration, and nothing is ever auto-deleted.
-try { app.setPath("userData", configDir()); } catch { /* keep Electron default */ }
+try {
+  app.setPath("userData", configDir());
+  console.log(`userData: unified into the config dir (${configDir()})`);
+} catch (e) {
+  // Never silent (NP-1114-35 closeout): if unification fails the two
+  // homes diverge again — that fact must be visible in the log.
+  console.log(`userData: unification FAILED (${e.message}) — Electron default applies (${app.getPath("userData")}); config/PSK still use the config dir`);
+}
 let cfg = loadConfig();
 // Config persistence must never take the app down (M2-5 hardening): a locked
 // or temporarily unwritable config dir logs and keeps the in-memory state.
