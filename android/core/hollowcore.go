@@ -9,7 +9,7 @@ package hollowcore
 // status placeholder — if this string renders on device, the whole
 // gomobile chain (bind, AAR packaging, JNI) is alive.
 func Version() string {
-	return "hollowcore 0.1.0 (M3-0 skeleton)"
+	return "hollowcore 0.2.0 (M3-1 core)"
 }
 
 // Echo round-trips a string across the binding boundary (both

@@ -8,7 +8,7 @@ D5 arm64-v8a only / D8 applicationId below).
 
 | Path | What |
 |---|---|
-| `core/` | Go module `hollow/androidcore` — the binding seam. M3-0: placeholder API (`Version`/`Echo`); M3-1 ports the protocol core behind this seam |
+| `core/` | Go module `hollow/androidcore` — the binding seam (`Version`/`Echo`) plus, since M3-1, the full protocol core port in `core/core/` (package `core`), locked to the JS canonical implementation by `core/testvectors/vectors-v0.1.2.json` (policy: `core/VECTORS.md`) |
 | `app/` | Kotlin shell: `MainActivity` (status placeholder + consent flow) and `HollowVpnService` (foreground skeleton; **no `establish()` until M3-2**) |
 | `app/libs/hollowcore.aar` | gomobile output — build artifact, git-ignored, produced by the bind step below |
 
