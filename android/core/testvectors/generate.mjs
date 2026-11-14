@@ -126,7 +126,7 @@ V.handshake = {
   const frames = [
     buildFrame(FT.FINISH, 0, finC),
     buildFrame(FT.DATA, 1, new TextEncoder().encode("abc")),
-    buildFrame(FT.DATA, 1, rep(0x61, 5000)), // forces a second bucket
+    buildFrame(FT.DATA, 1, rep(0x61, 5000)), // lifts the blob into the 16384 bucket (still ONE record)
     buildFrame(FT.PING, 0, un("01020304")),
   ];
   const { records, nextSeq } = sealRecords(sess.kC2s, sess.ivC2s, 0, frames);
@@ -140,6 +140,32 @@ V.handshake = {
     key: hx(sess.kC2s), iv: hx(sess.ivC2s),
     framesHex: frames.map(hx), recordsHex: records.map(hx), nextSeq, framesBlobsHex: blobs,
     bucketFor: [0, 100, 510, 511, 4094, 4095, 16382].map((n) => [n, bucketFor(n)]),
+  };
+}
+
+// Forced multi-record set (NP-1114-34): three frames each just under
+// the per-record blob capacity (16,382) — no two fit in one record, so
+// sealing MUST produce exactly three records. Guards the packing split
+// that the single-record set above cannot see.
+{
+  const frames = [
+    buildFrame(FT.DATA, 3, rep(0x62, 16000)),
+    buildFrame(FT.DATA, 3, rep(0x63, 16000)),
+    buildFrame(FT.DATA, 4, rep(0x64, 16000)),
+  ];
+  const { records, nextSeq } = sealRecords(sess.kS2c, sess.ivS2c, 0, frames);
+  if (records.length !== 3 || nextSeq !== 3) {
+    throw new Error(`multi-record construction failed: ${records.length} records`);
+  }
+  const rx = new RecordReceiver(sess.kS2c, sess.ivS2c);
+  const blobs = records.map((r) => {
+    const opened = rx.open(r);
+    if (!opened) throw new Error("multi record open failed in generator");
+    return hx(opened.framesBlob);
+  });
+  V.recordsMulti = {
+    key: hx(sess.kS2c), iv: hx(sess.ivS2c),
+    framesHex: frames.map(hx), recordsHex: records.map(hx), nextSeq, framesBlobsHex: blobs,
   };
 }
 

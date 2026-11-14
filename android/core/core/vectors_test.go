@@ -5,7 +5,9 @@ package core
 // anchored at generation time (RFC constants / BigInt ladder).
 import (
 	"encoding/hex"
+
 	"encoding/json"
+	"golang.org/x/crypto/chacha20poly1305"
 	"os"
 	"testing"
 )
@@ -37,6 +39,13 @@ type vectors struct {
 		FramesBlobsHex []string
 		BucketFor      [][2]*int
 	} `json:"records"`
+	RecordsMulti struct {
+		Key, Iv        string
+		FramesHex      []string
+		RecordsHex     []string
+		NextSeq        uint64
+		FramesBlobsHex []string
+	} `json:"recordsMulti"`
 	Frames struct {
 		GoodBlob            string
 		GoodCount           int
@@ -198,8 +207,8 @@ func TestRecordVectors(t *testing.T) {
 			t.Fatalf("BucketFor(%d) = %d/%v, want %d", *pair[0], got, ok, *pair[1])
 		}
 	}
-	// Negative: a tampered record must fail, and a wrong-sequence record
-	// must fail (fresh receiver, second record first).
+	// Negative: a tampered record must fail and count. (Out-of-order
+	// delivery needs a multi-record set — see TestRecordMultiVector.)
 	rx2 := NewRecordReceiver(un(t, r.Key), un(t, r.Iv))
 	if len(r.RecordsHex) > 0 {
 		bad := un(t, r.RecordsHex[0])
@@ -279,4 +288,96 @@ func splitDots(s string) []byte {
 		}
 	}
 	return out
+}
+
+// TestRecordMultiVector covers the forced multi-record set (NP-1114-34):
+// sealing must split into exactly the recorded records, in-order opens
+// must reproduce each frames blob, and OUT-OF-ORDER delivery must fail —
+// a fresh receiver fed record[1] first cannot open it (its nonce is
+// bound to seq 1 while seq 0 is expected), and a receiver that consumed
+// record[0] cannot open record[2].
+func TestRecordMultiVector(t *testing.T) {
+	v := loadVectors(t)
+	r := v.RecordsMulti
+	frames := make([][]byte, len(r.FramesHex))
+	for i, f := range r.FramesHex {
+		frames[i] = un(t, f)
+	}
+	records, nextSeq, err := SealRecords(un(t, r.Key), un(t, r.Iv), 0, frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) < 2 {
+		t.Fatalf("construction did not force multiple records: %d", len(records))
+	}
+	if nextSeq != r.NextSeq || len(records) != len(r.RecordsHex) {
+		t.Fatalf("seal shape: %d records nextSeq %d", len(records), nextSeq)
+	}
+	for i := range records {
+		eqHex(t, "multi sealed record", records[i], r.RecordsHex[i])
+	}
+	rx := NewRecordReceiver(un(t, r.Key), un(t, r.Iv))
+	for i, rec := range r.RecordsHex {
+		blob := rx.Open(un(t, rec))
+		if blob == nil {
+			t.Fatalf("multi record %d failed to open in order", i)
+		}
+		eqHex(t, "multi opened blob", blob, r.FramesBlobsHex[i])
+	}
+	// Out of order, fresh receiver: record[1] first must fail.
+	rxLate := NewRecordReceiver(un(t, r.Key), un(t, r.Iv))
+	if blob := rxLate.Open(un(t, r.RecordsHex[1])); blob != nil {
+		t.Fatal("out-of-order record[1] opened on a fresh receiver")
+	}
+	if rxLate.ConsecFails != 1 {
+		t.Fatalf("out-of-order consecFails = %d, want 1", rxLate.ConsecFails)
+	}
+	// The failed open must not have advanced the sequence: record[0]
+	// still opens afterwards.
+	if blob := rxLate.Open(un(t, r.RecordsHex[0])); blob == nil {
+		t.Fatal("record[0] no longer opens after the out-of-order failure")
+	}
+	// Out of order mid-stream: consumed [0], record[2] must fail.
+	rxSkip := NewRecordReceiver(un(t, r.Key), un(t, r.Iv))
+	if blob := rxSkip.Open(un(t, r.RecordsHex[0])); blob == nil {
+		t.Fatal("record[0] failed on skip receiver")
+	}
+	if blob := rxSkip.Open(un(t, r.RecordsHex[2])); blob != nil {
+		t.Fatal("skipped-to record[2] opened out of order")
+	}
+}
+
+// TestRFCAnchorsDirect hard-anchors the Go primitives to published RFC
+// constants WITHOUT the vector file in between (NP-1114-34收口: the Go
+// side checks RFC first, then JS — as VECTORS.md states). ChaCha uses
+// the RFC 8439 §A.5 AEAD vector (with AAD, via the library directly;
+// the protocol's own seal uses nil AAD and is anchored to JS through
+// the vector set plus this shared library anchor).
+func TestRFCAnchorsDirect(t *testing.T) {
+	// RFC 5869 Test Case 1.
+	ikm := make([]byte, 22)
+	for i := range ikm {
+		ikm[i] = 0x0b
+	}
+	prk := hkdfExtract(un(t, "000102030405060708090a0b0c"), ikm)
+	eqHex(t, "RFC5869 prk", prk, "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
+	eqHex(t, "RFC5869 okm", hkdfExpand(prk, un(t, "f0f1f2f3f4f5f6f7f8f9"), 42),
+		"3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+	// RFC 4231 Test Case 1.
+	key := make([]byte, 20)
+	for i := range key {
+		key[i] = 0x0b
+	}
+	eqHex(t, "RFC4231 hmac", hmacSHA256(key, []byte("Hi There")),
+		"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+	// RFC 8439 §A.5 AEAD (the "sunscreen" vector).
+	aead, err := chacha20poly1305.New(un(t, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt := []byte("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+	sealed := aead.Seal(nil, un(t, "070000004041424344454647"), pt, un(t, "50515253c0c1c2c3c4c5c6c7"))
+	eqHex(t, "RFC8439 A.5 sealed", sealed,
+		"d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116"+
+			"1ae10b594f09e26a7e902ecbd0600691")
 }
