@@ -41,7 +41,13 @@ func (b fakeBox) Open(token string) ([]byte, error) {
 	return out, nil
 }
 
-var testPSK = func() []byte { b := make([]byte, 32); for i := range b { b[i] = byte(i) }; return b }()
+var testPSK = func() []byte {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = byte(i)
+	}
+	return b
+}()
 
 func setupPairing(t *testing.T) string {
 	t.Helper()

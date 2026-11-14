@@ -8,6 +8,8 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.VpnService
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -17,38 +19,62 @@ import hollowcore.Hollowcore
 import org.json.JSONObject
 
 /**
- * Shell screen: core seam status, VPN consent + start/stop, and —
- * since M3-3 — the pairing import/export panel. Every import surface
- * (paste, file, QR image, camera, clipboard) feeds ONE funnel:
- * Hollowcore.stageImport -> in-app preview confirmation ->
- * Hollowcore.confirmImport. Nothing is applied without the explicit
- * confirmation click, mirroring Windows M2-3.
+ * Main screen (M3-4 formalized minimal surface): a status card fed by
+ * a 1-second poll of the Go facade's state JSON (the service owns the
+ * session; this screen only presents), connection controls, and the
+ * M3-3 pairing panel. Copy follows the Windows fixed wording where
+ * the plan pins it; the mode presentation is honest — Android has no
+ * system-proxy mode, only VPN on/off.
  */
 class MainActivity : Activity() {
 
-    private lateinit var status: TextView
+    private lateinit var stateView: TextView
+    private lateinit var detailView: TextView
+    private lateinit var statsView: TextView
+    private lateinit var noticesView: TextView
+    private lateinit var configView: TextView
+    private lateinit var pairingHeader: TextView
+    private lateinit var connectButton: Button
+    private lateinit var log: TextView
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val poll = object : Runnable {
+        override fun run() {
+            renderState()
+            handler.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         HollowInit.ensure(this)
 
-        status = TextView(this).apply {
-            textSize = 15f
-            text = "核心通路：${Hollowcore.version()}\n状态：未连接"
-        }
+        stateView = TextView(this).apply { textSize = 20f; text = "未连接" }
+        detailView = TextView(this)
+        statsView = TextView(this)
+        noticesView = TextView(this)
+        configView = TextView(this)
+        log = TextView(this).apply { textSize = 13f }
+
         fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
             text = label
             setOnClickListener { onClick() }
         }
+        connectButton = btn("开启 VPN") { requestConsentOrStart() }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(status)
-            addView(btn("开启 VPN") { requestConsentOrStart() })
+            addView(stateView)
+            addView(detailView)
+            addView(statsView)
+            addView(noticesView)
+            addView(configView)
+            addView(connectButton)
             addView(btn("停止") {
                 startService(Intent(this@MainActivity, HollowVpnService::class.java).setAction(HollowVpnService.ACTION_STOP))
-                status.append("\n已停止（状态位已清除，不会被系统拉活）")
+                log.append("\n已停止（状态位已清除，不会被系统拉活）")
             })
-            addView(TextView(this@MainActivity).apply { text = "\n— 配对导入 —" })
+            pairingHeader = TextView(this@MainActivity).apply { text = "\n— 配对导入 —" }
+            addView(pairingHeader)
             addView(btn("粘贴导入（链接或 JSON 文本）") { showPasteImport() })
             addView(btn("从剪贴板读二维码图导入") { importFromClipboardImage() })
             addView(btn("从文件导入（.hollow.json）") {
@@ -79,29 +105,79 @@ class MainActivity : Activity() {
                     }, REQ_CREATE_FILE)
                 }
             })
+            addView(TextView(this@MainActivity).apply { text = "\n— 记录 —" })
+            addView(log)
         }
         setContentView(ScrollView(this).apply { addView(layout) })
-        refreshConfiguredLine()
+        renderState()
     }
 
-    private var pendingExportJson: String? = null
+    override fun onResume() {
+        super.onResume()
+        handler.post(poll)
+    }
 
-    private fun refreshConfiguredLine() {
-        val configured = try {
-            JSONObject(Hollowcore.storedRuntimeConfigJSON()).optString("wsUrl")
+    override fun onPause() {
+        handler.removeCallbacks(poll)
+        super.onPause()
+    }
+
+    /** Renders the facade state into the status card. Error states
+     *  always carry their reason — never a silent blank. */
+    private fun renderState() {
+        val st = try {
+            JSONObject(Hollowcore.vpnStateJSON())
         } catch (e: Exception) {
-            null
+            stateView.text = "状态读取失败"
+            detailView.text = e.message ?: ""
+            return
         }
-        status.text = "核心通路：${Hollowcore.version()}\n状态：未连接\n" +
-            (if (configured != null) "已配对：$configured" else "未配对：请先导入配置")
+        val state = st.optString("state")
+        val configured = st.optBoolean("configured")
+        stateView.text = when (state) {
+            "connected" -> "已连接"
+            "connecting" -> "连接中…"
+            "error" -> "连接失败"
+            else -> "未连接"
+        }
+        val detail = StringBuilder(st.optString("detail"))
+        if (state == "connected" && st.optLong("sinceMs") > 0) {
+            val secs = (System.currentTimeMillis() - st.optLong("sinceMs")) / 1000
+            detail.append("已连接 " + fmtDuration(secs))
+        }
+        detailView.text = detail.toString()
+        val stats = st.optJSONObject("stats")
+        statsView.text = if (stats != null && state != "disconnected") {
+            "载体 ${st.optInt("carriers")} · 流 ${st.optInt("streams")}（活跃 ${stats.optLong("activeFlows")}）\n" +
+                "DNS 查询 ${stats.optLong("dnsQueries")} · 解析 ${stats.optLong("dnsResolved")} · SERVFAIL ${stats.optLong("dnsServfail")}\n" +
+                "UDP 丢弃 ${stats.optLong("droppedUdp")} · IPv6 丢弃 ${stats.optLong("droppedV6")}"
+        } else {
+            ""
+        }
+        // The two fixed notices, verbatim (plan §6): they describe
+        // what the data plane DOES with v6 / UDP while connected.
+        noticesView.text = if (state == "connected") "IPv6 已阻断 · UDP 流量不经过 Hollow 加密通道" else ""
+        configView.text = if (configured) {
+            "目标：${st.optString("wsUrl")} · keyId ${st.optInt("keyId")}"
+        } else {
+            "未配对：请先完成下方配对导入"
+        }
+        pairingHeader.text = if (configured) "\n— 配对导入 —" else "\n— 配对导入（先完成这一步） —"
+        connectButton.isEnabled = configured
+        connectButton.text = if (configured) "开启 VPN" else "开启 VPN（未配对）"
     }
 
-    // ---- the one import funnel ----
+    private fun fmtDuration(totalSecs: Long): String {
+        val s = maxOf(0, totalSecs)
+        return String.format("%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+    }
+
+    // ---- the one import funnel (M3-3, unchanged semantics) ----
     private fun funnel(text: String) {
         val previewJson = try {
             Hollowcore.stageImport(text)
         } catch (e: Exception) {
-            status.append("\n导入被拒绝：${e.message}")
+            log.append("\n导入被拒绝：${e.message}")
             return
         }
         val pv = JSONObject(previewJson)
@@ -121,15 +197,15 @@ class MainActivity : Activity() {
             .setPositiveButton("确认导入并覆盖") { _, _ ->
                 try {
                     Hollowcore.confirmImport()
-                    status.append("\n导入已应用。")
-                    refreshConfiguredLine()
+                    log.append("\n导入已应用。")
+                    renderState()
                 } catch (e: Exception) {
-                    status.append("\n导入失败：${e.message}")
+                    log.append("\n导入失败：${e.message}")
                 }
             }
             .setNegativeButton("取消") { _, _ ->
                 Hollowcore.cancelImport()
-                status.append("\n已取消导入。")
+                log.append("\n已取消导入。")
             }
             .setOnCancelListener { Hollowcore.cancelImport() }
             .show()
@@ -154,15 +230,15 @@ class MainActivity : Activity() {
                 ?: throw IllegalStateException("剪贴板图片读取失败")
             funnel(QrDecode.decodeBitmap(bmp))
         } catch (e: Exception) {
-            status.append("\n剪贴板导入失败：${e.message}")
+            log.append("\n剪贴板导入失败：${e.message}")
         }
     }
 
-    // ---- export ----
+    // ---- export (M3-3, unchanged semantics) ----
+    private var pendingExportJson: String? = null
+    private var pendingExportIsLink = true
+
     private fun askExportPsk(build: (String) -> Unit) {
-        // First ask whether the PSK rides along; a second, explicit
-        // danger confirmation gates the with-PSK variant (Windows
-        // export semantics).
         AlertDialog.Builder(this)
             .setTitle("导出范围")
             .setMessage("是否在导出中包含 PSK 本体？")
@@ -183,11 +259,9 @@ class MainActivity : Activity() {
         try {
             build(if (pendingExportIsLink) Hollowcore.exportLink(includePsk) else Hollowcore.exportConfigJSON(includePsk))
         } catch (e: Exception) {
-            status.append("\n导出失败：${e.message}")
+            log.append("\n导出失败：${e.message}")
         }
     }
-
-    private var pendingExportIsLink = true
 
     private fun showLinkDialog(link: String) {
         AlertDialog.Builder(this)
@@ -196,13 +270,13 @@ class MainActivity : Activity() {
             .setPositiveButton("复制") { _, _ ->
                 getSystemService(ClipboardManager::class.java)
                     .setPrimaryClip(ClipData.newPlainText("hollow link", link))
-                status.append("\n链接已复制到剪贴板")
+                log.append("\n链接已复制到剪贴板")
             }
             .setNegativeButton("关闭", null)
             .show()
     }
 
-    // ---- VPN consent / start (unchanged semantics) ----
+    // ---- VPN consent / start ----
     private fun requestConsentOrStart() {
         val consent = VpnService.prepare(this)
         if (consent != null) {
@@ -217,7 +291,8 @@ class MainActivity : Activity() {
         startForegroundService(
             Intent(this, HollowVpnService::class.java).setAction(HollowVpnService.ACTION_START)
         )
-        status.append("\n服务已启动（前台通知应出现；无配置时服务会 fail-closed 自停）")
+        log.append("\n服务已启动（无配置/启动失败时状态卡会明示原因）")
+        handler.postDelayed({ renderState() }, 600)
     }
 
     @Deprecated("Skeleton-era result flow; kept simple")
@@ -226,7 +301,7 @@ class MainActivity : Activity() {
         when (requestCode) {
             REQUEST_VPN_CONSENT -> {
                 if (resultCode == RESULT_OK) startVpnService()
-                else status.append("\nVPN 授权被拒绝——不启动")
+                else log.append("\nVPN 授权被拒绝——不启动")
             }
             REQ_OPEN_FILE -> {
                 if (resultCode != RESULT_OK) return
@@ -236,7 +311,7 @@ class MainActivity : Activity() {
                         ?: throw IllegalStateException("文件读取失败")
                     funnel(text)
                 } catch (e: Exception) {
-                    status.append("\n文件导入失败：${e.message}")
+                    log.append("\n文件导入失败：${e.message}")
                 }
             }
             REQ_OPEN_IMAGE -> {
@@ -247,7 +322,7 @@ class MainActivity : Activity() {
                         ?: throw IllegalStateException("图片读取失败")
                     funnel(QrDecode.decodeBitmap(bmp))
                 } catch (e: Exception) {
-                    status.append("\n图片扫码失败：${e.message}")
+                    log.append("\n图片扫码失败：${e.message}")
                 }
             }
             REQ_SCAN -> {
@@ -262,9 +337,9 @@ class MainActivity : Activity() {
                 val uri = data?.data ?: return
                 try {
                     contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray(Charsets.UTF_8)) }
-                    status.append("\n已导出 .hollow.json")
+                    log.append("\n已导出 .hollow.json")
                 } catch (e: Exception) {
-                    status.append("\n导出写入失败：${e.message}")
+                    log.append("\n导出写入失败：${e.message}")
                 }
             }
         }

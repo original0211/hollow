@@ -103,15 +103,15 @@ func (f *flow) close() {
 
 // Stats is a point-in-time snapshot for status reporting.
 type Stats struct {
-	ActiveFlows int
-	TotalFlows  uint64
-	RefusedFull uint64
-	DroppedUDP  uint64
-	DroppedV6   uint64 // IPv6 fast-reject counter (notes v2 §2)
-	DNSQueries  uint64
-	DNSResolved uint64
-	DNSServfail uint64
-	DNSConns    uint64 // upstream connections ever made (reuse proof, spec §4)
+	ActiveFlows int    `json:"activeFlows"`
+	TotalFlows  uint64 `json:"totalFlows"`
+	RefusedFull uint64 `json:"refusedFull"`
+	DroppedUDP  uint64 `json:"droppedUdp"`
+	DroppedV6   uint64 `json:"droppedV6"` // IPv6 fast-reject counter (notes v2 §2)
+	DNSQueries  uint64 `json:"dnsQueries"`
+	DNSResolved uint64 `json:"dnsResolved"`
+	DNSServfail uint64 `json:"dnsServfail"`
+	DNSConns    uint64 `json:"dnsConns"` // upstream connections ever made (reuse proof, spec §4)
 }
 
 // Pump owns the netstack and the flow table.

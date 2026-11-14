@@ -44,6 +44,51 @@ import session.Protector
 class HollowVpnService : VpnService() {
 
     private var sessionRunning = false
+    private var notifThread: Thread? = null
+
+    /** Notification text from the facade state (M3-4): state label,
+     *  elapsed time, and the two counters a glance should carry. */
+    private fun notifText(): String {
+        return try {
+            val st = org.json.JSONObject(Hollowcore.vpnStateJSON())
+            val label = when (st.optString("state")) {
+                "connected" -> "已连接"
+                "connecting" -> "连接中"
+                "error" -> "连接失败"
+                else -> "未连接"
+            }
+            val stats = st.optJSONObject("stats")
+            val dns = stats?.optLong("dnsQueries") ?: 0
+            val drops = (stats?.optLong("droppedUdp") ?: 0) + (stats?.optLong("droppedV6") ?: 0)
+            "Hollow $label · DNS 查询 $dns · 丢弃 $drops"
+        } catch (e: Exception) {
+            "Hollow 隧道运行中"
+        }
+    }
+
+    private fun startNotifTicker() {
+        stopNotifTicker()
+        notifThread = Thread {
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    Thread.sleep(2000)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (!sessionRunning) break
+                try {
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm.notify(NOTIFICATION_ID, buildNotification(notifText()))
+                } catch (_: Exception) {
+                }
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    private fun stopNotifTicker() {
+        notifThread?.interrupt()
+        notifThread = null
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -115,6 +160,7 @@ class HollowVpnService : VpnService() {
         return try {
             Hollowcore.startVPN(cfg, fd, ProtectorBridge())
             sessionRunning = true
+            startNotifTicker()
             true
         } catch (e: Exception) {
             false
@@ -122,6 +168,7 @@ class HollowVpnService : VpnService() {
     }
 
     private fun stopSession() {
+        stopNotifTicker()
         if (sessionRunning) {
             try { Hollowcore.stopVPN() } catch (_: Exception) {}
             sessionRunning = false
@@ -157,6 +204,21 @@ class HollowVpnService : VpnService() {
         super.onDestroy()
     }
 
+    private fun buildNotification(text: String): Notification {
+        // Tapping the notification returns to the main screen (M3-4).
+        val tap = android.app.PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(text)
+            .setContentIntent(tap)
+            .setSmallIcon(android.R.drawable.ic_lock_lock) // placeholder icon; real asset in M3-5
+            .build()
+    }
+
     private fun promoteToForeground() {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -164,11 +226,7 @@ class HollowVpnService : VpnService() {
                 NotificationChannel(CHANNEL_ID, getString(R.string.vpn_channel_name), NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.vpn_notification_text))
-            .setSmallIcon(android.R.drawable.ic_lock_lock) // placeholder icon; real asset in M3-4
-            .build()
+        val notification: Notification = buildNotification(getString(R.string.vpn_notification_text))
         // API 34 form: the three-arg startForeground with the declared
         // type constant; below 34 the two-arg form is the only one.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

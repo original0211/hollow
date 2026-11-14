@@ -145,3 +145,52 @@ func TestSessionLiveLoopback(t *testing.T) {
 	}
 	conn.Close()
 }
+
+// TestSessionStateMachine (M3-4): the presentation state follows the
+// session lifecycle — connected with counters after the live loopback
+// attach, a stream success counted, disconnected after Stop.
+func TestSessionStateMachine(t *testing.T) {
+	psk := make([]byte, 32)
+	for i := range psk {
+		psk[i] = byte(0xa0 + i)
+	}
+	srv := testServer(t, psk)
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	s := &Session{
+		cfg:     Config{WSURL: wsURL, PSK: psk, KeyID: 1},
+		stopCh:  make(chan struct{}),
+		deathCh: make(chan struct{}, 1),
+		tunFD:   -1,
+		state:   "connecting",
+	}
+	if err := s.rotateCarrier(context.Background()); err != nil {
+		t.Fatalf("rotateCarrier: %v", err)
+	}
+	st := s.State()
+	if st.State != "connected" || st.Carriers != 1 || st.SinceMs == 0 {
+		t.Fatalf("state after attach: %+v", st)
+	}
+	conn, err := s.dialFlow(net.ParseIP("203.0.113.7"), 443)
+	if err != nil {
+		t.Fatalf("dialFlow: %v", err)
+	}
+	msg := []byte("state-probe")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if st := s.State(); st.StreamsOK != 1 {
+		t.Fatalf("streamsOK = %d, want 1", st.StreamsOK)
+	}
+	conn.Close()
+	s.Stop()
+	if got := s.State().State; got != "disconnected" {
+		t.Fatalf("state after Stop = %s, want disconnected", got)
+	}
+}

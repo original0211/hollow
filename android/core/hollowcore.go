@@ -12,6 +12,7 @@ import (
 	"errors"
 	"sync"
 
+	"hollow/androidcore/pump"
 	"hollow/androidcore/session"
 )
 
@@ -19,7 +20,7 @@ import (
 // status screen — if this string renders on device, the whole gomobile
 // chain (bind, AAR packaging, JNI) is alive.
 func Version() string {
-	return "hollowcore 0.4.0 (M3-3 pairing)"
+	return "hollowcore 0.5.0 (M3-4 UI state)"
 }
 
 // Echo round-trips a string across the binding boundary (both
@@ -72,8 +73,10 @@ func StartVPN(cfgJSONText string, tunFD int, protector session.Protector) error 
 		HostBase: cj.HostBase,
 	}, tunFD, protector)
 	if err != nil {
+		lastStartError = err.Error()
 		return err
 	}
+	lastStartError = ""
 	current = s
 	return nil
 }
@@ -118,4 +121,45 @@ func FetchMetaJSON() (string, error) {
 	}
 	b, _ := json.Marshal(m)
 	return string(b), nil
+}
+
+// ---- M3-4 presentation state ----
+
+// lastStartError holds the most recent StartVPN failure for the UI's
+// error state (the session object is gone by then; the reason must
+// not be). Cleared on the next successful start.
+var lastStartError string
+
+// VPNStateJSON is the status surface's single read: session state
+// machine + pump counters + pairing identity (display fields only —
+// the PSK is never part of it).
+func VPNStateJSON() string {
+	mu.Lock()
+	cur := current
+	errText := lastStartError
+	mu.Unlock()
+	snap := session.StateSnapshot{State: "disconnected"}
+	var stats pump.Stats
+	if cur != nil {
+		snap = cur.State()
+		stats = cur.Stats()
+	} else if errText != "" {
+		snap.State, snap.Detail = "error", errText
+	}
+	configured, wsURL, keyID := false, "", 0
+	if sc, err := readStored(); err == nil && sc != nil && sc.WSURL != "" {
+		configured, wsURL, keyID = sc.PSKEnc != "", sc.WSURL, sc.KeyID
+	}
+	out, _ := json.Marshal(struct {
+		State      string     `json:"state"`
+		Detail     string     `json:"detail"`
+		SinceMs    int64      `json:"sinceMs"`
+		Carriers   int        `json:"carriers"`
+		StreamsOK  int        `json:"streams"`
+		Stats      pump.Stats `json:"stats"`
+		Configured bool       `json:"configured"`
+		WSURL      string     `json:"wsUrl"`
+		KeyID      int        `json:"keyId"`
+	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID})
+	return string(out)
 }

@@ -45,6 +45,32 @@ type Session struct {
 	stopCh  chan struct{} // closed on Stop
 	deathCh chan struct{} // carrier deaths (buffered 1)
 	tunFD   int           // owned once Start succeeds; closed by Stop
+
+	// UI-facing state machine (M3-4), guarded by mu: disconnected /
+	// connecting / connected / error, plus the counters the status
+	// surface presents. The error state surfaces via Start's return
+	// (the facade keeps the reason); a live session is never in it.
+	state     string
+	detail    string
+	sinceMs   int64
+	carriers  int
+	streamsOK int
+}
+
+// StateSnapshot is the session's presentation state (no internals).
+type StateSnapshot struct {
+	State     string
+	Detail    string
+	SinceMs   int64
+	Carriers  int
+	StreamsOK int
+}
+
+// State reads the presentation snapshot.
+func (s *Session) State() StateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return StateSnapshot{s.state, s.detail, s.sinceMs, s.carriers, s.streamsOK}
 }
 
 var (
@@ -63,7 +89,7 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 	if cfg.KeyID == 0 {
 		cfg.KeyID = 1
 	}
-	s := &Session{cfg: cfg, protector: protector, stopCh: make(chan struct{}), deathCh: make(chan struct{}, 1), tunFD: tunFD}
+	s := &Session{cfg: cfg, protector: protector, stopCh: make(chan struct{}), deathCh: make(chan struct{}, 1), tunFD: tunFD, state: "connecting"}
 
 	ep, err := fdbased.New(&fdbased.Options{FDs: []int{tunFD}, MTU: 1280})
 	if err != nil {
@@ -96,6 +122,9 @@ func (s *Session) rotateCarrier(ctx context.Context) error {
 		s.mu.Lock()
 		if s.client == client {
 			s.client = nil
+			if !s.stopping {
+				s.state, s.detail = "connecting", "承载中断，正在重连"
+			}
 		}
 		stopping := s.stopping
 		s.mu.Unlock()
@@ -123,6 +152,11 @@ func (s *Session) rotateCarrier(ctx context.Context) error {
 	s.mu.Lock()
 	old := s.client
 	s.client = client
+	s.carriers++
+	if s.sinceMs == 0 {
+		s.sinceMs = time.Now().UnixMilli()
+	}
+	s.state, s.detail = "connected", ""
 	s.mu.Unlock()
 	if old != nil {
 		old.Close()
@@ -190,6 +224,9 @@ func (s *Session) dialFlow(ip net.IP, port uint16) (net.Conn, error) {
 		stream.Reset(core.ErrStreamTimeout)
 		return nil, errors.New("session: stream open timeout")
 	}
+	s.mu.Lock()
+	s.streamsOK++
+	s.mu.Unlock()
 	return newStreamConn(stream, &net.TCPAddr{IP: ip, Port: int(port)}), nil
 }
 
@@ -242,6 +279,7 @@ func (s *Session) Stop() {
 	s.stopping = true
 	client := s.client
 	s.client = nil
+	s.state, s.detail = "disconnected", ""
 	s.mu.Unlock()
 	close(s.stopCh)
 	if client != nil {
