@@ -58,7 +58,7 @@ async function refresh() {
       ? "⚠ PSK 文件已损坏——应用不会自动重建；请重新导入配置或删除 psk.bin 后重启"
       : s.psk.exists
         ? `PSK 文件：正常（${s.psk.bytes} 字节，${s.settings ? s.settings.configDir : ""}）`
-        : "PSK 文件：不存在（首次连接或测试时生成）";
+        : "PSK 文件：不存在（首启自动生成未成功——请重启应用；若反复出现请看日志并反馈）";
     $("verifier").textContent = s.psk.verifier || "—";
   }
   render();

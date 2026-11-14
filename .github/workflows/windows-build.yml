@@ -23,6 +23,8 @@ jobs:
         run: npm --prefix windows install --no-audit --no-fund
       - name: Windows skeleton syntax + vendor prep
         run: npm --prefix windows run check
+      - name: UI smoke — source tree (NP-1114-35 guard)
+        run: xvfb-run -a npm --prefix windows run ui-smoke
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"
@@ -47,6 +49,13 @@ jobs:
       - name: Build portable exe
         working-directory: windows
         run: npm run dist
+      - name: UI smoke — packaged artifact (NP-1114-35 guard)
+        working-directory: windows
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist/Hollow-*-portable.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "portable exe not found"; exit 1 }
+          node tools/run-ui-smoke.mjs --exe $exe.FullName
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"

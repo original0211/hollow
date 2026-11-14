@@ -1,6 +1,11 @@
 // Preload whitelist bridge: exactly these actions plus log/event/import
+// COMMONJS ON PURPOSE (NP-1114-35): with sandbox:true the preload loader
+// parses this file as a classic script — an ESM `import` here is a
+// SyntaxError that kills the whole preload, leaving window.hollow
+// undefined and the UI dead. Never convert back to ESM; the ui-smoke
+// guard (tools/run-ui-smoke.mjs) fails the build if this regresses.
 // streams — no Node, no filesystem (plan §1).
-import { contextBridge, ipcRenderer } from "electron";
+const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("hollow", {
   getState: () => ipcRenderer.invoke("hollow:getState"),

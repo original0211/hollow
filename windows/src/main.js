@@ -25,6 +25,14 @@ import { execFile } from "node:child_process";
 import dns from "node:dns/promises";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// One data home (NP-1114-35): Electron's userData (Chromium profile and
+// caches) lives INSIDE the Hollow config dir — not in a second dir
+// derived from package.json's name (%APPDATA%\hollow-windows), which is
+// how the true-device run ended up with two homes. configDir() is the
+// single source of truth. Pre-existing hollow-windows dirs hold only
+// Chromium caches (Hollow data always lived in configDir()) and are
+// ignored — no migration, and nothing is ever auto-deleted.
+try { app.setPath("userData", configDir()); } catch { /* keep Electron default */ }
 let cfg = loadConfig();
 // Config persistence must never take the app down (M2-5 hardening): a locked
 // or temporarily unwritable config dir logs and keeps the in-memory state.
@@ -296,7 +304,7 @@ setInterval(() => {
 function createWindow() {
   win = new BrowserWindow({
     width: 560, height: 760, show: false,
-    webPreferences: { preload: path.join(here, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    webPreferences: { preload: path.join(here, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   // Renderer containment (NP-1114-07): no new windows, no navigation away.
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -347,6 +355,14 @@ else {
   app.on("open-url", (e, url) => { e.preventDefault(); if (url.startsWith("hollow://")) stageImport(url, "os-link"); });
   app.whenReady().then(async () => {
     try { app.setAsDefaultProtocolClient("hollow"); } catch { /* dev/unpacked may refuse */ }
+    // First-run PSK (NP-1114-35, closing the NP-1114-23 note): create the
+    // PSK at STARTUP when it is simply missing, so the verifier V is
+    // copyable from the first frame. A CORRUPT psk.bin is never touched
+    // here — loadOrCreatePsk's hard-error discipline stands (NP-1114-07).
+    if (pskStatus().state === "missing") {
+      try { loadOrCreatePsk(); log("PSK created on first run"); }
+      catch (e) { log(`PSK creation failed: ${e.message}`); }
+    }
     void tightenPskAcl(log); // startup ACL verification pass (NP-1114-07)
     const st = pskStatus();
     if (st.state === "corrupt") log(`PSK ERROR: psk.bin is corrupt (${st.bytes} bytes) — delete it or re-import a config to recover; nothing was regenerated`);
@@ -357,11 +373,41 @@ else {
       } catch { /* ignore */ }
     }
     createWindow(); createTray();
+    if (process.env.HOLLOW_UI_SMOKE === "1") void runUiSmoke();
     const link = process.argv.find((a) => typeof a === "string" && a.startsWith("hollow://"));
     if (link) setTimeout(() => stageImport(link, "os-link"), 600);
   });
   app.on("window-all-closed", (e) => { if (e) e.preventDefault?.(); }); // tray-resident
   app.on("before-quit", async () => { try { await doDisconnect(); } catch { /* ignore */ } });
+}
+
+// Packaged-state UI smoke (NP-1114-35): env-gated self-probe used by CI
+// (tools/run-ui-smoke.mjs) against BOTH the source tree and the built
+// artifact. Loads the real window, waits for the first render, then
+// asserts the bridge is exposed and refresh() rewrote the placeholders.
+// Exit code is the verdict; HOLLOW_UI_SMOKE_OUT optionally gets JSON.
+async function runUiSmoke() {
+  const finish = (code, verdict) => {
+    console.log("UI-SMOKE " + JSON.stringify(verdict));
+    if (process.env.HOLLOW_UI_SMOKE_OUT) { try { fs.writeFileSync(process.env.HOLLOW_UI_SMOKE_OUT, JSON.stringify(verdict)); } catch { /* ignore */ } }
+    app.exit(code);
+  };
+  try {
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error("did-finish-load timeout")), 20000);
+      win.webContents.once("did-finish-load", () => { clearTimeout(to); resolve(); });
+    });
+    await new Promise((r) => setTimeout(r, 900)); // first refresh() settles
+    const probe = await win.webContents.executeJavaScript(`({
+      hollow: typeof window.hollow,
+      state: document.getElementById("state").textContent,
+      verifier: document.getElementById("verifier").textContent,
+    })`);
+    const healthy = probe.hollow === "object" && probe.state !== "状态：—" && probe.verifier !== "—";
+    finish(healthy ? 0 : 1, { ...probe, healthy });
+  } catch (e) {
+    finish(2, { healthy: false, error: String((e && e.message) || e) });
+  }
 }
 
 ipcMain.handle("hollow:getState", () => ({
