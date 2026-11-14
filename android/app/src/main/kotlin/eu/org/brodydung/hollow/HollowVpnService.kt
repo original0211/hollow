@@ -8,7 +8,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import hollowcore.Hollowcore
-import session.Protector
+import hollowcore.Protector
 
 /**
  * Hollow VpnService: consent target, foreground form (specialUse, per
