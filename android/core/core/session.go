@@ -100,10 +100,10 @@ func ParseServerHello(b []byte) *ServerHello {
 // ---------- §5.3 session derivation ----------
 
 type SessionKeys struct {
-	TH                    []byte
-	KC2s, KS2c            []byte
-	IvC2s, IvS2c          []byte
-	FC, FS                []byte
+	TH           []byte
+	KC2s, KS2c   []byte
+	IvC2s, IvS2c []byte
+	FC, FS       []byte
 }
 
 func DeriveSession(dh, verifier, clientRandom, serverRandom, clientHello, serverHello []byte) *SessionKeys {

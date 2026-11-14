@@ -30,12 +30,12 @@ type vectors struct {
 		FinishedServerMac, FinishedClientMac        string
 	} `json:"handshake"`
 	Records struct {
-		Key, Iv       string
-		FramesHex     []string
-		RecordsHex    []string
-		NextSeq       uint64
+		Key, Iv        string
+		FramesHex      []string
+		RecordsHex     []string
+		NextSeq        uint64
 		FramesBlobsHex []string
-		BucketFor     [][2]*int
+		BucketFor      [][2]*int
 	} `json:"records"`
 	Frames struct {
 		GoodBlob            string

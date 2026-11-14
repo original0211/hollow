@@ -42,16 +42,16 @@ type ClientStream struct {
 	HasGate    bool
 	QueuedInfo *QueuedInfo
 
-	pending       [][]byte
-	sendWindow    int
-	recvWindow    int
-	recvUnacked   int
-	localClosed   bool
-	remoteClosed  bool
-	closePending  bool
-	Paused        bool
-	openErr       error
-	openDone      chan struct{}
+	pending      [][]byte
+	sendWindow   int
+	recvWindow   int
+	recvUnacked  int
+	localClosed  bool
+	remoteClosed bool
+	closePending bool
+	Paused       bool
+	openErr      error
+	openDone     chan struct{}
 
 	OnOpenOK    func(gate byte)
 	OnQueued    func(info QueuedInfo)
@@ -139,23 +139,23 @@ type HollowClient struct {
 	FailReason string
 	GoAwayCode *byte
 
-	streams        map[uint32]*ClientStream
-	nextStreamID   uint32
-	sender         *RecordSender
-	receiver       *RecordReceiver
-	connSendWindow int
-	connRecvWindow int
+	streams         map[uint32]*ClientStream
+	nextStreamID    uint32
+	sender          *RecordSender
+	receiver        *RecordReceiver
+	connSendWindow  int
+	connRecvWindow  int
 	connRecvUnacked int
-	WireSizes      []int // observed inbound WS message sizes (F-8)
+	WireSizes       []int // observed inbound WS message sizes (F-8)
 
-	keys         *SessionKeys
-	th           []byte
-	eph          *Ephemeral
-	clientRandom []byte
-	clientHello  []byte
-	serverHello  []byte
-	hsErr        error
-	hsDone       chan struct{}
+	keys           *SessionKeys
+	th             []byte
+	eph            *Ephemeral
+	clientRandom   []byte
+	clientHello    []byte
+	serverHello    []byte
+	hsErr          error
+	hsDone         chan struct{}
 	lastSentRecord []byte
 
 	OnCarrierDead func(reason string)
@@ -654,4 +654,3 @@ func (c *HollowClient) forgetStream(s *ClientStream) {
 	}
 	delete(c.streams, s.ID)
 }
-

@@ -22,8 +22,8 @@ const (
 	ConnWindowInit   = 1 << 20 // §6.5
 	StreamWindowInit = 256 * 1024
 	MergeWindow      = 2 * time.Millisecond // §6.4
-	RecordFailLimit  = 3                     // §6.1 consecutive
-	StreamErrorLimit = 10                    // §8.2
+	RecordFailLimit  = 3                    // §6.1 consecutive
+	StreamErrorLimit = 10                   // §8.2
 )
 
 // Frame types (§6.2).
@@ -44,22 +44,22 @@ const (
 
 // Error codes (§8.3).
 const (
-	ErrConcurrencyLimit      = 0x01
-	ErrProhibitedPort        = 0x02
-	ErrPrivateTarget         = 0x03
-	ErrCFSegmentNonHTTP      = 0x04
-	ErrTargetUnreachable     = 0x05
-	ErrOutboundFailed        = 0x06
-	ErrFetchFallbackFailed   = 0x07
-	ErrFetchProfileUnsupp    = 0x08
-	ErrFetchBodyTooLarge     = 0x09
-	ErrLoopTarget            = 0x0a
-	ErrUnsupportedTarget     = 0x0b
-	ErrProtocolError         = 0x0c
-	ErrFlowControlViolation  = 0x0d
-	ErrQuotaGuard            = 0x0e
-	ErrServerClosing         = 0x0f
-	ErrStreamTimeout         = 0x10
+	ErrConcurrencyLimit     = 0x01
+	ErrProhibitedPort       = 0x02
+	ErrPrivateTarget        = 0x03
+	ErrCFSegmentNonHTTP     = 0x04
+	ErrTargetUnreachable    = 0x05
+	ErrOutboundFailed       = 0x06
+	ErrFetchFallbackFailed  = 0x07
+	ErrFetchProfileUnsupp   = 0x08
+	ErrFetchBodyTooLarge    = 0x09
+	ErrLoopTarget           = 0x0a
+	ErrUnsupportedTarget    = 0x0b
+	ErrProtocolError        = 0x0c
+	ErrFlowControlViolation = 0x0d
+	ErrQuotaGuard           = 0x0e
+	ErrServerClosing        = 0x0f
+	ErrStreamTimeout        = 0x10
 )
 
 // Gate policies / scheme hints.
