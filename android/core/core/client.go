@@ -11,6 +11,7 @@ package core
 import (
 	"errors"
 	"math/rand"
+	"sync/atomic"
 )
 
 // Transport carries raw WebSocket messages (hello plaintext, then AEAD
@@ -154,7 +155,7 @@ type HollowClient struct {
 	clientRandom   []byte
 	clientHello    []byte
 	serverHello    []byte
-	hsErr          error
+	hsErr          atomic.Value // error; written once by die() (run loop), read via Err() from any goroutine
 	hsDone         chan struct{}
 	lastSentRecord []byte
 
@@ -245,7 +246,16 @@ func (c *HollowClient) Handshake() <-chan struct{} {
 	return c.hsDone
 }
 
-func (c *HollowClient) Err() error { return c.hsErr }
+// Err returns the handshake-fatal error, if any. Safe from any
+// goroutine: hsErr is stored atomically by die() — a carrier that dies
+// AFTER a successful handshake writes it with no other happens-before
+// edge to readers (caught by TestSessionCarrierDeathRecovery -race).
+func (c *HollowClient) Err() error {
+	if e := c.hsErr.Load(); e != nil {
+		return e.(error)
+	}
+	return nil
+}
 
 // OpenStream registers a stream and sends OPEN (§6.3).
 func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy byte) (*ClientStream, error) {
@@ -309,8 +319,8 @@ func (c *HollowClient) die(reason string) {
 	}
 	c.State = "dead"
 	c.FailReason = reason
-	if c.hsErr == nil {
-		c.hsErr = errors.New(reason)
+	if c.hsErr.Load() == nil {
+		c.hsErr.Store(errors.New(reason))
 		select {
 		case <-c.hsDone:
 		default:
