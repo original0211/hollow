@@ -13,6 +13,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
+        android:name=".HollowApplication"
         android:label="@string/app_name"
         android:allowBackup="false">
 
@@ -25,11 +26,9 @@
             </intent-filter>
         </activity>
 
-        <!-- VpnService skeleton. foregroundServiceType=specialUse with the
+        <!-- VpnService. foregroundServiceType=specialUse with the
              subtype property, per the NP-1114-30 FGS verification record
-             (files/m3/fgs-verification-record.md). Data plane (Builder
-             establish) arrives in M3-2; this declaration is the consent +
-             foreground form only. -->
+             (files/m3/fgs-verification-record.md). -->
         <service
             android:name=".HollowVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
@@ -42,6 +41,6 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Hollow encrypted VPN tunnel: the VpnService must stay foreground for the whole tunnel session" />
         </service>
-    <activity android:name=".ScanActivity" android:exported="false" />
+        <activity android:name=".ScanActivity" android:exported="false" />
     </application>
 </manifest>

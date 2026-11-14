@@ -109,6 +109,17 @@ class MainActivity : Activity() {
             addView(log)
         }
         setContentView(ScrollView(this).apply { addView(layout) })
+        // Crash surfacing (M3-5): a marker from a previous run's
+        // uncaught exception is shown once, then cleared.
+        try {
+            val marker = java.io.File(filesDir, HollowApplication.CRASH_MARKER)
+            if (marker.exists()) {
+                val text = marker.readText()
+                marker.delete()
+                log.append("\n上次运行异常退出（$text）——如反复出现请反馈此行")
+            }
+        } catch (_: Exception) {
+        }
         renderState()
     }
 
