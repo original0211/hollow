@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "builds": [
+    {
+      "name": "minimal",
+      "input": {
+        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "keyId": 1,
+        "pskHex": null,
+        "metaPath": null,
+        "edgesPath": null
+      },
+      "link": "hollow://v1?worker=wss%3A%2F%2Fnewproto-hollow.newproto.workers.dev%2F&keyId=1",
+      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://newproto-hollow.newproto.workers.dev/\",\"keyId\":1}"
+    },
+    {
+      "name": "full",
+      "input": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "pskHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "metaPath": "/m~abc/seg-1",
+        "edgesPath": "/e_xyz"
+      },
+      "link": "hollow://v1?worker=wss%3A%2F%2Fexample.com%2Fsocket%3Fx%3D1&keyId=7&psk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&mp=%2Fm%7Eabc%2Fseg-1&ep=%2Fe_xyz",
+      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://example.com/socket?x=1\",\"keyId\":7,\"pskBase64\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"metaPath\":\"/m~abc/seg-1\",\"edgesPath\":\"/e_xyz\"}"
+    },
+    {
+      "name": "localhost-ws",
+      "input": {
+        "workerUrl": "ws://localhost:8787/",
+        "keyId": 0,
+        "pskHex": null,
+        "metaPath": null,
+        "edgesPath": null
+      },
+      "link": "hollow://v1?worker=ws%3A%2F%2Flocalhost%3A8787%2F&keyId=0",
+      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"ws://localhost:8787/\",\"keyId\":0}"
+    },
+    {
+      "name": "default-keyid",
+      "input": {
+        "workerUrl": "wss://a.b/",
+        "keyId": null,
+        "pskHex": null,
+        "metaPath": null,
+        "edgesPath": null
+      },
+      "link": "hollow://v1?worker=wss%3A%2F%2Fa.b%2F&keyId=1",
+      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://a.b/\",\"keyId\":1}"
+    }
+  ],
+  "parses": [
+    {
+      "name": "link-full",
+      "text": "hollow://v1?worker=wss%3A%2F%2Fexample.com%2Fsocket%3Fx%3D1&keyId=7&psk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&mp=%2Fm%7Eabc%2Fseg-1&ep=%2Fe_xyz",
+      "ok": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "pskHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "metaPath": "/m~abc/seg-1",
+        "edgesPath": "/e_xyz"
+      }
+    },
+    {
+      "name": "link-minimal",
+      "text": "hollow://v1?worker=wss%3A%2F%2Fnewproto-hollow.newproto.workers.dev%2F&keyId=1",
+      "ok": {
+        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "keyId": 1,
+        "pskHex": null,
+        "metaPath": null,
+        "edgesPath": null
+      }
+    },
+    {
+      "name": "file-full",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://example.com/socket?x=1\",\"keyId\":7,\"pskBase64\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\"metaPath\":\"/m~abc/seg-1\",\"edgesPath\":\"/e_xyz\"}",
+      "ok": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "pskHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "metaPath": "/m~abc/seg-1",
+        "edgesPath": "/e_xyz"
+      }
+    },
+    {
+      "name": "file-pretty",
+      "text": "{\n  \"app\": \"hollow\",\n  \"version\": 1,\n  \"workerUrl\": \"wss://example.com/socket?x=1\",\n  \"keyId\": 7,\n  \"pskBase64\": \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\",\n  \"metaPath\": \"/m~abc/seg-1\",\n  \"edgesPath\": \"/e_xyz\"\n}\n",
+      "ok": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "pskHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "metaPath": "/m~abc/seg-1",
+        "edgesPath": "/e_xyz"
+      }
+    },
+    {
+      "name": "file-nopsk",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://newproto-hollow.newproto.workers.dev/\",\"keyId\":1}",
+      "ok": {
+        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "keyId": 1,
+        "pskHex": null,
+        "metaPath": null,
+        "edgesPath": null
+      }
+    },
+    {
+      "name": "link-trimmed",
+      "text": "  \nhollow://v1?worker=wss%3A%2F%2Fexample.com%2Fsocket%3Fx%3D1&keyId=7&psk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&mp=%2Fm%7Eabc%2Fseg-1&ep=%2Fe_xyz  ",
+      "ok": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "pskHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "metaPath": "/m~abc/seg-1",
+        "edgesPath": "/e_xyz"
+      }
+    }
+  ],
+  "errors": [
+    {
+      "name": "http-url",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"http://x.example/\",\"keyId\":1}",
+      "error": "worker url must be wss:// (ws:// only for localhost)"
+    },
+    {
+      "name": "ws-nonlocal",
+      "text": "hollow://v1?worker=ws%3A%2F%2Fexample.com%2F&keyId=1",
+      "error": "worker url must be wss:// (ws:// only for localhost)"
+    },
+    {
+      "name": "psk-31",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://a.b/\",\"keyId\":1,\"pskBase64\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}",
+      "error": "psk must be 32 bytes"
+    },
+    {
+      "name": "bad-b64url",
+      "text": "hollow://v1?worker=wss%3A%2F%2Fa.b%2F&keyId=1&psk=!!!",
+      "error": "invalid base64url"
+    },
+    {
+      "name": "wrong-app",
+      "text": "{\"app\":\"other\",\"version\":1,\"workerUrl\":\"wss://a.b/\"}",
+      "error": "not a hollow export file"
+    },
+    {
+      "name": "keyid-300",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://a.b/\",\"keyId\":300}",
+      "error": "keyId out of range"
+    },
+    {
+      "name": "bad-metapath",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://a.b/\",\"metaPath\":\"no-slash\"}",
+      "error": "metaPath malformed"
+    },
+    {
+      "name": "garbage",
+      "text": "hello world",
+      "error": "unrecognized payload form"
+    },
+    {
+      "name": "wrong-version",
+      "text": "hollow://v2?worker=wss%3A%2F%2Fa.b%2F",
+      "error": "unrecognized payload form"
+    },
+    {
+      "name": "bad-pskbase64",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://a.b/\",\"pskBase64\":\"a*b\"}",
+      "error": "bad pskBase64"
+    },
+    {
+      "name": "keyid-nan",
+      "text": "hollow://v1?worker=wss%3A%2F%2Fa.b%2F&keyId=abc",
+      "error": "keyId out of range"
+    }
+  ],
+  "previews": [
+    {
+      "currentPskExists": true,
+      "preview": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "hasPsk": true,
+        "pskVerifier": "1327e1f7dbb2a6f3188dabd5cbd6f32b611c92d30d256ed18df885d40937cdce",
+        "overwritesPsk": true,
+        "hasEndpointPaths": true
+      }
+    },
+    {
+      "currentPskExists": false,
+      "preview": {
+        "workerUrl": "wss://example.com/socket?x=1",
+        "keyId": 7,
+        "hasPsk": true,
+        "pskVerifier": "1327e1f7dbb2a6f3188dabd5cbd6f32b611c92d30d256ed18df885d40937cdce",
+        "overwritesPsk": false,
+        "hasEndpointPaths": true
+      }
+    }
+  ]
+}

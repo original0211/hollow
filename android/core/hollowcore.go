@@ -19,7 +19,7 @@ import (
 // status screen — if this string renders on device, the whole gomobile
 // chain (bind, AAR packaging, JNI) is alive.
 func Version() string {
-	return "hollowcore 0.3.0 (M3-2 data plane)"
+	return "hollowcore 0.4.0 (M3-3 pairing)"
 }
 
 // Echo round-trips a string across the binding boundary (both

@@ -8,9 +8,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import hollowcore.Hollowcore
-import org.json.JSONObject
 import session.Protector
-import java.io.File
 
 /**
  * Hollow VpnService: consent target, foreground form (specialUse, per
@@ -109,18 +107,15 @@ class HollowVpnService : VpnService() {
     }
 
     /**
-     * Stored config is complete iff the pairing-written file exists,
-     * parses, and carries a non-empty wsUrl and pskHex. (M3-3 writes
-     * this file from the hollow:// payload; until then a config placed
-     * by hand is honored the same way.)
+     * Stored config is complete iff the Go facade can produce the
+     * runtime config: stored file present, PSK unwrap succeeds
+     * (Keystore), PSK present. Any failure — including a lost
+     * keystore key — is "incomplete": the restart gate fails closed
+     * and the session never self-starts (M3-3 read side).
      */
     private fun readConfig(): String? {
-        val f = File(filesDir, CONFIG_FILE)
-        if (!f.exists()) return null
-        val text = try { f.readText() } catch (e: Exception) { return null }
-        val obj = try { JSONObject(text) } catch (e: Exception) { return null }
-        if (obj.optString("wsUrl").isEmpty() || obj.optString("pskHex").isEmpty()) return null
-        return text
+        HollowInit.ensure(this)
+        return try { Hollowcore.storedRuntimeConfigJSON() } catch (e: Exception) { null }
     }
 
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -173,6 +168,5 @@ class HollowVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
         private const val PREFS = "hollow-vpn"
         private const val KEY_USER_ENABLED = "user_enabled"
-        private const val CONFIG_FILE = "hollow-config.json"
     }
 }

@@ -34,6 +34,7 @@ android {
 }
 
 dependencies {
+    implementation("com.google.zxing:core:3.5.3")
     // The gomobile-built core (android/core). CI binds it into this
     // folder before assembling; a local build must do the same (see
     // android/README.md). Absent AAR = compile error by design (fail
