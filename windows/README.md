@@ -33,7 +33,7 @@ Electron shell, M1 core reused byte-identical via a vendored copy
 ## Pairing a fresh install (≤15 minutes)
 
 1. Deploy the Worker (repo root): `cd worker && npx wrangler deploy`
-   (or, in the Cloudflare console: Workers & Pages → `newproto-hollow` →
+   (or, in the Cloudflare console: Workers & Pages → `hollow` →
    Settings → Variables and Secrets).
 2. Start Hollow once — it generates its PSK locally
    (`%APPDATA%\Hollow\psk.bin`, ACL-locked) and shows the pairing value **V**

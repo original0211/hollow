@@ -12,7 +12,14 @@ import { connectWs } from "../../cli/src/ws-client.js";
 import { FT, ERR, GATE, buildFrame } from "../../shared/protocol.js";
 import { randomBytes } from "../../shared/crypto.js";
 
-const URL = process.env.HOLLOW_WORKER_URL || "wss://newproto-hollow.newproto.workers.dev/";
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(name + " is not set — the production endpoint is never recorded in this repo (NP-1114-47); supply it out-of-band");
+  return v;
+}
+const URL = requireEnv("HOLLOW_WORKER_URL");
+const OWN_HOST = new URL(URL).host;
+const ZONE = OWN_HOST.split(".").slice(1).join(".");
 const PSK = new Uint8Array(fs.readFileSync(
   process.env.HOLLOW_PSK_FILE || path.join(os.homedir(), ".hollow", "psk.bin")));
 
@@ -74,8 +81,8 @@ async function f2() {
   check("F-2 port 25", (await tryOpen("tcpbin.com", 25)) === ERR.PROHIBITED_PORT);
   check("F-2 private 127.0.0.1", (await tryOpen("127.0.0.1", 80)) === ERR.PRIVATE_TARGET);
   check("F-2 private 169.254.169.254", (await tryOpen("169.254.169.254", 80)) === ERR.PRIVATE_TARGET);
-  check("F-2 loop self", (await tryOpen("newproto-hollow.newproto.workers.dev", 443)) === ERR.LOOP_TARGET);
-  check("F-2 same-zone", (await tryOpen("other.newproto.workers.dev", 443)) === ERR.UNSUPPORTED_TARGET);
+  check("F-2 loop self", (await tryOpen(OWN_HOST, 443)) === ERR.LOOP_TARGET);
+  check("F-2 same-zone", (await tryOpen("other." + ZONE, 443)) === ERR.UNSUPPORTED_TARGET);
   client.close();
 }
 
@@ -132,16 +139,16 @@ async function f3() {
 // example.com:80 and :443 now SUCCEEDS (no fallback needed there), while
 // connect() to the bare workers.dev account domain — an HTTP-only service
 // with no TCP listener — reproduces the special error. The fallback is
-// therefore exercised against newproto.workers.dev:443 (not this Worker).
+// therefore exercised against the bare account zone domain:443 (not this Worker).
 async function f5() {
   const client = await newClient();
-  const s = client.openStream({ host: "newproto.workers.dev", port: 443, schemeHint: 2, gatePolicy: 0 });
+  const s = client.openStream({ host: ZONE, port: 443, schemeHint: 2, gatePolicy: 0 });
   const gate = await s.opened.then((g) => g, (e) => e);
   if (gate === GATE.FETCH) {
     check("F-5 fetch gate selected after connect() refusal", true);
     const c = collect(s);
     const ended = new Promise((res) => { s.onEnd = res; });
-    s.write(new TextEncoder().encode("GET / HTTP/1.1\r\nHost: newproto.workers.dev\r\nAccept: */*\r\n\r\n"));
+    s.write(new TextEncoder().encode(`GET / HTTP/1.1\r\nHost: ${ZONE}\r\nAccept: */*\r\n\r\n`));
     s.closeWrite();
     await Promise.race([ended, sleep(15000)]);
     const text = c.text();

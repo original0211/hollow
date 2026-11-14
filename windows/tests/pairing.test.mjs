@@ -12,7 +12,7 @@ import { buildLink, parseLink, buildExportObject, parseExportObject, parseAnyPay
 import { verifierHex } from "../src/config.js";
 
 const PSK = new Uint8Array(crypto.randomBytes(32));
-const URL_OK = "wss://newproto-hollow.newproto.workers.dev/";
+const URL_OK = "wss://hollow.example.workers.dev/";
 
 test("link roundtrip with and without PSK", () => {
   const withKey = parseLink(buildLink({ workerUrl: URL_OK, keyId: 1, psk: PSK }));

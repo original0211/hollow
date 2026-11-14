@@ -7,7 +7,7 @@ node cli/src/cli.js --version     # hollow-cli 0.1.0
 node cli/src/cli.js --health      # {"name":"hollow-cli","version":"0.1.0","status":"ok"}
 node cli/src/cli.js psk init      # 在 ~/.hollow/psk.bin 生成 PSK（0600），并打印校验值 V
 node cli/src/cli.js psk verifier  # 打印现有 PSK 的校验值 V（供所有者设置 Worker secret）
-HOLLOW_WORKER_URL="wss://newproto-hollow.newproto.workers.dev/" \
+HOLLOW_WORKER_URL="wss://hollow.example.workers.dev/" \
   node cli/src/cli.js serve --listen 127.0.0.1:1080   # SOCKS5 本地入口（loopback、仅 CONNECT）
 ```
 

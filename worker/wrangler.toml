@@ -1,6 +1,8 @@
-# hollow worker (deployment is via the Cloudflare API, this file documents
-# the intended settings; script name keeps the newproto- prefix infra naming).
-name = "newproto-hollow"
+# hollow worker (deployment is via the Cloudflare API; this file documents
+# the intended settings only. The real script name is injected at deploy
+# time from out-of-repo config and never recorded in this repo, NP-1114-47;
+# "hollow" below is a placeholder for local tooling.)
+name = "hollow"
 main = "src/index.js"
 compatibility_date = "2025-10-01"
 compatibility_flags = ["nodejs_compat"]

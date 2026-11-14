@@ -22,7 +22,7 @@ export function configDir() {
 }
 
 const DEFAULTS = {
-  workerUrl: "wss://newproto-hollow.newproto.workers.dev/",
+  workerUrl: "wss://hollow.example.workers.dev/",
   keyId: 1,
   socksPort: 1080,
   proxyMode: "off", // off | global | pac | tun (M2-4; tun added T-4 — mode families off/sysproxy/tun are mutually exclusive)

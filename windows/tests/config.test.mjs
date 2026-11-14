@@ -30,7 +30,7 @@ test("corrupt config.json -> defaults, no throw (app keeps running)", () => {
   const dir = freshHome();
   fs.writeFileSync(path.join(dir, "config.json"), "{not json!!");
   const c = loadConfig();
-  assert.equal(c.workerUrl, "wss://newproto-hollow.newproto.workers.dev/");
+  assert.equal(c.workerUrl, "wss://hollow.example.workers.dev/");
 });
 
 test("saveConfig is atomic: roundtrip exact, no tmp residue", () => {

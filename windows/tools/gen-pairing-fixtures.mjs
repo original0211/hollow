@@ -16,7 +16,7 @@ const hx = (b) => (b ? Buffer.from(b).toString("hex") : null);
 const shape = (p) => ({ workerUrl: p.workerUrl, keyId: p.keyId, pskHex: hx(p.psk), metaPath: p.metaPath, edgesPath: p.edgesPath });
 
 const buildInputs = [
-  { name: "minimal", in: { workerUrl: "wss://newproto-hollow.newproto.workers.dev/", keyId: 1 } },
+  { name: "minimal", in: { workerUrl: "wss://hollow.example.workers.dev/", keyId: 1 } },
   { name: "full", in: { workerUrl: "wss://example.com/socket?x=1", keyId: 7, psk: PSK, metaPath: "/m~abc/seg-1", edgesPath: "/e_xyz" } },
   { name: "localhost-ws", in: { workerUrl: "ws://localhost:8787/", keyId: 0 } },
   { name: "default-keyid", in: { workerUrl: "wss://a.b/" } },

@@ -479,7 +479,7 @@ class HollowServer {
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
-    this.zoneSuffix = zoneSuffix; // e.g. "newproto.workers.dev"
+    this.zoneSuffix = zoneSuffix; // e.g. "example.workers.dev"
     this.connectFn = connectFn; this.fetchFn = fetchFn;
     this.state = "hello"; // hello | wait-finished | open | dead
     this.streams = new Map();
@@ -987,8 +987,8 @@ function indexOfDoubleCRLF(b) {
 // ===== worker/src/entry.js =====
 // Hollow Worker entry (bundled into worker/src/index.js by tools/build-worker.mjs
 // together with shared/crypto.js, shared/protocol.js, shared/server-core.js).
-// Cloudflare script name: newproto-hollow (newproto- prefix = infrastructure
-// naming, unchanged by the Hollow product name, spec §10.4).
+// Cloudflare script name: injected at deploy time from out-of-repo
+// config and never recorded in this repo (NP-1114-47).
 import { connect } from "cloudflare:sockets";
 
 // §2-4: unauthenticated, non-Upgrade requests get exactly this fixed page:

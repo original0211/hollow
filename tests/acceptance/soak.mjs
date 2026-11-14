@@ -10,7 +10,8 @@ import crypto from "node:crypto";
 import { HollowClient } from "../../shared/client-core.js";
 import { connectWs } from "../../cli/src/ws-client.js";
 
-const WORKER_URL = "wss://newproto-hollow.newproto.workers.dev/";
+const WORKER_URL = process.env.HOLLOW_WORKER_URL;
+if (!WORKER_URL) throw new Error("HOLLOW_WORKER_URL is not set — the production endpoint is never recorded in this repo (NP-1114-47); supply it out-of-band");
 const MINUTES = Number(process.env.HOLLOW_SOAK_MINUTES || 60);
 const OUT = process.env.HOLLOW_SOAK_OUT || "soak-ledger.jsonl";
 const PSK = new Uint8Array(fs.readFileSync(path.join(os.homedir(), ".hollow", "psk.bin")));

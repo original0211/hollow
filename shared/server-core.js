@@ -25,7 +25,7 @@ export class HollowServer {
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
-    this.zoneSuffix = zoneSuffix; // e.g. "newproto.workers.dev"
+    this.zoneSuffix = zoneSuffix; // e.g. "example.workers.dev"
     this.connectFn = connectFn; this.fetchFn = fetchFn;
     this.state = "hello"; // hello | wait-finished | open | dead
     this.streams = new Map();

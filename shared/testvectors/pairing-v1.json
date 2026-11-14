@@ -4,14 +4,14 @@
     {
       "name": "minimal",
       "input": {
-        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "workerUrl": "wss://hollow.example.workers.dev/",
         "keyId": 1,
         "pskHex": null,
         "metaPath": null,
         "edgesPath": null
       },
-      "link": "hollow://v1?worker=wss%3A%2F%2Fnewproto-hollow.newproto.workers.dev%2F&keyId=1",
-      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://newproto-hollow.newproto.workers.dev/\",\"keyId\":1}"
+      "link": "hollow://v1?worker=wss%3A%2F%2Fhollow.example.workers.dev%2F&keyId=1",
+      "exportJson": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://hollow.example.workers.dev/\",\"keyId\":1}"
     },
     {
       "name": "full",
@@ -64,9 +64,9 @@
     },
     {
       "name": "link-minimal",
-      "text": "hollow://v1?worker=wss%3A%2F%2Fnewproto-hollow.newproto.workers.dev%2F&keyId=1",
+      "text": "hollow://v1?worker=wss%3A%2F%2Fhollow.example.workers.dev%2F&keyId=1",
       "ok": {
-        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "workerUrl": "wss://hollow.example.workers.dev/",
         "keyId": 1,
         "pskHex": null,
         "metaPath": null,
@@ -97,9 +97,9 @@
     },
     {
       "name": "file-nopsk",
-      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://newproto-hollow.newproto.workers.dev/\",\"keyId\":1}",
+      "text": "{\"app\":\"hollow\",\"version\":1,\"workerUrl\":\"wss://hollow.example.workers.dev/\",\"keyId\":1}",
       "ok": {
-        "workerUrl": "wss://newproto-hollow.newproto.workers.dev/",
+        "workerUrl": "wss://hollow.example.workers.dev/",
         "keyId": 1,
         "pskHex": null,
         "metaPath": null,

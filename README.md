@@ -8,7 +8,7 @@
 
 ## 目录
 
-- `worker/` — 服务端 Worker（已部署为新账号脚本 `newproto-hollow`，仅 workers.dev）。
+- `worker/` — 服务端 Worker（已部署为新账号脚本 `hollow`，仅 workers.dev）。
 - `cli/` — 命令行客户端：PSK 管理 + SOCKS5 本地入口（`serve`）。
 - `shared/` — 双端共享协议核心（握手、记录层、流帧层、选门）。
 - `spec/` — 冻结的协议规格 v0.1 及冻结记录。

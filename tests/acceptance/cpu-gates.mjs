@@ -14,7 +14,8 @@ import path from "node:path";
 import { HollowClient } from "../../shared/client-core.js";
 import { connectWs } from "../../cli/src/ws-client.js";
 
-const WORKER_URL = "wss://newproto-hollow.newproto.workers.dev/";
+const WORKER_URL = process.env.HOLLOW_WORKER_URL;
+if (!WORKER_URL) throw new Error("HOLLOW_WORKER_URL is not set — the production endpoint is never recorded in this repo (NP-1114-47); supply it out-of-band");
 const TAIL = process.env.HOLLOW_TAIL_URL;
 const OUT = process.env.HOLLOW_CPU_OUT || "cpu-tail.jsonl";
 if (!TAIL) { console.error("HOLLOW_TAIL_URL required"); process.exit(2); }

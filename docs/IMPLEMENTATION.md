@@ -10,7 +10,7 @@
 - `shared/protocol.js` — 常量、帧编解码、记录层 seal/open、HKDF/HMAC 派生、OPEN 编解码、禁区判定、错误码。
 - `shared/client-core.js` — `HollowClient`：握手状态机、流多路复用、双向流控、OPEN_QUEUED 处理。传输层注入（`send/onMessage/onClose/closeCarrier`），本地测试用内存传输、线上用 `cli/src/ws-client.js`。
 - `shared/server-core.js` — `HollowServer`：握手、§7.2 禁区校验、§7.3 选门、§7.4 fetch 事务、§7.5 占用/队列、socket 泵送与背压。出站注入（`connectFn/fetchFn`），Worker 入口传平台实现、本地测试传 node:net 实现。
-- `worker/src/entry.js` + `tools/build-worker.mjs` — 把 shared 三件与入口打包为单文件 `worker/src/index.js` 部署（脚本名 `newproto-hollow`，新账号 newproto）。
+- `worker/src/entry.js` + `tools/build-worker.mjs` — 把 shared 三件与入口打包为单文件 `worker/src/index.js` 部署（脚本名 `hollow`，新账号 newproto）。
 - `cli/src/cli.js` — 命令面：`--version` / `--health` / `psk init` / `psk verifier` / `serve`。本地入口为 **SOCKS5**（`cli/src/socks.js`，loopback、仅 CONNECT）。
 
 ## 2. 平台决策：ChaCha20-Poly1305 走 node:crypto（非偏离）
@@ -53,5 +53,5 @@ X25519、HMAC-SHA256、SHA-256 双端均走 WebCrypto subtle；HKDF 按 RFC 5869
 
 - 本地：`npm test`（16 项，含 spec 常量、帧分流、记录往返、内存传输 E2E、禁区全矩阵、队列、fetch 机制、超窗、CLOSE 顺序、SOCKS 回归）。
 - 线上：`tests/acceptance/online.mjs`（F-1/F-2 子集/F-3/F-4 子集/F-6/F-8）、`tests/acceptance/demo-capture.mjs`（端到端演示+抓帧：握手后报文长度只在 {528, 4112, 16400}、明文令牌零出现）、`tests/acceptance/cpu-gates.mjs`（CPU 门，Tail 逐调用 cpuTime）。
-- CPU 门方法：Tail API（脚本 `newproto-hollow`）逐调用事件；G1=仅握手会话、G2=每会话恰好一帧 16,373 B DATA 双向（整调用 cpuTime < 10 ms 蕴含记录处理 < 10 ms）、G4=错 PSK 未认证握手。Tail 消费端需经出口代理 CONNECT 且带 `Sec-WebSocket-Protocol: trace-v1`，否则 406。
+- CPU 门方法：Tail API（脚本 `hollow`）逐调用事件；G1=仅握手会话、G2=每会话恰好一帧 16,373 B DATA 双向（整调用 cpuTime < 10 ms 蕴含记录处理 < 10 ms）、G4=错 PSK 未认证握手。Tail 消费端需经出口代理 CONNECT 且带 `Sec-WebSocket-Protocol: trace-v1`，否则 406。
 - F-9（1 小时混合负载 soak）：`tests/acceptance/soak.mjs`，逐动作 JSONL 账本与 GraphQL 用量对账闭合。

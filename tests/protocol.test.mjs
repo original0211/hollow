@@ -99,8 +99,8 @@ async function makePair(pskClient, pskServer, connectFn = nodeConnect) {
   const server = new HollowServer({
     transport: tb,
     verifiers: new Map([[1, v]]),
-    ownHost: "newproto-hollow.newproto.workers.dev",
-    zoneSuffix: "newproto.workers.dev",
+    ownHost: "hollow.example.workers.dev",
+    zoneSuffix: "example.workers.dev",
     connectFn,
     fetchFn: async () => { throw new Error("no fetch in local harness"); },
   });
@@ -152,8 +152,8 @@ test("E2E: banned targets rejected with spec error codes", async () => {
   assert.equal(await tryOpen("192.168.1.1", 80), ERR.PRIVATE_TARGET);
   assert.equal(await tryOpen("169.254.169.254", 80), ERR.PRIVATE_TARGET);
   assert.equal(await tryOpen("::1", 80), ERR.PRIVATE_TARGET);
-  assert.equal(await tryOpen("newproto-hollow.newproto.workers.dev", 443), ERR.LOOP_TARGET);
-  assert.equal(await tryOpen("other.newproto.workers.dev", 443), ERR.UNSUPPORTED_TARGET);
+  assert.equal(await tryOpen("hollow.example.workers.dev", 443), ERR.LOOP_TARGET);
+  assert.equal(await tryOpen("other.example.workers.dev", 443), ERR.UNSUPPORTED_TARGET);
   client.close();
 });
 
@@ -288,8 +288,8 @@ test("E2E: fetch gate fallback on the spec's special connect() error (§7.3-2, �
   const server = new HollowServer({
     transport: tb,
     verifiers: new Map([[1, v]]),
-    ownHost: "newproto-hollow.newproto.workers.dev",
-    zoneSuffix: "newproto.workers.dev",
+    ownHost: "hollow.example.workers.dev",
+    zoneSuffix: "example.workers.dev",
     connectFn: async () => {
       throw new Error("proxy request failed, cannot connect to the specified address. It looks like you might be trying to connect to a HTTP-based service — consider using fetch instead");
     },
@@ -331,8 +331,8 @@ test("E2E: fetch fallback refused when gate_policy=connect-only (§7.3)", async 
   new HollowServer({
     transport: tb,
     verifiers: new Map([[1, v]]),
-    ownHost: "newproto-hollow.newproto.workers.dev",
-    zoneSuffix: "newproto.workers.dev",
+    ownHost: "hollow.example.workers.dev",
+    zoneSuffix: "example.workers.dev",
     connectFn: async () => {
       throw new Error("proxy request failed, cannot connect to the specified address");
     },

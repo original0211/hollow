@@ -5,12 +5,14 @@ import fs from "node:fs";
 
 const file = process.argv[2];
 const marks = fs.readFileSync(file + ".marks.jsonl", "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const SCRIPT_NAME = process.env.HOLLOW_WORKER_NAME;
+if (!SCRIPT_NAME) throw new Error("HOLLOW_WORKER_NAME is not set — the production script name is never recorded in this repo (NP-1114-47)");
 const events = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
 const m = Object.fromEntries(marks.map((x) => [x.name, x.at]));
 // tail eventTimestamp is epoch ms; marks use Date.now() — same clock basis.
 
 function bucket(name, from, to) {
-  const rows = events.filter((e) => e.eventTimestamp >= from && e.eventTimestamp < to && e.scriptName === "newproto-hollow");
+  const rows = events.filter((e) => e.eventTimestamp >= from && e.eventTimestamp < to && e.scriptName === SCRIPT_NAME);
   const cpus = rows.map((e) => e.cpuTime).sort((a, b) => a - b);
   const stats = cpus.length ? {
     n: cpus.length,
