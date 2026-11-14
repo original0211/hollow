@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hollow</string>
+    <string name="vpn_channel_name">Hollow VPN</string>
+    <string name="vpn_notification_text">Hollow 骨架服务运行中（数据面未接入）</string>
+</resources>

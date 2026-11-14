@@ -25,3 +25,6 @@ build/
 windows/vendor/
 windows/node_modules/
 windows/dist/
+
+# gomobile output (built in CI / locally, never committed)
+android/app/libs/*.aar
