@@ -51,7 +51,18 @@ var (
 // bridge; every egress socket of the session goes through it (D10).
 // A second StartVPN without StopVPN is an error, never a silent
 // replace — the service owns the lifecycle.
-func StartVPN(cfgJSONText string, tunFD int, protector session.Protector) error {
+// Protector is the gomobile-facing mirror of session.Protector:
+// gobind binds only types declared in THIS package, so StartVPN takes
+// this interface and hands the value to the session layer
+// structurally (identical method set). Kotlin implements
+// hollowcore.Protector. (A cross-package interface in this signature
+// made gobind silently drop StartVPN — first CI compile, NP-1114-35
+// catch-up runs.)
+type Protector interface {
+	Protect(fd int) bool
+}
+
+func StartVPN(cfgJSONText string, tunFD int, protector Protector) error {
 	var cj configJSON
 	if err := json.Unmarshal([]byte(cfgJSONText), &cj); err != nil {
 		return err
