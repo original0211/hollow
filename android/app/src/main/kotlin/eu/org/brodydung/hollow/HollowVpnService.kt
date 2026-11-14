@@ -28,6 +28,18 @@ import session.Protector
  *             system will not resurrect a revoked VPN anyway, and the
  *             next explicit start re-runs the full flow regardless).
  *  - config validity is re-checked at every (re)start, never cached.
+ *  - persistence is SYNCHRONOUS (commit(), NP-1114-37): apply() is
+ *    async, and a hard kill between the user's stop and the flush
+ *    would leave a stale "enabled" bit that resurrects a session the
+ *    user stopped — the exact failure this bit exists to prevent.
+ *    Failure semantics are fail-closed both ways:
+ *      set fails   -> the session is NOT started (start evidence must
+ *                     be durable before a session may exist);
+ *      clear fails -> the live session is still torn down (the user's
+ *                     stop always wins in-process), the failure is
+ *                     logged, and the stale bit is left as-is for the
+ *                     next start to re-read — residue is visible in
+ *                     the log, never silently "assumed stopped".
  */
 class HollowVpnService : VpnService() {
 
@@ -36,17 +48,27 @@ class HollowVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                // Explicit user stop: clear the state bit FIRST, then
-                // tear down. After this, a system restart must not
-                // resurrect the session.
-                prefs().edit().putBoolean(KEY_USER_ENABLED, false).apply()
+                // Explicit user stop: clear the state bit FIRST
+                // (synchronously, NP-1114-37), then tear down. After
+                // this, a system restart must not resurrect the
+                // session. A failed commit does not hold the stop
+                // hostage — see the class-doc failure semantics.
+                val cleared = prefs().edit().putBoolean(KEY_USER_ENABLED, false).commit()
+                if (!cleared) {
+                    android.util.Log.e("HollowVpnService", "user_enabled clear failed to persist; stopping the live session anyway")
+                }
                 stopSession()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
             ACTION_START -> {
-                prefs().edit().putBoolean(KEY_USER_ENABLED, true).apply()
-                if (!startSession()) {
+                // Fail-closed: without a durably recorded start, no
+                // session (NP-1114-37 failure semantics).
+                val recorded = prefs().edit().putBoolean(KEY_USER_ENABLED, true).commit()
+                if (!recorded) {
+                    android.util.Log.e("HollowVpnService", "user_enabled set failed to persist; not starting (fail-closed)")
+                    stopSelf()
+                } else if (!startSession()) {
                     // Explicit start with unusable config: fail closed
                     // and visible (no foreground ghost, no retry loop).
                     stopSelf()
