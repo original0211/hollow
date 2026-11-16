@@ -414,3 +414,115 @@ test("occupancy wedge (NP-1116-01): remote EOF holds §7.5 slots until the app c
   assert.equal(server.occupancy, 1);
   client.close();
 });
+
+test("P2 linger (NP-1116-04): outEof stream is RESET stream_timeout after the idle linger", async () => {
+  function fakeTarget() {
+    let ctrl; let echoed = false;
+    const readable = new ReadableStream({ start(c) { ctrl = c; } });
+    const writable = new WritableStream({
+      write(chunk) {
+        if (!echoed) {
+          echoed = true;
+          ctrl.enqueue(new Uint8Array(chunk));
+          setTimeout(() => { try { ctrl.close(); } catch {} }, 20);
+        }
+      },
+    });
+    return { readable, writable, opened: Promise.resolve(), close() { try { ctrl.close(); } catch {} } };
+  }
+  const psk = randomBytes(32);
+  const [ta, tb] = memoryTransportPair();
+  const v = await deriveVerifier(psk);
+  const server = new HollowServer({
+    transport: tb, verifiers: new Map([[1, v]]),
+    ownHost: "hollow.example.workers.dev", zoneSuffix: "example.workers.dev",
+    connectFn: async () => fakeTarget(),
+    fetchFn: async () => { throw new Error("no fetch"); },
+    streamLingerMs: 300,
+  });
+  const client = new HollowClient({ transport: ta, psk, keyId: 1 });
+  await client.handshake();
+  const s = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+  await s.opened;
+  const ended = new Promise((res) => { s.onEnd = res; });
+  const resetP = new Promise((res) => { s.onReset = res; });
+  s.onData = () => {};
+  s.write(new Uint8Array(300).fill(0x61));
+  await ended; // server CLOSE (outEof); app does not close
+  assert.equal(server.occupancy, 1);
+  const code = await resetP; // linger expires -> RESET 0x10
+  assert.equal(code, ERR.STREAM_TIMEOUT);
+  assert.equal(server.occupancy, 0);
+  assert.equal(server.lingerReleases, 1);
+  client.close();
+});
+
+test("P2 linger is idle-based (NP-1116-04): client DATA re-arms it", async () => {
+  function fakeTarget() {
+    let ctrl; let echoed = false;
+    const readable = new ReadableStream({ start(c) { ctrl = c; } });
+    const writable = new WritableStream({
+      write(chunk) {
+        if (!echoed) {
+          echoed = true;
+          ctrl.enqueue(new Uint8Array(chunk));
+          setTimeout(() => { try { ctrl.close(); } catch {} }, 20);
+        }
+      },
+    });
+    return { readable, writable, opened: Promise.resolve(), close() { try { ctrl.close(); } catch {} } };
+  }
+  const psk = randomBytes(32);
+  const [ta, tb] = memoryTransportPair();
+  const v = await deriveVerifier(psk);
+  const server = new HollowServer({
+    transport: tb, verifiers: new Map([[1, v]]),
+    ownHost: "hollow.example.workers.dev", zoneSuffix: "example.workers.dev",
+    connectFn: async () => fakeTarget(),
+    fetchFn: async () => { throw new Error("no fetch"); },
+    streamLingerMs: 400,
+  });
+  const client = new HollowClient({ transport: ta, psk, keyId: 1 });
+  await client.handshake();
+  const s = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+  await s.opened;
+  const ended = new Promise((res) => { s.onEnd = res; });
+  let resetCode = null;
+  s.onReset = (c) => { resetCode = c; };
+  s.onData = () => {};
+  s.write(new Uint8Array(300).fill(0x61));
+  await ended;
+  // keep the half-closed stream active: a small write every 150 ms
+  for (let i = 0; i < 4; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    s.write(new Uint8Array(16).fill(0x62));
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(resetCode, null); // ~700 ms > 400 ms linger, but never idle that long
+  assert.equal(server.occupancy, 1);
+  const code = await new Promise((res) => { s.onReset = res; }); // now idle -> fires
+  assert.equal(code, ERR.STREAM_TIMEOUT);
+  assert.equal(server.occupancy, 0);
+  client.close();
+});
+
+test("P3 write failure (NP-1116-04): dead target socket -> RESET target_unreachable + release", async () => {
+  const deadTarget = {
+    readable: new ReadableStream({ start() {} }), // never ends, never yields
+    writable: new WritableStream({ write() { throw new Error("socket dead"); } }),
+    opened: Promise.resolve(),
+    close() {},
+  };
+  const psk = randomBytes(32);
+  const { client, server } = await makePair(psk, psk, async () => deadTarget);
+  await client.handshake();
+  const s = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+  await s.opened;
+  assert.equal(server.occupancy, 1);
+  const resetP = new Promise((res) => { s.onReset = res; });
+  s.write(new Uint8Array(100).fill(0x63));
+  const code = await resetP;
+  assert.equal(code, ERR.TARGET_UNREACHABLE);
+  assert.equal(server.occupancy, 0);
+  client.close();
+});

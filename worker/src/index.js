@@ -475,7 +475,7 @@ const HALF_CONN = CONN_WINDOW_INIT / 2;
 const CONNECT_SPECIAL_ERROR = "proxy request failed, cannot connect to the specified address";
 
 class HollowServer {
-  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn }) {
+  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000 }) {
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
@@ -487,6 +487,11 @@ class HollowServer {
     this.occupancy = 0;
     this.fetchActive = 0;
     this.streamErrors = 0;
+    // P2 (NP-1116-04): half-close linger for outEof streams — a purely
+    // local parameter (never written back to spec); releases counted
+    // locally in lingerReleases.
+    this.streamLingerMs = streamLingerMs;
+    this.lingerReleases = 0;
     this.connSendWindow = CONN_WINDOW_INIT;
     this.connRecvWindow = CONN_WINDOW_INIT;
     this.connRecvUnacked = 0;
@@ -505,7 +510,10 @@ class HollowServer {
 
   _teardown() {
     this.dead = true;
-    for (const s of this.streams.values()) this._closeSocket(s);
+    for (const s of this.streams.values()) {
+      if (s.lingerTimer) { clearTimeout(s.lingerTimer); s.lingerTimer = null; }
+      this._closeSocket(s);
+    }
     this.streams.clear();
     this.queue.length = 0;
   }
@@ -746,10 +754,27 @@ class HollowServer {
 
   _freeStream(s, { releaseSlot = true } = {}) {
     if (!this.streams.has(s.id)) return;
+    if (s.lingerTimer) { clearTimeout(s.lingerTimer); s.lingerTimer = null; }
     this.streams.delete(s.id);
     this._closeSocket(s);
     if (s.occupiesFetch) { this.fetchActive--; s.occupiesFetch = false; }
     if (releaseSlot) { this.occupancy--; this._drainQueue(); }
+  }
+
+  // P2 (NP-1116-04): arm/re-arm the idle linger for an outEof stream.
+  // Idle-based: any client DATA on the stream re-arms it (see _onData),
+  // matching stream_timeout's "no bidirectional data" definition. On
+  // expiry the stream is RESET with the existing 0x10 code — §6.3
+  // already names either side's RESET as a release event.
+  _armLinger(s) {
+    if (s.lingerTimer) clearTimeout(s.lingerTimer);
+    s.lingerTimer = setTimeout(() => {
+      s.lingerTimer = null;
+      if (this.dead || s.dead || !s.outEof || !this.streams.has(s.id)) return;
+      this.lingerReleases++;
+      this._resetStream(s.id, ERR.STREAM_TIMEOUT);
+    }, this.streamLingerMs);
+    if (s.lingerTimer && typeof s.lingerTimer.unref === "function") s.lingerTimer.unref();
   }
 
   _resetStream(streamId, code) {
@@ -800,7 +825,7 @@ class HollowServer {
       this._sendFrame(buildFrame(FT.CLOSE, s.id, new Uint8Array([0x00])), true);
       s.localClosed = true;
       if (s.remoteClosed) this._freeStream(s);
-      else s.outEof = true;
+      else { s.outEof = true; this._armLinger(s); }
     }
   }
 
@@ -809,6 +834,7 @@ class HollowServer {
     if (q >= 0) { this._noteStreamError(); return; } // DATA on queued stream: ignore+count
     const s = this.streams.get(f.streamId);
     if (!s) return; // data for unknown stream: drop (may race a RESET)
+    if (s.outEof && s.lingerTimer) this._armLinger(s); // P2: data activity resets the idle linger
     if (s.remoteClosed) {
       this._resetStream(f.streamId, ERR.PROTOCOL_ERROR);
       this._noteStreamError();
@@ -830,7 +856,18 @@ class HollowServer {
       let wp;
       try { wp = Promise.resolve(s.writer.write(f.payload)); }
       catch { wp = Promise.reject(new Error("write failed")); }
-      wp.then(() => this._consume(s, len), () => {});
+      wp.then(() => this._consume(s, len), () => {
+        // P3 (NP-1116-04): a real write error means the target socket
+        // died mid-stream — RESET target_unreachable (error-table
+        // semantics include mid-stream disconnect) and release the
+        // slot, instead of swallowing the error and wedging the
+        // stream. Backpressure is unaffected: a stalled-but-alive
+        // socket's write() stays pending rather than rejecting, and
+        // credit still flows only via _consume (§6.5).
+        if (!this.dead && !s.dead && this.streams.has(s.id)) {
+          this._resetStream(s.id, ERR.TARGET_UNREACHABLE);
+        }
+      });
     } else if (s.gate === GATE.FETCH) {
       const total = (s.fetchLen || 0) + f.payload.length;
       if (total > FETCH_BODY_MAX) {
