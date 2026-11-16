@@ -370,3 +370,47 @@ test("E2E: over-window DATA is RESET with flow_control_violation", async () => {
   assert.equal(code, ERR.FLOW_CONTROL_VIOLATION);
   client.close();
 });
+
+test("occupancy wedge (NP-1116-01): remote EOF holds §7.5 slots until the app closes", async () => {
+  // Fake target: first write is echoed, then the readable side EOFs —
+  // the tcpbin idle-close shape that wedged the M4 soak for an hour.
+  function fakeTarget() {
+    let ctrl; let echoed = false;
+    const readable = new ReadableStream({ start(c) { ctrl = c; } });
+    const writable = new WritableStream({
+      write(chunk) {
+        if (!echoed) {
+          echoed = true;
+          ctrl.enqueue(new Uint8Array(chunk));
+          setTimeout(() => { try { ctrl.close(); } catch {} }, 20);
+        }
+      },
+    });
+    return { readable, writable, opened: Promise.resolve(), close() { try { ctrl.close(); } catch {} } };
+  }
+  const psk = randomBytes(32);
+  const { client, server } = await makePair(psk, psk, async () => fakeTarget());
+  await client.handshake();
+  const streams = [];
+  for (let i = 0; i < 6; i++) {
+    const s = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+    await s.opened;
+    const ended = new Promise((res) => { s.onEnd = res; });
+    s.onData = () => {};
+    s.write(new Uint8Array(300).fill(0x61));
+    await ended; // server CLOSE arrived; app deliberately does NOT close
+    streams.push(s);
+  }
+  assert.equal(server.occupancy, 6);
+  const s7 = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+  await assert.rejects(s7.opened, (e) => e.code === ERR.CONCURRENCY_LIMIT);
+  assert.equal(server.occupancy, 6);
+  // The app fulfils its CLOSE obligation -> slots release (§6.3).
+  for (const s of streams) s.closeWrite();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(server.occupancy, 0);
+  const s8 = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
+  await s8.opened;
+  assert.equal(server.occupancy, 1);
+  client.close();
+});

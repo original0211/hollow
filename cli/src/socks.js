@@ -125,7 +125,16 @@ async function handleConn(sock, getClient, log) {
     if (unacked > 0) { stream.consume(unacked); unacked = 0; }
     stream.paused = false;
   });
-  stream.onEnd = () => { try { sock.end(); } catch {} };
+  stream.onEnd = () => {
+    // NP-1116-02 (P1; root cause NP-1116-01): the server half-closed
+    // (§6.3) — the target will send no more. End the local socket AND
+    // fulfil our CLOSE obligation: without it the stream holds a §7.5
+    // occupancy slot until the local app happens to close its write
+    // side, which may be never. closeWrite is stream-ordered, so app
+    // data already queued still flushes before the CLOSE.
+    try { sock.end(); } catch {}
+    try { stream.closeWrite(); } catch {}
+  };
   stream.onReset = () => { try { sock.destroy(); } catch {} };
   stream.onFail = () => { try { sock.destroy(); } catch {} };
   stream.onDrain = () => { try { sock.resume(); } catch {} };

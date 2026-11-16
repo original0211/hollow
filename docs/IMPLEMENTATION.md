@@ -9,6 +9,7 @@
 
 - `shared/protocol.js` — 常量、帧编解码、记录层 seal/open、HKDF/HMAC 派生、OPEN 编解码、禁区判定、错误码。
 - `shared/client-core.js` — `HollowClient`：握手状态机、流多路复用、双向流控、OPEN_QUEUED 处理。传输层注入（`send/onMessage/onClose/closeCarrier`），本地测试用内存传输、线上用 `cli/src/ws-client.js`。
+  - **应用契约（NP-1116-01/02）**：流的 `onEnd`（对端 CLOSE）到达后，应用层**必须**履行关流义务——调用该流的 `closeWrite()`（或在异常时 `reset()`）。core 按 §6.3 半关语义不代答 CLOSE（应用可能仍有数据要发），而服务端要等到双方均 CLOSE 或任一方 RESET 才释放 §7.5 占用名额；应用漏关会把整条承载的并发名额无限期占死（M4 soak 实证：6 流整点被 OPEN_REJECT 0x01 拒绝）。各应用层泵（SOCKS、Go pump、测试 harness）均须遵守，回归用例见 `tests/protocol.test.mjs` 的 occupancy wedge 用例。
 - `shared/server-core.js` — `HollowServer`：握手、§7.2 禁区校验、§7.3 选门、§7.4 fetch 事务、§7.5 占用/队列、socket 泵送与背压。出站注入（`connectFn/fetchFn`），Worker 入口传平台实现、本地测试传 node:net 实现。
 - `worker/src/entry.js` + `tools/build-worker.mjs` — 把 shared 三件与入口打包为单文件 `worker/src/index.js` 部署（脚本名 `hollow`，新账号 newproto）。
 - `cli/src/cli.js` — 命令面：`--version` / `--health` / `psk init` / `psk verifier` / `serve`。本地入口为 **SOCKS5**（`cli/src/socks.js`，loopback、仅 CONNECT）。

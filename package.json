@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "check": "node --check worker/src/index.js && node --check cli/src/cli.js",
-    "test": "node --test --test-force-exit tests/protocol.test.mjs tests/smoke.test.mjs"
+    "test": "node --test --test-force-exit tests/protocol.test.mjs tests/smoke.test.mjs tests/socks.test.mjs"
   },
   "type": "module",
   "version": "0.0.1"
