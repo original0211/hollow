@@ -91,13 +91,13 @@ async function serve(argv) {
 
   // NP-1117-23: one supervisor loop per pool slot; a lineage ending
   // is replenished by its own loop and never blocks the others.
-  async function runCarrier() {
+  async function runCarrier(slotIndex) {
     while (!stopped) {
       try {
         const client = await sessions.establish();
         failures = 0;
         log(`carrier up: ${url}`);
-        await sessions.adopt(client);
+        await sessions.adopt(client, slotIndex);
         log("carrier down; will reconnect");
       } catch (e) {
         log("carrier attempt failed:", e && e.message || e);
@@ -120,7 +120,7 @@ async function serve(argv) {
   log(`socks5 listening on ${lhost}:${lport} (loopback only)`);
   process.on("SIGINT", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
   process.on("SIGTERM", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
-  for (let i = 0; i < poolSize; i++) runCarrier();
+  for (let i = 0; i < poolSize; i++) runCarrier(i);
   await new Promise(() => {}); // serve forever; signals exit explicitly
   return 0;
 }

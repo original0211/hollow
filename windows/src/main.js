@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
 import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
 import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl, validateHttpPath } from "./pairing.js";
-import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
+import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge, rankedEdges } from "./edges.js";
 import { makePacProvider, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
 import { HelperClient } from "./helper-client.js";
@@ -66,7 +66,7 @@ function getBridge() {
       return null;
     }
     bridgeError = null;
-    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp(), poolSize: cfg.poolSize });
+    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp(), poolSize: cfg.poolSize, edgeCandidates: cfg.edgeMode === "auto" ? rankedEdges(cfg.edgeResults || {}, edgeList()) : null });
     let restoring = false;
     bridge.onEvent((ev) => {
       // RF-06-03: if the bridge lands in its Error terminal state while the
@@ -284,6 +284,15 @@ function resolveEdgeIp() {
   if (cfg.edgeMode === "manual") return cfg.preferredEdgeIp || null;
   if (cfg.edgeMode === "auto") return bestEdge(cfg.edgeResults || {});
   return null;
+}
+// NP-1117-27: keep the bridge's single pin and its ranked candidate
+// list in step with the current selection/measurement. Dispersion
+// (the ranked list) is an auto-mode behavior; manual and default
+// modes keep the single-entry behavior.
+function syncBridgeEdges() {
+  if (!bridge) return;
+  bridge.setEdgeIp(resolveEdgeIp());
+  bridge.setEdgeCandidates(cfg.edgeMode === "auto" ? rankedEdges(cfg.edgeResults || {}, edgeList()) : null);
 }
 
 async function doDisconnect() {
@@ -595,7 +604,7 @@ ipcMain.handle("hollow:measureEdges", async () => {
   });
   cfg = { ...cfg, edgeResults: results };
   safeSave();
-  if (bridge) bridge.setEdgeIp(resolveEdgeIp());
+  syncBridgeEdges();
   log(`edge measurement done: best=${bestEdge(results) || "none"}`);
   return { ok: true, results };
 });
@@ -603,7 +612,7 @@ ipcMain.handle("hollow:setEdgeSelection", (_e, { mode, ip }) => {
   if (["default", "auto", "manual"].includes(mode)) cfg = { ...cfg, edgeMode: mode };
   if (typeof ip === "string" && ip) cfg = { ...cfg, preferredEdgeIp: ip };
   safeSave();
-  if (bridge) bridge.setEdgeIp(resolveEdgeIp());
+  syncBridgeEdges();
   log(`edge selection: mode=${cfg.edgeMode}${cfg.edgeMode === "manual" ? ` ip=${cfg.preferredEdgeIp}` : ""} (applies to the next carrier)`);
   return { edgeMode: cfg.edgeMode, preferredEdgeIp: cfg.preferredEdgeIp, activeEdgeIp: resolveEdgeIp() };
 });

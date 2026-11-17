@@ -51,6 +51,23 @@ test("pool pick: least-loaded placement balances; exclude is honored", () => {
   sessions.stop();
 });
 
+test("pool: adopt(slotHint) pins the lineage to that slot — rotations establish under the same index (NP-1117-27)", async () => {
+  const establishedFor = [];
+  const sessions = new SessionManager({
+    establish: async (slot) => { establishedFor.push(slot); return fakeClient(); },
+    size: 3, rotationMs: 0, log: () => {},
+  });
+  const a = fakeClient(), b = fakeClient();
+  const pB = sessions.adopt(b, 2); // hinted into slot 2, adopted first
+  const pA = sessions.adopt(a, 0);
+  b.onOpenThreshold(); // lineage in slot 2 hits its open budget and rotates
+  for (let i = 0; i < 100 && !establishedFor.length; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(establishedFor, [2]); // rotation established as slot 2
+  sessions.stop();
+  a.close(); b.close();
+  await Promise.allSettled([pA, pB]);
+});
+
 test("pool adopt: more concurrent lineages than the pool size is a host bug", () => {
   const sessions = new SessionManager({
     establish: async () => { throw new Error("not used in this test"); },

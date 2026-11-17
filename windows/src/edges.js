@@ -134,3 +134,18 @@ export function bestEdge(results) {
   }
   return best;
 }
+// NP-1117-27: the measured candidates as an RTT-ranked list
+// ([{ ip, rttMs }], best first) for per-carrier entry dispersion.
+// Only candidates that measured ok AND are still on the candidate
+// list qualify; unmeasured or failed candidates are not dialed by
+// rank (the single-pin fallback in bestEdge covers the winner).
+export function rankedEdges(results, list = BUILTIN_EDGES) {
+  const inList = new Set((list || []).map((e) => e.ip));
+  const out = [];
+  for (const [ip, r] of Object.entries(results || {})) {
+    if (r && r.ok && typeof r.medianMs === "number" && inList.has(ip)) {
+      out.push({ ip, rttMs: r.medianMs });
+    }
+  }
+  return out.sort((a, b) => a.rttMs - b.rttMs);
+}

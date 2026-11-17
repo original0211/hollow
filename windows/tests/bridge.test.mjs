@@ -540,3 +540,84 @@ test("pool (NP-1117-23): a budget rotation stays inside its own lineage", async 
   sB.reset(0);
   sessions.stop();
 });
+
+// ---- NP-1117-27: entry dispersion — one pinned entry IP per carrier ----
+function mkDispersed({ candidates = null, poolSize = 4, failIps = new Set(), edgeIp = null } = {}) {
+  const logs = [];
+  const dials = [];
+  const makeTransport = async (dialIp) => {
+    dials.push(dialIp);
+    if (failIps.has(dialIp)) throw new Error("dial refused (test)");
+    const [ct, st] = memoryTransportPair();
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const bridge = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1, log: (m) => logs.push(m),
+    makeTransport, rotationMs: 60000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize, edgeIp, edgeCandidates: candidates,
+  });
+  return { bridge, logs, dials };
+}
+const CANDS = [
+  { ip: "10.0.0.1", rttMs: 10 }, { ip: "10.0.0.2", rttMs: 20 },
+  { ip: "10.0.0.3", rttMs: 30 }, { ip: "10.0.0.4", rttMs: 40 },
+];
+
+test("dispersion: four carriers pin the four ranked candidates, one per slot", async () => {
+  const { bridge, logs, dials } = mkDispersed({ candidates: CANDS });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 4);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.1", 1: "10.0.0.2", 2: "10.0.0.3", 3: "10.0.0.4" });
+  assert.deepEqual([...dials].sort(), ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]);
+  assert.ok(logs.some((m) => m.includes("entry 10.0.0.3, rtt 30ms")), "per-carrier entry+rtt log line");
+  await bridge.disconnect();
+});
+
+test("dispersion: a short candidate list leaves the gap slots on domain resolution", async () => {
+  const { bridge, dials } = mkDispersed({ candidates: CANDS.slice(0, 2) });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 4);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.1", 1: "10.0.0.2" });
+  assert.equal(dials.filter((d) => d === null).length, 2); // explicit domain dials
+  await bridge.disconnect();
+});
+
+test("dispersion: no candidate list keeps the single-entry behavior (factory gets the bridge default)", async () => {
+  const { bridge, dials } = mkDispersed({ candidates: null, edgeIp: "10.9.9.9", poolSize: 2 });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 2);
+  assert.ok(dials.length >= 2 && dials.every((d) => d === undefined));
+  assert.equal(bridge._pickSlotEdge(0), null);
+  await bridge.disconnect();
+});
+
+test("dispersion: a candidate failing 3 establishments is demoted; its slot re-pins to the best unused candidate", async () => {
+  const failIps = new Set(["10.0.0.1"]);
+  const { bridge, logs, dials } = mkDispersed({ candidates: CANDS.slice(0, 3), poolSize: 2, failIps });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 2);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.3", 1: "10.0.0.2" });
+  assert.equal(dials.filter((d) => d === "10.0.0.1").length, 3); // exactly the d3 threshold
+  assert.ok(logs.some((m) => m.includes("10.0.0.1") && m.includes("demoted")));
+  await bridge.disconnect();
+});
+
+test("dispersion: a fresh measurement clears demotions — the candidate rises again on rebuild", async () => {
+  const failIps = new Set(["10.0.0.1"]);
+  const { bridge } = mkDispersed({ candidates: CANDS.slice(0, 2), poolSize: 1, failIps });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 1);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.2" }); // fell over to the substitute
+  failIps.clear();
+  bridge.setEdgeCandidates(CANDS.slice(0, 2)); // periodic re-measurement
+  assert.equal(bridge._edgeDisfavored.size, 0);
+  bridge.sessions.pick().close(); // kill the live carrier; the slot rebuilds
+  await waitFor(() => bridge.snapshot().slotEdges[0] === "10.0.0.1");
+  assert.equal(bridge.sessions.healthyCount(), 1);
+  await bridge.disconnect();
+});

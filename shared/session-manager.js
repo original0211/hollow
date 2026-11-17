@@ -241,7 +241,7 @@ export const MAX_POOL_SIZE = 8;
 
 export class SessionManager {
   constructor({
-    establish, // async () => HollowClient (handshaken, host-instrumented)
+    establish, // async (slotIndex) => HollowClient (handshaken, host-instrumented)
     log = () => {},
     rotateThreshold = SESSION_ROTATE_THRESHOLD,
     rotationMs = ROTATION_MS,
@@ -253,18 +253,29 @@ export class SessionManager {
     this.establish = establish;
     this.log = log;
     this.size = Math.max(1, Math.min(MAX_POOL_SIZE, Math.floor(size) || 1));
-    this._lineageOpts = { establish, log, rotateThreshold, rotationMs, drainGraceMs };
+    this._lineageOpts = { log, rotateThreshold, rotationMs, drainGraceMs };
     this._onSwap = onSwap;
     this._onLineageEnd = onLineageEnd;
-    this._slots = []; // { lineage, busy }
+    this._slots = []; // { lineage, busy, index }
     this._rr = 0; // round-robin cursor for placement ties
     this._stopped = false;
+    // Slots (and their stable indices) exist from construction, so a
+    // supervisor loop's adopt hint always lands on its own slot and
+    // the lineage keeps that index for its whole life (NP-1117-27).
+    for (let i = 0; i < this.size; i++) this._newSlot();
   }
 
   _newSlot() {
-    const slot = { lineage: null, busy: false };
+    // NP-1117-27: a slot's index is stable for the pool's lifetime and
+    // is passed to every establishment of its lineage (rotations
+    // included), so the host can pin per-slot policy (e.g. an entry
+    // IP) to the lineage rather than to whichever attempt happens to
+    // run. Hosts that don't care simply ignore the argument.
+    const index = this._slots.length;
+    const slot = { lineage: null, busy: false, index };
     slot.lineage = new SessionLineage({
       ...this._lineageOpts,
+      establish: () => this.establish(index),
       onSwap: (next, old) => { this._onSwap(next, old); },
       onLineageEnd: () => {
         slot.busy = false;
@@ -279,8 +290,17 @@ export class SessionManager {
   // returned promise resolves when THAT lineage ends. The host runs
   // exactly one supervisor loop per slot, so a free slot always
   // exists — overflow is a host bug, not a runtime condition.
-  adopt(client) {
-    let slot = this._slots.find((s) => !s.busy);
+  // `slotHint` (NP-1117-27): the supervisor loop's own index — when
+  // that slot exists and is free it is used, so a lineage keeps the
+  // same slot index (and the host policy pinned to it) across its
+  // first establishment and all its rotations.
+  adopt(client, slotHint = -1) {
+    let slot = null;
+    if (Number.isInteger(slotHint) && this._slots[slotHint] && !this._slots[slotHint].busy) {
+      slot = this._slots[slotHint];
+    } else {
+      slot = this._slots.find((s) => !s.busy) || null;
+    }
     if (!slot) {
       if (this._slots.length >= this.size) {
         throw new Error(`session pool exhausted (size ${this.size})`);

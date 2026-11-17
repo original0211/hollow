@@ -24,7 +24,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4 }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -36,6 +36,22 @@ export class CoreBridge {
     // takes effect on the NEXT carrier (rotation/reconnect) and never tears
     // down the live one.
     this.edgeIp = edgeIp;
+    // NP-1117-27: entry dispersion. `edgeCandidates` is the measured,
+    // RTT-ranked candidate list ([{ ip, rttMs }], best first) or null.
+    // When a list is active, pool slot i pins candidate i (slots past
+    // the end of the list dial by domain), a candidate that fails
+    // EDGE_FALLBACK_THRESHOLD consecutive establishments is demoted
+    // and its slot re-pins to the best unused healthy candidate, and
+    // setEdgeCandidates() with a fresh measurement clears demotions
+    // (a re-measured candidate may rise again). When no list is
+    // active, every slot uses the single-pin behavior (edgeIp above)
+    // exactly as before. The TUN bearer lock overrides all of this:
+    // under a lock the dial set is a routing-safety matter.
+    this.edgeCandidates = null;
+    this._edgeFailCounts = new Map(); // ip -> consecutive establishment failures
+    this._edgeDisfavored = new Set(); // demoted ips (until the next refresh)
+    this._slotEdge = new Map(); // slotIndex -> ip currently pinned by that slot
+    if (edgeCandidates) this.setEdgeCandidates(edgeCandidates);
     // Bearer lock (TUN mode, notes v2 §3 / mandatory change C): while TUN
     // is up, the bearer may ONLY dial IPs from the pinned candidate set
     // (candidate set = exclusion set — every member has a /32 host route
@@ -43,9 +59,13 @@ export class CoreBridge {
     // which forbids dialing entirely (fail-closed: default-resolution
     // dialing under TUN would loop the bearer into its own tunnel).
     this.bearerLock = null;
-    this.makeTransport = makeTransport || (async () => {
+    // The transport factory receives the dial target for THIS attempt
+    // (NP-1117-27): an explicit IP string, null for domain resolution,
+    // or undefined for "the bridge default" (the single-pin /
+    // bearer-lock path). Injected factories may ignore the argument.
+    this.makeTransport = makeTransport || (async (dialIp) => {
       const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5 randomized keepalive
-      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: this.effectiveEdgeIp(), userAgent: "HollowClient/0.1" });
+      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: dialIp !== undefined ? dialIp : this.effectiveEdgeIp(), userAgent: "HollowClient/0.1" });
       return {
         send: (b) => raw.send(b), close: () => raw.close(), closeCarrier: () => raw.close(),
         onMessage: (cb) => raw.onMessage(cb), onClose: (cb) => raw.onClose(cb),
@@ -76,7 +96,7 @@ export class CoreBridge {
     // the SOCKS layer places each new stream on the least-loaded
     // healthy carrier. this.client is only a representative session.
     this.sessions = new SessionManager({
-      establish: () => this._establishClient(),
+      establish: (slot) => this._establishClient(slot),
       log: (m) => this.log(m),
       rotationMs: this.rotationMs,
       size: poolSize,
@@ -94,18 +114,105 @@ export class CoreBridge {
     this.poolSize = this.sessions.size;
   }
 
+  // NP-1117-27: replace the ranked candidate list (fresh measurement).
+  // A refresh is new health evidence: demotions and failure counts
+  // reset, so a candidate that measures well again may rise again.
+  // Live carriers are never torn down; new pins apply at each slot's
+  // next establishment.
+  setEdgeCandidates(list) {
+    if (!list || !list.length) {
+      this.edgeCandidates = null;
+    } else {
+      const seen = new Set();
+      const out = [];
+      for (const c of list) {
+        if (c && typeof c.ip === "string" && !seen.has(c.ip)) {
+          seen.add(c.ip);
+          out.push({ ip: c.ip, rttMs: typeof c.rttMs === "number" ? c.rttMs : null });
+        }
+      }
+      out.sort((a, b) => (a.rttMs ?? Infinity) - (b.rttMs ?? Infinity));
+      this.edgeCandidates = out.length ? out : null;
+    }
+    this._edgeFailCounts.clear();
+    this._edgeDisfavored.clear();
+    this.log(this.edgeCandidates
+      ? `edge candidates ranked: ${this.edgeCandidates.map((c) => `${c.ip}(${c.rttMs ?? "?"}ms)`).join(", ")}`
+      : "edge candidates cleared (single-entry behavior)");
+  }
+
+  // The candidate pinned for a slot right now, or null when the slot
+  // should dial by domain. The primary pin is candidates[slot]; a
+  // demoted or already-taken primary falls through to the best-ranked
+  // candidate that is healthy and not pinned by another slot; when
+  // none qualifies the slot dials by domain (dispatch NP-1117-27 (a)).
+  _pickSlotEdge(slotIndex) {
+    const list = this.edgeCandidates;
+    if (!list || this.bearerLock !== null) return null;
+    // A slot past the end of the list has no primary: it dials by
+    // domain, never by substitute (dispatch (a): the gap goes domain).
+    if (slotIndex >= list.length) return null;
+    const usedByOthers = new Set();
+    for (const [slot, ip] of this._slotEdge) if (slot !== slotIndex) usedByOthers.add(ip);
+    const primary = list[slotIndex];
+    if (primary && !this._edgeDisfavored.has(primary.ip) && !usedByOthers.has(primary.ip)) return primary;
+    for (const c of list) {
+      if (!this._edgeDisfavored.has(c.ip) && !usedByOthers.has(c.ip)) return c;
+    }
+    return null;
+  }
+
+  // NP-1117-27 (b): per-IP health memory on the d3 threshold - an IP
+  // whose establishments fail EDGE_FALLBACK_THRESHOLD times in a row
+  // (a success resets its count) is demoted until the next refresh.
+  _noteEdgeFailure(ip) {
+    const n = (this._edgeFailCounts.get(ip) || 0) + 1;
+    this._edgeFailCounts.set(ip, n);
+    if (n >= EDGE_FALLBACK_THRESHOLD && !this._edgeDisfavored.has(ip)) {
+      this._edgeDisfavored.add(ip);
+      this.log(`edge ${ip} demoted after ${n} consecutive establishment failures; its slot re-pins at the next attempt`);
+    }
+  }
+
   // One establishment path for the loop's first session and for the
   // session manager's rotations (NP-1117-16): TUN bearer lock check,
-  // transport, instrumentation, handshake.
-  async _establishClient() {
+  // transport, instrumentation, handshake. NP-1117-27: with a ranked
+  // candidate list active (and no bearer lock), the dial target is
+  // the slot's pinned candidate - or explicit domain when the list
+  // has no candidate left for the slot; otherwise the target is left
+  // to the bridge default (single pin / bearer lock), as before.
+  async _establishClient(slotIndex = -1) {
     if (this.bearerLock !== null && this.bearerLock.length === 0) {
       throw new Error("bearer <redacted> is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
     }
-    const transport = await this.makeTransport();
-    if (!this._want) { try { transport.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
-    const client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
-    await client.handshake();
+    const dispersed = !!(this.edgeCandidates && this.bearerLock === null);
+    const pick = dispersed && slotIndex >= 0 ? this._pickSlotEdge(slotIndex) : null;
+    const dialIp = dispersed ? (pick ? pick.ip : null) : undefined;
+    // Reserve the pin at pick time, not at success time: concurrent
+    // establishments of other slots must already see this slot's IP
+    // as taken, or two slots could land on the same entry.
+    if (dispersed && slotIndex >= 0) {
+      if (pick) this._slotEdge.set(slotIndex, pick.ip);
+      else this._slotEdge.delete(slotIndex);
+    }
+    let client;
+    try {
+      const transport = await this.makeTransport(dialIp);
+      if (!this._want) { try { transport.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
+      client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
+      await client.handshake();
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      if (pick && msg !== "connect aborted" && !AUTH_FATAL.test(msg)) this._noteEdgeFailure(pick.ip);
+      throw e;
+    }
     if (!this._want) { try { client.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
+    if (pick) {
+      this._edgeFailCounts.delete(pick.ip);
+      this.log(`carrier established: slot ${slotIndex}, entry ${pick.ip}, rtt ${pick.rttMs ?? "?"}ms`);
+    } else if (dispersed) {
+      this.log(`carrier established: slot ${slotIndex}, entry domain (no candidate for this slot)`);
+    }
     return client;
   }
 
@@ -185,16 +292,16 @@ export class CoreBridge {
   // "reconnecting" when the whole pool is down.
   async _runLoop() {
     const loops = [];
-    for (let i = 0; i < this.sessions.size; i++) loops.push(this._lineageLoop());
+    for (let i = 0; i < this.sessions.size; i++) loops.push(this._lineageLoop(i));
     await Promise.all(loops);
     if (this.state !== "error") this._setState("disconnected");
   }
 
-  async _lineageLoop() {
+  async _lineageLoop(slotIndex) {
     while (this._want) {
       let client = null;
       try {
-        client = await this._establishClient();
+        client = await this._establishClient(slotIndex);
         if (!this.client || this.client.state !== "open") this.client = client;
         this.failures = 0;
         this._rollDay(); this.stats.carriers++;
@@ -207,7 +314,7 @@ export class CoreBridge {
         // rotations (15-min + open budget) swap this.client under us
         // via onSwap; adopt() resolves only when the lineage truly
         // ends (the then-current session died with no successor).
-        await this.sessions.adopt(client);
+        await this.sessions.adopt(client, slotIndex);
         if (this.client === client && client.state === "dead") this.client = this.sessions.pick();
         if (!this._want) break;
         if (this.sessions.healthyCount() === 0) this.log("carrier down; will reconnect");
@@ -336,6 +443,8 @@ export class CoreBridge {
       socksPort: this.socksPort, queuedNow: this.queuedNow,
       liveCarriers: this.sessions.healthyCount(), poolSize: this.poolSize,
       edgeIp: this.edgeIp,
+      slotEdges: Object.fromEntries(this._slotEdge),
+      edgeCandidates: this.edgeCandidates ? this.edgeCandidates.map((c) => c.ip) : null,
       effectiveEdgeIp: this.effectiveEdgeIp(),
       bearerLock: this.bearerLock === null ? null : [...this.bearerLock],
       stats: { ...this.stats },

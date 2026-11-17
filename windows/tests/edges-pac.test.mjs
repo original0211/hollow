@@ -2,7 +2,7 @@
 import { test as _test } from "node:test";
 const test = (name, fn) => _test(name, { timeout: 15000 }, fn);
 import assert from "node:assert/strict";
-import { parseEdgesJson, httpBaseOf, median, measureEdges, bestEdge, BUILTIN_EDGES } from "../src/edges.js";
+import { parseEdgesJson, httpBaseOf, median, measureEdges, bestEdge, rankedEdges, BUILTIN_EDGES } from "../src/edges.js";
 import { buildPac, startPacServer } from "../src/pac.js";
 
 test("parseEdgesJson validates shape and caps entries", () => {
@@ -43,6 +43,22 @@ test("measureEdges: median of 3, landing attached, failures recorded (fail-open)
   assert.match(results["3.3.3.3"].error, /boom/);
   assert.equal(bestEdge(results), "2.2.2.2");
   assert.equal(bestEdge({}), null);
+});
+
+test("rankedEdges: ok-only, on-list only, RTT ascending (NP-1117-27)", () => {
+  const list = [{ ip: "1.1.1.1" }, { ip: "2.2.2.2" }, { ip: "3.3.3.3" }];
+  const results = {
+    "1.1.1.1": { ok: true, medianMs: 30 },
+    "2.2.2.2": { ok: true, medianMs: 10 },
+    "3.3.3.3": { ok: false, medianMs: null },
+    "9.9.9.9": { ok: true, medianMs: 1 }, // measured but no longer listed
+  };
+  assert.deepEqual(rankedEdges(results, list), [
+    { ip: "2.2.2.2", rttMs: 10 },
+    { ip: "1.1.1.1", rttMs: 30 },
+  ]);
+  assert.deepEqual(rankedEdges({}, list), []);
+  assert.deepEqual(rankedEdges(null, list), []);
 });
 
 test("buildPac: private/localhost/user hosts DIRECT, rest via SOCKS5 port", () => {
