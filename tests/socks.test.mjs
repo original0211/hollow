@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import http from "node:http";
 import { startSocks } from "../cli/src/socks.js";
 
 function fakeStream() {
@@ -140,11 +141,14 @@ test("live dual-protocol: SOCKS5 and HTTP CONNECT both carry a stream on one por
       s.destroy();
     }
     // --- neither dialect: destroyed, no answer ---
+    // (Origin-form requests are neither CONNECT nor absolute form.
+    // Absolute form itself became a supported dialect in NP-1117-21
+    // and is covered by the four-way live test below.)
     {
       const s = net.connect(port, "127.0.0.1");
       await new Promise((r) => s.once("connect", r));
       const closedP = new Promise((r) => s.once("close", r));
-      s.write("GET http://example.com/ HTTP/1.1\r\n\r\n");
+      s.write("GET /origin-form HTTP/1.1\r\nHost: example.com\r\n\r\n");
       await closedP;
       s.destroy();
     }
@@ -244,4 +248,149 @@ test("0x01 retry (e): target_unreachable (0x05) fails immediately, never retried
   assert.ok(elapsed < 250, `elapsed ${elapsed} ms must be immediate`);
   sock.destroy();
   server.close();
+});
+
+test("live four-way (NP-1117-21): SOCKS5 + CONNECT + absolute GET + absolute POST share one port without cross-talk", async () => {
+  // HTTP target that reports exactly what arrived (method, origin-form
+  // url, body, and whether proxy headers leaked through).
+  const target = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (d) => chunks.push(d));
+    req.on("end", () => {
+      const payload = JSON.stringify({
+        method: req.method, url: req.url, body: Buffer.concat(chunks).toString(),
+        proxyauth: req.headers["proxy-authorization"] ?? null,
+        proxyconn: req.headers["proxy-connection"] ?? null,
+      });
+      res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+      res.end(payload);
+    });
+  });
+  await new Promise((r) => target.listen(0, "127.0.0.1", r));
+  const httpPort = target.address().port;
+  const psk = randomBytes(32);
+  const [ta, tb] = memoryTransportPair();
+  const v = await deriveVerifier(psk);
+  new HollowServer({
+    transport: tb, verifiers: new Map([[1, v]]),
+    ownHost: "hollow.example.workers.dev", zoneSuffix: "example.workers.dev",
+    connectFn: nodeConnect,
+    fetchFn: async () => { throw new Error("no fetch in live self-test"); },
+  });
+  const client = new HollowClient({ transport: ta, psk, keyId: 1 });
+  await client.handshake();
+  const server = await startSocks({ getClient: () => client, port: 0, host: "127.0.0.1" });
+  const port = server.address().port;
+
+  const readAll = (s) => new Promise((resolve, reject) => {
+    const chunks = [];
+    const to = setTimeout(() => reject(new Error("readAll timeout")), 10000);
+    s.on("data", (d) => chunks.push(d));
+    s.on("end", () => { clearTimeout(to); resolve(Buffer.concat(chunks)); });
+    s.on("error", (e) => { clearTimeout(to); reject(e); });
+  });
+  const parseResp = (buf) => {
+    const txt = buf.toString("latin1");
+    const status = Number((txt.match(/^HTTP\/1\.[01] (\d+)/) || [])[1] || 0);
+    const body = txt.slice(txt.indexOf("\r\n\r\n") + 4);
+    return { status, json: JSON.parse(body) };
+  };
+  // Stepwise helpers over raw sockets (small replies, readBytes exists above).
+  async function socks5Flow() {
+    const s = net.connect(port, "127.0.0.1");
+    await new Promise((r) => s.once("connect", r));
+    s.write(Buffer.from([0x05, 0x01, 0x00]));
+    await readBytes(s, 2);
+    const dom = Buffer.from("localhost", "utf8");
+    s.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, dom.length]), dom, Buffer.from([(httpPort >> 8) & 0xff, httpPort & 0xff])]));
+    const rep = await readBytes(s, 10);
+    assert.equal(rep[1], 0x00);
+    const all = readAll(s);
+    s.write(`GET /via-socks HTTP/1.1\r\nHost: localhost:${httpPort}\r\nConnection: close\r\n\r\n`);
+    const { status, json } = parseResp(await all);
+    s.destroy();
+    return { status, json };
+  }
+  async function connectFlow() {
+    const s = net.connect(port, "127.0.0.1");
+    await new Promise((r) => s.once("connect", r));
+    s.write(`CONNECT localhost:${httpPort} HTTP/1.1\r\nHost: localhost:${httpPort}\r\n\r\n`);
+    const head = await readBytes(s, 39);
+    assert.ok(head.toString("latin1").startsWith("HTTP/1.1 200"));
+    const all = readAll(s);
+    s.write(`GET /via-connect HTTP/1.1\r\nHost: localhost:${httpPort}\r\nConnection: close\r\n\r\n`);
+    const { status, json } = parseResp(await all);
+    s.destroy();
+    return { status, json };
+  }
+  async function absoluteFlow(raw) {
+    const s = net.connect(port, "127.0.0.1");
+    await new Promise((r) => s.once("connect", r));
+    const all = readAll(s);
+    s.write(raw);
+    const { status, json } = parseResp(await all);
+    s.destroy();
+    return { status, json };
+  }
+  try {
+    const [r1, r2, r3, r4] = await Promise.all([
+      socks5Flow(),
+      connectFlow(),
+      absoluteFlow(`GET http://localhost:${httpPort}/abs-get?x=1 HTTP/1.1\r\nHost: localhost:${httpPort}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic Zm9v\r\nConnection: close\r\n\r\n`),
+      absoluteFlow(`POST http://localhost:${httpPort}/abs-post HTTP/1.1\r\nHost: localhost:${httpPort}\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello-body`),
+    ]);
+    assert.equal(r1.status, 200); assert.equal(r1.json.url, "/via-socks");
+    assert.equal(r2.status, 200); assert.equal(r2.json.url, "/via-connect");
+    // Absolute GET: the request line arrived in origin form (rewrite),
+    // and the proxy headers were stripped before forwarding.
+    assert.equal(r3.status, 200);
+    assert.equal(r3.json.method, "GET");
+    assert.equal(r3.json.url, "/abs-get?x=1");
+    assert.equal(r3.json.proxyauth, null);
+    assert.equal(r3.json.proxyconn, null);
+    // Absolute POST: the body arrived verbatim.
+    assert.equal(r4.status, 200);
+    assert.equal(r4.json.method, "POST");
+    assert.equal(r4.json.url, "/abs-post");
+    assert.equal(r4.json.body, "hello-body");
+  } finally {
+    client.close();
+    server.close();
+    target.close();
+  }
+});
+
+test("characterization (NP-1117-21 c): a SOCKS4 greeting is destroyed unanswered — known deterministic behavior, not support", async () => {
+  // Chromium under the old WinINET "socks=" form spoke exactly this
+  // (proxy_config.cc maps "socks" to SOCKS4). The listener never
+  // speaks SOCKS4; the fix was on the registry side (http=/https=),
+  // not here. This test pins the behavior so it is a decision on
+  // record, not an accident.
+  const psk = randomBytes(32);
+  const [ta, tb] = memoryTransportPair();
+  const v = await deriveVerifier(psk);
+  new HollowServer({
+    transport: tb, verifiers: new Map([[1, v]]),
+    ownHost: "hollow.example.workers.dev", zoneSuffix: "example.workers.dev",
+    connectFn: nodeConnect,
+    fetchFn: async () => { throw new Error("no fetch in live self-test"); },
+  });
+  const client = new HollowClient({ transport: ta, psk, keyId: 1 });
+  await client.handshake();
+  const server = await startSocks({ getClient: () => client, port: 0, host: "127.0.0.1" });
+  const port = server.address().port;
+  try {
+    const s = net.connect(port, "127.0.0.1");
+    await new Promise((r) => s.once("connect", r));
+    let received = 0;
+    s.on("data", (d) => { received += d.length; });
+    const closedP = new Promise((r) => s.once("close", r));
+    s.write(Buffer.from([0x04, 0x01, 0x00, 0x50, 1, 2, 3, 4, 0x00])); // VN=4 CD=1 port 80, 1.2.3.4, no userid
+    await closedP;
+    assert.equal(received, 0);
+    s.destroy();
+  } finally {
+    client.close();
+    server.close();
+  }
 });

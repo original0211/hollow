@@ -201,7 +201,7 @@ async function applyProxyMode(b) {
     enableGlobal: async () => {
       await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
       proxyOn = true;
-      log(`system proxy enabled (global, socks=127.0.0.1:${b.socksPort || cfg.socksPort})`);
+      log(`system proxy enabled (global, http=127.0.0.1:${b.socksPort || cfg.socksPort})`);
     },
     stopPac,
     startPac: async () => { await startPac(b); },

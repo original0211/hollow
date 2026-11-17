@@ -6,7 +6,7 @@
 // Failure mapping is honest: unsupported commands get REP=7, rejected OPENs
 // get REP=5 (refused) unless the code says otherwise; nothing hangs silently.
 import net from "node:net";
-import { ERR } from "../../shared/protocol.js";
+import { ERR, SCHEME } from "../../shared/protocol.js";
 
 const REP = { SUCCESS: 0, GENERAL: 1, NOT_ALLOWED: 2, NET_UNREACH: 3, HOST_UNREACH: 4, REFUSED: 5, CMD_NOT_SUPPORTED: 7, ATYP_NOT_SUPPORTED: 8 };
 const repForOpenError = (code) => {
@@ -151,7 +151,10 @@ async function handleConn(sock, getClient, log, openRetry = {}, openHooks = {}) 
   const first = await reader.readN(1);
   if (!first) { sock.destroy(); return; }
   if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry, openHooks);
-  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log, openRetry, openHooks); // 'C'
+  // HTTP proxy requests start with a method letter (CONNECT, GET,
+  // POST, ...). Anything else — including a SOCKS4 greeting (0x04),
+  // which this listener deliberately does not speak — is destroyed.
+  if (first[0] >= 0x41 && first[0] <= 0x5a) return handleHttp(sock, reader, first, getClient, log, openRetry, openHooks);
   sock.destroy();
 }
 
@@ -207,27 +210,72 @@ async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHoo
 // HTTP CONNECT (NP-1117-07): the other dialect browsers speak to this
 // port. Same open path, same pump; failures are HTTP status lines, and
 // anything that is not a well-formed CONNECT is destroyed.
-async function handleHttpConnect(sock, reader, first, getClient, log, openRetry = {}, openHooks = {}) {
+async function handleHttp(sock, reader, first, getClient, log, openRetry = {}, openHooks = {}) {
   const headBuf = await reader.readUntil("\r\n\r\n", 16384);
   if (!headBuf) { sock.destroy(); return; }
   const headText = Buffer.concat([first, headBuf]).toString("latin1");
   const requestLine = headText.split("\r\n", 1)[0];
-  const m = /^CONNECT[ \t]+(\S+)[ \t]+HTTP\/\d+(?:\.\d+)?[ \t]*$/i.exec(requestLine);
-  if (!m) { sock.destroy(); return; }
-  const target = parseHostPort(m[1]);
-  if (!target) { httpReply(sock, 400, "Bad Request"); return; }
-  const pipelined = reader.detach(); // payload bytes that arrived early
+
+  // --- CONNECT form (tunnel; the response is opaque after the 200) ---
+  const cm = /^CONNECT[ \t]+(\S+)[ \t]+(HTTP\/\d+(?:\.\d+)?)[ \t]*$/i.exec(requestLine);
+  if (cm) {
+    const target = parseHostPort(cm[1]);
+    if (!target) { httpReply(sock, 400, "Bad Request"); return; }
+    const pipelined = reader.detach(); // payload bytes that arrived early
+    const client = getClient();
+    if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
+    let stream;
+    try {
+      stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
+    } catch {
+      httpReply(sock, 502, "Bad Gateway");
+      return;
+    }
+    log(`http-connect stream ${stream.id} -> ${target.host}:${target.port} gate=${stream.gate}`);
+    sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    attachPump(sock, stream, pipelined);
+    return;
+  }
+
+  // --- Absolute form (NP-1117-21): "GET http://host/path HTTP/1.1" ---
+  // The WinINET global form (http=/https=) makes browsers send plain
+  // HTTP requests in absolute form to this listener. The request line
+  // is rewritten to origin form, proxy headers are stripped, and the
+  // origin's response flows back through the same pump — no 200 of
+  // our own. Anything that is neither CONNECT nor absolute form is
+  // destroyed, as before.
+  const am = /^(\S+)[ \t]+(http:\/\/\S+)[ \t]+(HTTP\/\d+(?:\.\d+)?)[ \t]*$/i.exec(requestLine);
+  if (!am) { sock.destroy(); return; }
+  const [, method, absUri, version] = am;
+  let url;
+  try { url = new URL(absUri); } catch { httpReply(sock, 400, "Bad Request"); return; }
+  const target = { host: url.hostname, port: url.port ? Number(url.port) : 80 };
+  if (!target.host) { httpReply(sock, 400, "Bad Request"); return; }
+  const originForm = (url.pathname || "/") + url.search;
+  const lines = headText.split("\r\n");
+  const kept = [];
+  let hasHost = false;
+  for (const ln of lines.slice(1)) {
+    if (ln === "") continue;
+    const name = ln.split(":", 1)[0].trim().toLowerCase();
+    if (name === "proxy-connection" || name === "proxy-authorization") continue;
+    if (name === "host") hasHost = true;
+    kept.push(ln);
+  }
+  if (!hasHost) kept.unshift(`Host: ${url.host}`);
+  const rewritten = Buffer.from([`${method} ${originForm} ${version}`, ...kept, "", ""].join("\r\n"), "latin1");
+  const pipelined = reader.detach(); // body bytes that arrived early
   const client = getClient();
   if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
   let stream;
   try {
-    stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
+    stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: SCHEME.HTTP, gatePolicy: 0 }, openRetry, log, openHooks);
   } catch {
     httpReply(sock, 502, "Bad Gateway");
     return;
   }
-  log(`http-connect stream ${stream.id} -> ${target.host}:${target.port} gate=${stream.gate}`);
-  sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+  log(`http-absolute stream ${stream.id} -> ${target.host}:${target.port} gate=${stream.gate}`);
+  stream.write(rewritten);
   attachPump(sock, stream, pipelined);
 }
 

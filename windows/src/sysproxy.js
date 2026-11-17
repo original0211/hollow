@@ -27,16 +27,24 @@ export const KEY_PATH = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Int
 export const VALUE_NAMES = ["ProxyEnable", "ProxyServer", "ProxyOverride", "AutoConfigURL"];
 export const BYPASS = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
 export const NO_PROXY = { ProxyEnable: 0, ProxyServer: null, ProxyOverride: null, AutoConfigURL: null };
-// Global form: WinINET parses a bare "host:port" ProxyServer as an HTTP
-// proxy; the socks= scheme prefix is what makes it a SOCKS proxy
-// (NP-1117-07 — the bare form blackholed all browsing: browsers sent
-// HTTP CONNECT to a SOCKS5-only port).
+// Global form (NP-1117-21, correcting NP-1117-07): WinINET's
+// per-protocol http=/https= entries, both pointing at the app's
+// dual-protocol listener (SOCKS5 + HTTP CONNECT + HTTP absolute
+// form). NP-1117-07 wrote "socks=127.0.0.1:<port>" on the strength of
+// WinINET documentation semantics — the wrong consumer: Chromium's
+// proxy_config.cc (ParseFromString) maps the "socks" scheme to
+// SOCKS4 (its source comment says so outright), so Chrome sent 0x04
+// SOCKS4 greetings (socks_client_socket.cc) that this listener
+// refuses, and global mode never worked in Chrome
+// (ERR_CONNECTION_CLOSED). "socks5=" is NOT a WinINET key — a string
+// using it would be dropped whole. PAC mode is unaffected: its
+// "SOCKS5" token maps correctly in Chromium.
 // NP-1117-19 (item 1): the port is validated before it is baked into
 // a registry string — an invalid port throws here instead of writing
-// "socks=127.0.0.1:null" into the user's Internet Settings.
+// a malformed endpoint into the user's Internet Settings.
 export const writtenFor = (port) => {
   const p = assertPort(port, "socks port");
-  return { ProxyEnable: 1, ProxyServer: `socks=127.0.0.1:${p}`, ProxyOverride: BYPASS, AutoConfigURL: null };
+  return { ProxyEnable: 1, ProxyServer: `http=127.0.0.1:${p};https=127.0.0.1:${p}`, ProxyOverride: BYPASS, AutoConfigURL: null };
 };
 // PAC form (M2-4): manual proxy off, AutoConfigURL points at the app's
 // loopback PAC endpoint. The snapshot/self-heal machinery is form-agnostic —

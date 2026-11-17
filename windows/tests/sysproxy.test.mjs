@@ -45,7 +45,7 @@ test("roundtrip: enable writes the four keys; restore returns the user's state v
   const { reg, sp, backupFile } = setup({ ...USER_STATE });
   await sp.enableGlobal(1080);
   assert.deepEqual(reg.snapshot(), writtenFor(1080));
-  assert.ok(writtenFor(1080).ProxyServer.startsWith("socks="), "global form must carry the socks= scheme (NP-1117-07)");
+  assert.equal(writtenFor(1080).ProxyServer, "http=127.0.0.1:1080;https=127.0.0.1:1080", "global form is the WinINET http=/https= pair (NP-1117-21)");
   const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
   assert.deepEqual(backup.original, USER_STATE);
   assert.deepEqual(backup.written, writtenFor(1080));
@@ -183,12 +183,13 @@ test("atomicity: backup file is complete valid JSON with no tmp residue", async 
 test("parseRegQuery: DWORD hex canonicalizes; SZ passes through; absent is null", () => {  const sample = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n    ProxyEnable    REG_DWORD    0x1\r\n";
   assert.equal(parseRegQuery(sample, "ProxyEnable"), 1);
   assert.equal(parseRegQuery(sample.replace("0x1", "0x0"), "ProxyEnable"), 0);
-  // NP-1117-07: the canonical written form carries the socks= scheme.
+  // NP-1117-21: the canonical written form is the http=/https= pair.
   // The pre-fix expectation pinned the BARE "127.0.0.1:1080" here; that
   // bare form is exactly the bug (WinINET reads it as an HTTP proxy), so
-  // the old expectation is void and replaced by the socks= form.
-  const sz = "    ProxyServer    REG_SZ    socks=127.0.0.1:1080";
-  assert.equal(parseRegQuery(sz, "ProxyServer"), "socks=127.0.0.1:1080");
+  // (The NP-1117-07 socks= expectation is void — Chromium maps the
+  // WinINET "socks" scheme to SOCKS4; see NP-1117-21.)
+  const sz = "    ProxyServer    REG_SZ    http=127.0.0.1:1080;https=127.0.0.1:1080";
+  assert.equal(parseRegQuery(sz, "ProxyServer"), "http=127.0.0.1:1080;https=127.0.0.1:1080");
   assert.equal(parseRegQuery("ERROR: The system was unable to find the specified registry key or value.", "ProxyServer"), null);
 });
 
@@ -260,12 +261,18 @@ test("mode switches while connected (NP-1117-07 d2): written form follows, origi
   assert.deepEqual(reg.snapshot(), USER_STATE);
 });
 
+// NP-1117-21: the global form is the WinINET http=/https= pair.
+// Chromium source basis (do not "fix" back): proxy_config.cc
+// ParseFromString maps the WinINET "socks" scheme to SOCKS4 (source
+// comment, verbatim intent) and socks_client_socket.cc then speaks
+// SOCKS4 — the socks= form can never work in Chrome. "socks5=" is
+// not a WinINET key at all.
 test("writtenFor port validation (NP-1117-19 a): invalid ports throw, valid shape unchanged", () => {
   for (const bad of [null, undefined, "abc", 0, 65536, 1.5]) {
     assert.throws(() => writtenFor(bad), /invalid socks port/, `port ${String(bad)}`);
   }
-  assert.equal(writtenFor("1080").ProxyServer, "socks=127.0.0.1:1080");
-  assert.equal(writtenFor(1080).ProxyServer, "socks=127.0.0.1:1080");
+  assert.equal(writtenFor("1080").ProxyServer, "http=127.0.0.1:1080;https=127.0.0.1:1080");
+  assert.equal(writtenFor(1080).ProxyServer, "http=127.0.0.1:1080;https=127.0.0.1:1080");
 });
 
 test("switch order (NP-1117-19 d): pac->global writes the registry before the PAC endpoint closes", async () => {
@@ -293,7 +300,7 @@ test("verifyAgainst (NP-1117-19 e mechanism): an external change is detected by 
   await sp.enableGlobal(1080);
   const okv = await sp.verifyAgainst(writtenFor(1080));
   assert.equal(okv.ok, true);
-  reg.store.set("ProxyServer", "socks=127.0.0.1:9999"); // external tamper
+  reg.store.set("ProxyServer", "http=127.0.0.1:9999;https=127.0.0.1:9999"); // external tamper
   const bad = await sp.verifyAgainst(writtenFor(1080));
   assert.equal(bad.ok, false);
   assert.deepEqual(bad.mismatches, ["ProxyServer"]);
