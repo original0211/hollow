@@ -275,3 +275,161 @@ test("queued count follows the live queue: fades on establish, on carrier death,
   assert.equal(b.queuedNow, 0);
   assert.deepEqual(queuedEvents, [1, 0, 1, 0, 1, 0, 1, 0]);
 });
+
+// ---- NP-1117-16: session open budget — proactive rotation + drain + 0x06 migration ----
+function echoRoundTrip(s, tag) {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error("echo timeout")), 5000);
+    let buf = Buffer.alloc(0);
+    s.onData = (d) => {
+      buf = Buffer.concat([buf, Buffer.from(d)]);
+      if (buf.length >= tag.length) { clearTimeout(to); resolve(buf.subarray(0, tag.length).toString()); }
+    };
+    s.onReset = () => { clearTimeout(to); reject(new Error("stream reset during echo")); };
+    s.write(new TextEncoder().encode(tag));
+  });
+}
+async function fillOpens(b, n) {
+  for (let i = 0; i < n; i++) {
+    const s = b.client.openStream({ host: "localhost", port: echoPort });
+    await s.opened;
+    s.reset();
+  }
+}
+// Minimal SOCKS5 domain-CONNECT; resolves { rep, sock } once the reply lands.
+function socksConnectDomain(port, host, targetPort) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(port, "127.0.0.1", () => sock.write(Buffer.from([5, 1, 0])));
+    let stage = 0; let buf = Buffer.alloc(0);
+    const to = setTimeout(() => reject(new Error("socks connect timeout")), 8000);
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (stage === 0 && buf.length >= 2) {
+        const h = Buffer.from(host);
+        sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([targetPort >> 8, targetPort & 0xff])]));
+        stage = 1; buf = Buffer.alloc(0);
+      } else if (stage === 1 && buf.length >= 10) {
+        clearTimeout(to);
+        resolve({ rep: buf[1], sock });
+      }
+    });
+    sock.on("error", (e) => { clearTimeout(to); reject(e); });
+  });
+}
+
+test("open budget (NP-1117-16 a): 150 streams across one lineage — rotations happen, state never flickers, kept streams intact", async () => {
+  const b = mkBridge();
+  await b.connect();
+  await waitFor(() => b.state === "connected" && b.client);
+  const kept = [];
+  for (let i = 0; i < 150; i++) {
+    const s = b.client.openStream({ host: "localhost", port: echoPort });
+    await s.opened;
+    if (i % 15 === 0) kept.push(s); else s.reset();
+    assert.equal(b.state, "connected");
+  }
+  assert.ok(b.sessions.rotations >= 2, `expected >=2 budget rotations, got ${b.sessions.rotations}`);
+  assert.ok(b.stats.carriers >= 3, `carriers=${b.stats.carriers}`);
+  for (const [k, s] of kept.entries()) {
+    assert.equal(await echoRoundTrip(s, `kept-${k}`), `kept-${k}`);
+  }
+  for (const s of kept) s.reset();
+  await b.disconnect();
+});
+
+test("open budget (NP-1117-16 b): long streams cross a rotation alive, drain closes the retired session once empty", async () => {
+  const b = mkBridge();
+  await b.connect();
+  await waitFor(() => b.state === "connected" && b.client);
+  const firstClient = b.client;
+  const longs = [];
+  for (let i = 0; i < 3; i++) {
+    const s = b.client.openStream({ host: "localhost", port: echoPort });
+    await s.opened;
+    longs.push(s);
+  }
+  assert.equal(await echoRoundTrip(longs[0], "before"), "before");
+  await fillOpens(b, 40);
+  await waitFor(() => b.stats.carriers === 2);
+  assert.notEqual(b.client, firstClient);
+  assert.equal(firstClient.state, "open"); // retired to drain, NOT killed
+  for (const [k, s] of longs.entries()) {
+    assert.equal(await echoRoundTrip(s, `after-${k}`), `after-${k}`);
+  }
+  for (const s of longs) s.reset();
+  await waitFor(() => firstClient.state === "dead", 8000); // drained -> closed by the manager
+  await b.disconnect();
+});
+
+test("open budget (NP-1117-16 c): target-level 0x06 under budget fails immediately — no rotation, no retry", async () => {
+  let attempts = 0;
+  const factory = makeFactory(VERIFIER, {
+    onCarrier: (st, server) => {
+      const orig = server.connectFn;
+      server.connectFn = (a) => {
+        if (a.hostname === "capped.example") { attempts++; throw new Error("simulated session cap"); }
+        return orig(a);
+      };
+    },
+  });
+  const b = mkBridge({ makeTransport: factory });
+  await b.connect();
+  await waitFor(() => b.state === "connected" && b.client);
+  const firstClient = b.client;
+  const port = await b.startSocks(0 + 24100);
+  const t0 = Date.now();
+  const { rep, sock } = await socksConnectDomain(port, "capped.example", echoPort);
+  const elapsed = Date.now() - t0;
+  assert.equal(rep, 0x01); // REP.GENERAL for 0x06
+  assert.ok(elapsed < 3000, `must be immediate, took ${elapsed} ms`);
+  assert.equal(attempts, 1); // no retry
+  assert.equal(b.client, firstClient); // no rotation
+  assert.equal(b.sessions.rotations, 0);
+  sock.destroy();
+  await b.disconnect();
+});
+
+test("open budget (NP-1117-16 d): 0x06 at the budget rotates and retries once on the new session", async () => {
+  let carrierNo = 0;
+  const attemptsByCarrier = new Map();
+  const factory = makeFactory(VERIFIER, {
+    onCarrier: (st, server) => {
+      carrierNo++;
+      const mine = carrierNo;
+      const orig = server.connectFn;
+      server.connectFn = (a) => {
+        if (a.hostname === "capped.example") {
+          attemptsByCarrier.set(mine, (attemptsByCarrier.get(mine) || 0) + 1);
+          if (mine === 1) throw new Error("simulated session cap");
+        }
+        return orig(a);
+      };
+    },
+  });
+  const b = mkBridge({ makeTransport: factory });
+  await b.connect();
+  await waitFor(() => b.state === "connected" && b.client);
+  const firstClient = b.client;
+  await fillOpens(b, 39); // one short of the threshold
+  firstClient.onOpenThreshold = null; // isolate the REACTIVE path (proactive is covered by a/b)
+  const port = await b.startSocks(24200);
+  const { rep, sock } = await socksConnectDomain(port, "capped.example", echoPort);
+  assert.equal(rep, 0x00); // success after migration
+  assert.equal(attemptsByCarrier.get(1), 1); // exactly one failed attempt on the old session
+  assert.equal(attemptsByCarrier.get(2), 1); // exactly one retry on the new session
+  assert.notEqual(b.client, firstClient);
+  assert.equal(b.sessions.rotations, 1);
+  // the migrated stream actually carries data (echo at echoPort)
+  const got = await new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error("echo timeout")), 5000);
+    let buf = Buffer.alloc(0);
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (buf.length >= 7) { clearTimeout(to); resolve(buf.subarray(0, 7).toString()); }
+    });
+    sock.write(Buffer.from("migrate"));
+  });
+  assert.equal(got, "migrate");
+  sock.destroy();
+  await b.disconnect();
+});

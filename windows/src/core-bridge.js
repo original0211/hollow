@@ -7,6 +7,7 @@
 // of retrying forever (plan §4). Electron-free: tests drive this module
 // directly with an injected transport factory.
 import { HollowClient } from "../vendor/shared/client-core.js";
+import { SessionManager } from "../vendor/shared/session-manager.js";
 import { connectWs } from "../vendor/cli/src/ws-client.js";
 import { startSocks } from "../vendor/cli/src/socks.js";
 
@@ -63,6 +64,42 @@ export class CoreBridge {
     this._wake = null;
     this._listeners = new Set();
     this.stats = { carriers: 0, streams: 0, day: new Date().toISOString().slice(0, 10) };
+    // NP-1117-16: the shared session manager owns rotations (15-min
+    // timer + the 40-open budget) with drain semantics. This bridge
+    // keeps its own connect/backoff/auth policy for the FIRST session
+    // of a lineage (the loop below) and hands each established client
+    // to the manager; rotations are established through the same
+    // _establishClient() and land here via onSwap without the state
+    // machine ever leaving "connected".
+    this.sessions = new SessionManager({
+      establish: () => this._establishClient(),
+      log: (m) => this.log(m),
+      rotationMs: this.rotationMs,
+      onSwap: (next) => {
+        this.client = next;
+        this._rollDay(); this.stats.carriers++;
+        this.connectedSince = Date.now();
+        this._emit("stats", { stats: { ...this.stats } });
+      },
+      onLineageEnd: () => {
+        if (this.client && this.client.state === "dead") this.client = null;
+      },
+    });
+  }
+
+  // One establishment path for the loop's first session and for the
+  // session manager's rotations (NP-1117-16): TUN bearer lock check,
+  // transport, instrumentation, handshake.
+  async _establishClient() {
+    if (this.bearerLock !== null && this.bearerLock.length === 0) {
+      throw new Error("bearer <redacted> is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
+    }
+    const transport = await this.makeTransport();
+    if (!this._want) { try { transport.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
+    const client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
+    await client.handshake();
+    if (!this._want) { try { client.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
+    return client;
   }
 
   onEvent(cb) { this._listeners.add(cb); return () => this._listeners.delete(cb); }
@@ -137,26 +174,20 @@ export class CoreBridge {
     while (this._want) {
       let client = null;
       try {
-        if (this.bearerLock !== null && this.bearerLock.length === 0) {
-          throw new Error("bearer lock is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
-        }
-        const transport = await this.makeTransport();
-        if (!this._want) { try { transport.close(); } catch { /* ignore */ } break; }
-        client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
+        client = await this._establishClient();
         this.client = client;
-        await client.handshake();
-        if (!this._want) { try { client.close(); } catch { /* ignore */ } break; }
         this.failures = 0;
         this._rollDay(); this.stats.carriers++;
         this.connectedSince = Date.now();
         this._setState("connected");
         this._emit("stats", { stats: { ...this.stats } });
-        const rotate = setTimeout(() => { this.log("carrier rotation (15 min)"); try { client.close(); } catch { /* ignore */ } }, this.rotationMs);
-        rotate.unref?.();
-        await new Promise((res) => { client.onCarrierDead = () => res(); });
-        clearTimeout(rotate);
+        // NP-1117-16: the session manager now owns this lineage —
+        // rotations (15-min + open budget) swap this.client under us
+        // via onSwap; adopt() resolves only when the lineage truly
+        // ends (the then-current session died with no successor).
+        await this.sessions.adopt(client);
         this.connectedSince = null;
-        if (this.client === client) this.client = null;
+        if (this.client && this.client.state === "dead") this.client = null;
         if (!this._want) break;
         this.log("carrier down; will reconnect");
       } catch (e) {
@@ -204,6 +235,7 @@ export class CoreBridge {
         const server = await startSocks({
           getClient: () => (this.state === "connected" ? this.client : null),
           host, port, log: (m) => this.log(`socks: ${m}`),
+          openHooks: { onOutboundExhausted: (c) => this.sessions.noteOutboundFailure(c) },
         });
         this.socksServer = server;
         this.socksPort = port;
@@ -234,6 +266,7 @@ export class CoreBridge {
   async disconnect() {
     this._want = false;
     if (this._wake) { const w = this._wake; this._wake = null; w(); }
+    this.sessions.stop();
     await this.stopSocks();
     if (this.client) { try { this.client.close(); } catch { /* ignore */ } this.client = null; }
     if (this._loopPromise) { try { await this._loopPromise; } catch { /* ignore */ } this._loopPromise = null; }

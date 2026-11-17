@@ -14,6 +14,7 @@ import path from "node:path";
 import { randomBytes } from "../../shared/crypto.js";
 import { deriveVerifier } from "../../shared/protocol.js";
 import { HollowClient } from "../../shared/client-core.js";
+import { SessionManager } from "../../shared/session-manager.js";
 import { connectWs } from "./ws-client.js";
 import { startSocks } from "./socks.js";
 
@@ -70,24 +71,30 @@ async function serve(argv) {
   let failures = 0;
   const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+  // NP-1117-16: the shared session manager owns rotations (15-min
+  // timer + the 40-open budget) with drain semantics — the same
+  // machine the Windows bridge uses. This loop keeps the CLI's own
+  // reconnect/backoff policy for the first session of a lineage.
+  const sessions = new SessionManager({
+    establish: async () => {
+      const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5: 75–150s randomized
+      const transport = await connectWs(url, { pingIntervalMs: pingMs });
+      const client = new HollowClient({ transport, psk, keyId });
+      await client.handshake();
+      return client;
+    },
+    log: (m) => log(m),
+    onSwap: (next) => { current = next; log("carrier up (rotated)"); },
+  });
+
   async function runCarrier() {
     while (!stopped) {
       try {
-        const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5: 75–150s randomized
-        const transport = await connectWs(url, { pingIntervalMs: pingMs });
-        const client = new HollowClient({ transport, psk, keyId });
+        const client = await sessions.establish();
         current = client;
-        await client.handshake();
         failures = 0;
         log(`carrier up: ${url}`);
-        // §5.6: rotate the carrier at 15 minutes (old streams fail per §8.4)
-        const rotate = setTimeout(() => {
-          log("carrier rotation (15 min)");
-          client.close();
-        }, 15 * 60 * 1000);
-        rotate.unref();
-        await new Promise((res) => { client.onCarrierDead = () => res(); });
-        clearTimeout(rotate);
+        await sessions.adopt(client);
         current = null;
         log("carrier down; will reconnect");
       } catch (e) {
@@ -107,10 +114,11 @@ async function serve(argv) {
     getClient: () => current,
     host: lhost, port: Number(lport),
     log: (...a) => log(...a),
+    openHooks: { onOutboundExhausted: (c) => sessions.noteOutboundFailure(c) },
   });
   log(`socks5 listening on ${lhost}:${lport} (loopback only)`);
-  process.on("SIGINT", () => { stopped = true; server.close(); process.exit(0); });
-  process.on("SIGTERM", () => { stopped = true; server.close(); process.exit(0); });
+  process.on("SIGINT", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
+  process.on("SIGTERM", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
   runCarrier();
   await new Promise(() => {}); // serve forever; signals exit explicitly
   return 0;

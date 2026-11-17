@@ -54,11 +54,25 @@ export class ClientStream {
   }
 }
 
+// NP-1117-16 (plan A, Brody-approved): the platform caps a session at
+// roughly 50 outbound establishments — past it, every OPEN is refused
+// 0x06 while the session otherwise looks alive (measured on a real
+// browser, 2026-11-17: stream 51+ all 0x06, a fresh session is fine).
+// The client therefore counts the OPENs it has SENT on this session
+// and the session layer rotates proactively at 40 — a safety margin
+// under the measured cap — so the cap is never user-visible.
+export const SESSION_OPEN_HARD_CAP = 50; // measured platform ceiling (approx.)
+export const SESSION_ROTATE_THRESHOLD = 40; // rotate here; margin = 10
+
 export class HollowClient {
   constructor({ transport, psk, keyId = 1 }) {
     this.transport = transport;
     this.psk = psk; this.keyId = keyId;
     this.state = "idle"; // idle | hello | wait-finished | open | dead
+    // NP-1117-16: outbound budget bookkeeping (see constants above).
+    this.opensSent = 0; // OPEN frames sent on THIS session
+    this.budgetExhausted = false; // set when the session is retired to drain
+    this.onOpenThreshold = null; // fired once when opensSent hits the threshold
     this.failReason = null;
     this.streams = new Map();
     this.nextStreamId = 1;
@@ -197,6 +211,12 @@ export class HollowClient {
     this.streams.set(id, s);
     const payload = buildOpenPayload({ host, port, schemeHint, gatePolicy });
     this._sendFrame(buildFrame(FT.OPEN, id, payload), true);
+    // NP-1117-16: the OPEN is on the wire — count it (retries included:
+    // every re-OPEN consumes budget exactly like a first attempt).
+    this.opensSent++;
+    if (this.opensSent === SESSION_ROTATE_THRESHOLD && this.onOpenThreshold) {
+      try { this.onOpenThreshold(); } catch { /* the session layer's problem, not the stream's */ }
+    }
     s.opened = new Promise((res, rej) => { s._openResolve = res; s._openReject = rej; });
     return s;
   }

@@ -32,17 +32,40 @@ const repForOpenError = (code) => {
 export const OPEN_RETRY_BASE_MS = 250;
 export const OPEN_RETRY_CAP_MS = 10000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function openWithRetry(client, opts, retry = {}, log = () => {}) {
+// Attempts go through getClient() EVERY time (NP-1117-16): a session
+// rotation may swap the current client mid-retry, and the next attempt
+// then lands on the fresh session — streams arriving during a
+// rotation window hang here instead of failing because of it.
+// hooks.onOutboundExhausted(client) (NP-1117-16 item 2): a 0x06 from a
+// session that is at/over its open budget earns exactly ONE migration
+// retry on the rotated session; the hook decides (session manager).
+// A 0x06 under budget — and every other code — fails immediately.
+async function openWithRetry(getClient, opts, retry = {}, log = () => {}, hooks = {}) {
   const baseMs = retry.baseMs ?? OPEN_RETRY_BASE_MS;
   const capMs = retry.capMs ?? OPEN_RETRY_CAP_MS;
   const t0 = Date.now();
   let delay = baseMs;
+  let migrated = false;
   for (;;) {
+    const client = getClient();
+    if (!client || client.state !== "open") {
+      const e = new Error("no live session");
+      e.code = undefined;
+      throw e;
+    }
     const s = client.openStream(opts);
     try {
       await s.opened;
       return s;
     } catch (e) {
+      if (e && e.code === ERR.OUTBOUND_FAILED && !migrated && hooks.onOutboundExhausted) {
+        migrated = true; // at most one migration per connection, ever
+        if (await hooks.onOutboundExhausted(client)) {
+          log("open rejected 0x06 on a budget-exhausted session; rotated, retrying once");
+          continue;
+        }
+        throw e;
+      }
       if (!e || e.code !== ERR.CONCURRENCY_LIMIT) throw e;
       const elapsed = Date.now() - t0;
       if (elapsed >= capMs) throw e;
@@ -55,9 +78,9 @@ async function openWithRetry(client, opts, retry = {}, log = () => {}) {
   }
 }
 
-export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {}, openRetry = {} }) {
+export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {}, openRetry = {}, openHooks = {} }) {
   const server = net.createServer((sock) => {
-    handleConn(sock, getClient, log, openRetry).catch(() => { try { sock.destroy(); } catch {} });
+    handleConn(sock, getClient, log, openRetry, openHooks).catch(() => { try { sock.destroy(); } catch {} });
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -122,17 +145,17 @@ function makeReader(sock) {
   };
 }
 
-async function handleConn(sock, getClient, log, openRetry = {}) {
+async function handleConn(sock, getClient, log, openRetry = {}, openHooks = {}) {
   sock.on("error", () => {});
   const reader = makeReader(sock);
   const first = await reader.readN(1);
   if (!first) { sock.destroy(); return; }
-  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry);
-  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log, openRetry); // 'C'
+  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry, openHooks);
+  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log, openRetry, openHooks); // 'C'
   sock.destroy();
 }
 
-async function handleSocks(sock, reader, getClient, log, openRetry = {}) {
+async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHooks = {}) {
   const readN = reader.readN;
   const nmethods = await readN(1);
   if (!nmethods) { sock.destroy(); return; }
@@ -171,7 +194,7 @@ async function handleSocks(sock, reader, getClient, log, openRetry = {}) {
   if (!client || client.state !== "open") { reply(sock, REP.GENERAL); return; }
   let stream;
   try {
-    stream = await openWithRetry(client, { host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 }, openRetry, log);
+    stream = await openWithRetry(getClient, { host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
   } catch (e) {
     reply(sock, e && e.code !== undefined ? repForOpenError(e.code) : REP.GENERAL);
     return;
@@ -184,7 +207,7 @@ async function handleSocks(sock, reader, getClient, log, openRetry = {}) {
 // HTTP CONNECT (NP-1117-07): the other dialect browsers speak to this
 // port. Same open path, same pump; failures are HTTP status lines, and
 // anything that is not a well-formed CONNECT is destroyed.
-async function handleHttpConnect(sock, reader, first, getClient, log, openRetry = {}) {
+async function handleHttpConnect(sock, reader, first, getClient, log, openRetry = {}, openHooks = {}) {
   const headBuf = await reader.readUntil("\r\n\r\n", 16384);
   if (!headBuf) { sock.destroy(); return; }
   const headText = Buffer.concat([first, headBuf]).toString("latin1");
@@ -198,7 +221,7 @@ async function handleHttpConnect(sock, reader, first, getClient, log, openRetry 
   if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
   let stream;
   try {
-    stream = await openWithRetry(client, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log);
+    stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
   } catch {
     httpReply(sock, 502, "Bad Gateway");
     return;
