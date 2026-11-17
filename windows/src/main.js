@@ -127,7 +127,18 @@ function waitConnected(b, ms = 30000) {
 async function doConnect() {
   const b = getBridge();
   if (!b) return; // PSK error already logged + surfaced via getState
-  await b.startSocks(cfg.socksPort).catch((e) => log(`socks start failed: ${e.message}`));
+  try {
+    await b.startSocks(cfg.socksPort);
+  } catch (e) {
+    // NP-1117-07 (Q4): the SOCKS entry is the only local door. If it did
+    // not come up, connecting anyway would let the system proxy be
+    // enabled against the configured port where nothing listens — a
+    // blackhole. Fail closed: no connect, no proxy enable, and the UI
+    // gets the error state with the cause.
+    log(`socks start failed: ${e.message} — not connecting; system proxy NOT enabled`);
+    b._setState("error", `socks start failed: ${e.message}`);
+    return;
+  }
   if (modeFamily(cfg.proxyMode) === "tun" && process.platform === "win32") {
     // TUN (T-4): helper takeover + bearer pin BEFORE the bridge dials, so
     // the carrier itself can only ever leave via its pinned /32.

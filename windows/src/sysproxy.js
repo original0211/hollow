@@ -27,7 +27,11 @@ export const KEY_PATH = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Int
 export const VALUE_NAMES = ["ProxyEnable", "ProxyServer", "ProxyOverride", "AutoConfigURL"];
 export const BYPASS = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
 export const NO_PROXY = { ProxyEnable: 0, ProxyServer: null, ProxyOverride: null, AutoConfigURL: null };
-export const writtenFor = (port) => ({ ProxyEnable: 1, ProxyServer: `127.0.0.1:${port}`, ProxyOverride: BYPASS, AutoConfigURL: null });
+// Global form: WinINET parses a bare "host:port" ProxyServer as an HTTP
+// proxy; the socks= scheme prefix is what makes it a SOCKS proxy
+// (NP-1117-07 — the bare form blackholed all browsing: browsers sent
+// HTTP CONNECT to a SOCKS5-only port).
+export const writtenFor = (port) => ({ ProxyEnable: 1, ProxyServer: `socks=127.0.0.1:${port}`, ProxyOverride: BYPASS, AutoConfigURL: null });
 // PAC form (M2-4): manual proxy off, AutoConfigURL points at the app's
 // loopback PAC endpoint. The snapshot/self-heal machinery is form-agnostic —
 // it records and restores whichever written state was applied.

@@ -1,4 +1,8 @@
-// SOCKS5 local entry (spec §3): loopback only, CONNECT only, no UDP/BIND.
+// Local proxy entry (spec §3): loopback only, CONNECT only, no UDP/BIND.
+// Dual protocol on one port (NP-1117-07): the first byte selects the
+// dialect — 0x05 is SOCKS5, 'C' is HTTP CONNECT (what WinINET/browsers
+// send when ProxyServer names an HTTP proxy). Both end at the same
+// client.openStream and the same pump. Anything else is destroyed.
 // Failure mapping is honest: unsupported commands get REP=7, rejected OPENs
 // get REP=5 (refused) unless the code says otherwise; nothing hangs silently.
 import net from "node:net";
@@ -52,6 +56,25 @@ function makeReader(sock) {
   }
   return {
     readN: (n) => new Promise((res) => { waiters.push({ n, res }); pump(); }),
+    // Read through the end of an HTTP header block (delimiter inclusive).
+    // Resolves null on close or when the block exceeds `max` bytes.
+    readUntil: (delim, max) => new Promise((res) => {
+      const dl = Buffer.from(delim, "latin1");
+      const check = () => {
+        const idx = buf.indexOf(dl);
+        if (idx >= 0) {
+          const out = buf.subarray(0, idx + dl.length);
+          buf = buf.subarray(idx + dl.length);
+          cleanup(); res(out);
+        } else if (buf.length > max || closed) {
+          cleanup(); res(null);
+        }
+      };
+      const onMore = () => check();
+      const cleanup = () => { sock.off("data", onMore); sock.off("close", onMore); sock.off("error", onMore); };
+      sock.on("data", onMore); sock.once("close", onMore); sock.once("error", onMore);
+      check();
+    }),
     // Stop consuming and hand back any buffered-but-unread bytes (pipelined
     // payload that arrived with the request header).
     detach() {
@@ -66,10 +89,18 @@ function makeReader(sock) {
 async function handleConn(sock, getClient, log) {
   sock.on("error", () => {});
   const reader = makeReader(sock);
+  const first = await reader.readN(1);
+  if (!first) { sock.destroy(); return; }
+  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log);
+  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log); // 'C'
+  sock.destroy();
+}
+
+async function handleSocks(sock, reader, getClient, log) {
   const readN = reader.readN;
-  const head = await readN(2);
-  if (!head || head[0] !== 0x05) { sock.destroy(); return; }
-  const methods = await readN(head[1]);
+  const nmethods = await readN(1);
+  if (!nmethods) { sock.destroy(); return; }
+  const methods = await readN(nmethods[0]);
   if (!methods || !methods.includes(0x00)) {
     sock.write(Buffer.from([0x05, 0xff])); sock.end(); return;
   }
@@ -112,7 +143,64 @@ async function handleConn(sock, getClient, log) {
   }
   log(`socks stream ${stream.id} -> ${targetHost}:${targetPort} gate=${stream.gate}`);
   reply(sock, REP.SUCCESS);
+  attachPump(sock, stream, pipelined);
+}
 
+// HTTP CONNECT (NP-1117-07): the other dialect browsers speak to this
+// port. Same open path, same pump; failures are HTTP status lines, and
+// anything that is not a well-formed CONNECT is destroyed.
+async function handleHttpConnect(sock, reader, first, getClient, log) {
+  const headBuf = await reader.readUntil("\r\n\r\n", 16384);
+  if (!headBuf) { sock.destroy(); return; }
+  const headText = Buffer.concat([first, headBuf]).toString("latin1");
+  const requestLine = headText.split("\r\n", 1)[0];
+  const m = /^CONNECT[ \t]+(\S+)[ \t]+HTTP\/\d+(?:\.\d+)?[ \t]*$/i.exec(requestLine);
+  if (!m) { sock.destroy(); return; }
+  const target = parseHostPort(m[1]);
+  if (!target) { httpReply(sock, 400, "Bad Request"); return; }
+  const pipelined = reader.detach(); // payload bytes that arrived early
+  const client = getClient();
+  if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
+  let stream;
+  try {
+    stream = client.openStream({ host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 });
+    await stream.opened;
+  } catch {
+    httpReply(sock, 502, "Bad Gateway");
+    return;
+  }
+  log(`http-connect stream ${stream.id} -> ${target.host}:${target.port} gate=${stream.gate}`);
+  sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+  attachPump(sock, stream, pipelined);
+}
+
+function parseHostPort(s) {
+  let host, portStr;
+  if (s.startsWith("[")) {
+    const end = s.indexOf("]");
+    if (end < 0 || s[end + 1] !== ":") return null;
+    host = s.slice(1, end);
+    portStr = s.slice(end + 2);
+  } else {
+    const idx = s.lastIndexOf(":");
+    if (idx <= 0) return null;
+    host = s.slice(0, idx);
+    portStr = s.slice(idx + 1);
+  }
+  const port = Number(portStr);
+  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+function httpReply(sock, code, text) {
+  try { sock.write(`HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n\r\n`); } catch {}
+  sock.end();
+}
+
+// Bidirectional pump shared by both dialects: stream data to the socket
+// with consume-on-drain flow control; socket data into the stream with
+// pause-on-pending; half-close discipline per §6.3 / NP-1116-02.
+function attachPump(sock, stream, pipelined) {
   let unacked = 0;
   let sockEnded = false;
   stream.onData = (data) => {

@@ -45,6 +45,7 @@ test("roundtrip: enable writes the four keys; restore returns the user's state v
   const { reg, sp, backupFile } = setup({ ...USER_STATE });
   await sp.enableGlobal(1080);
   assert.deepEqual(reg.snapshot(), writtenFor(1080));
+  assert.ok(writtenFor(1080).ProxyServer.startsWith("socks="), "global form must carry the socks= scheme (NP-1117-07)");
   const backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
   assert.deepEqual(backup.original, USER_STATE);
   assert.deepEqual(backup.written, writtenFor(1080));
@@ -182,8 +183,12 @@ test("atomicity: backup file is complete valid JSON with no tmp residue", async 
 test("parseRegQuery: DWORD hex canonicalizes; SZ passes through; absent is null", () => {  const sample = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n    ProxyEnable    REG_DWORD    0x1\r\n";
   assert.equal(parseRegQuery(sample, "ProxyEnable"), 1);
   assert.equal(parseRegQuery(sample.replace("0x1", "0x0"), "ProxyEnable"), 0);
-  const sz = "    ProxyServer    REG_SZ    127.0.0.1:1080";
-  assert.equal(parseRegQuery(sz, "ProxyServer"), "127.0.0.1:1080");
+  // NP-1117-07: the canonical written form carries the socks= scheme.
+  // The pre-fix expectation pinned the BARE "127.0.0.1:1080" here; that
+  // bare form is exactly the bug (WinINET reads it as an HTTP proxy), so
+  // the old expectation is void and replaced by the socks= form.
+  const sz = "    ProxyServer    REG_SZ    socks=127.0.0.1:1080";
+  assert.equal(parseRegQuery(sz, "ProxyServer"), "socks=127.0.0.1:1080");
   assert.equal(parseRegQuery("ERROR: The system was unable to find the specified registry key or value.", "ProxyServer"), null);
 });
 
