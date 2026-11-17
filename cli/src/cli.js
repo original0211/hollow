@@ -65,8 +65,9 @@ async function serve(argv) {
   if (!url) { console.error("--url wss://<worker> is required (or HOLLOW_WORKER_URL)"); return 1; }
   const psk = loadPsk(argVal(argv, "--psk-file", DEFAULT_PSK));
   const keyId = Number(argVal(argv, "--key-id", "1"));
+  // NP-1117-23: session pool size (striping), 1-8, default 4.
+  const poolSize = Math.max(1, Math.min(8, Number(argVal(argv, "--sessions", "4")) || 4));
 
-  let current = null;
   let stopped = false;
   let failures = 0;
   const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -84,21 +85,21 @@ async function serve(argv) {
       return client;
     },
     log: (m) => log(m),
-    onSwap: (next) => { current = next; log("carrier up (rotated)"); },
+    size: poolSize,
+    onSwap: () => { log("carrier up (rotated)"); },
   });
 
+  // NP-1117-23: one supervisor loop per pool slot; a lineage ending
+  // is replenished by its own loop and never blocks the others.
   async function runCarrier() {
     while (!stopped) {
       try {
         const client = await sessions.establish();
-        current = client;
         failures = 0;
         log(`carrier up: ${url}`);
         await sessions.adopt(client);
-        current = null;
         log("carrier down; will reconnect");
       } catch (e) {
-        current = null;
         log("carrier attempt failed:", e && e.message || e);
       }
       if (stopped) break;
@@ -111,7 +112,7 @@ async function serve(argv) {
   }
 
   const server = await startSocks({
-    getClient: () => current,
+    getClient: (exclude) => sessions.pick(exclude),
     host: lhost, port: Number(lport),
     log: (...a) => log(...a),
     openHooks: { onOutboundExhausted: (c) => sessions.noteOutboundFailure(c) },
@@ -119,7 +120,7 @@ async function serve(argv) {
   log(`socks5 listening on ${lhost}:${lport} (loopback only)`);
   process.on("SIGINT", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
   process.on("SIGTERM", () => { stopped = true; sessions.stop(); server.close(); process.exit(0); });
-  runCarrier();
+  for (let i = 0; i < poolSize; i++) runCarrier();
   await new Promise(() => {}); // serve forever; signals exit explicitly
   return 0;
 }

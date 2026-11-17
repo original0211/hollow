@@ -36,6 +36,7 @@ const DEFAULTS = {
   pacSeg: null, // per-install random PAC path segment (H-15-01)
   preferredEdgeIp: null, // plan §5, M2-4 (manual selection)
   exitRegion: null, // plan §7 reserve: read but ignored until the spec supplement lands
+  poolSize: 4, // NP-1117-23: session pool (striping) size, 1-8
 };
 
 // NP-1117-19 (item 1): port validation shared by every layer that
@@ -69,6 +70,10 @@ export function loadConfig() {
     const p = validPort(cfg[k]);
     cfg[k] = p === null ? DEFAULTS[k] : p;
   }
+  // NP-1117-23: pool size clamps into [1, 8]; anything unusable
+  // falls back to the default rather than poisoning the bridge.
+  const poolN = Math.floor(Number(cfg.poolSize));
+  cfg.poolSize = Number.isFinite(poolN) ? Math.max(1, Math.min(8, poolN)) : DEFAULTS.poolSize;
   return cfg;
 }
 

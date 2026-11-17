@@ -66,7 +66,7 @@ function getBridge() {
       return null;
     }
     bridgeError = null;
-    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp() });
+    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp(), poolSize: cfg.poolSize });
     let restoring = false;
     bridge.onEvent((ev) => {
       // RF-06-03: if the bridge lands in its Error terminal state while the

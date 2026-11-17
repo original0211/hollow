@@ -24,7 +24,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4 }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -61,20 +61,25 @@ export class CoreBridge {
     this.failures = 0;
     this._want = false;
     this._loopPromise = null;
-    this._wake = null;
+    this._wakes = new Set();
     this._listeners = new Set();
     this.stats = { carriers: 0, streams: 0, day: new Date().toISOString().slice(0, 10) };
     // NP-1117-16: the shared session manager owns rotations (15-min
     // timer + the 40-open budget) with drain semantics. This bridge
     // keeps its own connect/backoff/auth policy for the FIRST session
-    // of a lineage (the loop below) and hands each established client
+    // of a lineage (the loops below) and hands each established client
     // to the manager; rotations are established through the same
     // _establishClient() and land here via onSwap without the state
     // machine ever leaving "connected".
+    // NP-1117-23: the manager is a POOL of independent lineages
+    // (striping) — the supervisor runs one lineage loop per slot and
+    // the SOCKS layer places each new stream on the least-loaded
+    // healthy carrier. this.client is only a representative session.
     this.sessions = new SessionManager({
       establish: () => this._establishClient(),
       log: (m) => this.log(m),
       rotationMs: this.rotationMs,
+      size: poolSize,
       onSwap: (next) => {
         this.client = next;
         this._rollDay(); this.stats.carriers++;
@@ -82,9 +87,11 @@ export class CoreBridge {
         this._emit("stats", { stats: { ...this.stats } });
       },
       onLineageEnd: () => {
-        if (this.client && this.client.state === "dead") this.client = null;
+        // Repoint the representative at any surviving carrier.
+        this.client = this.sessions.pick();
       },
     });
+    this.poolSize = this.sessions.size;
   }
 
   // One establishment path for the loop's first session and for the
@@ -170,33 +177,49 @@ export class CoreBridge {
     this._loopPromise = this._runLoop();
   }
 
+  // NP-1117-23: the supervisor runs one lineage loop per pool slot,
+  // concurrently. Each loop keeps the pre-pool policy for its own
+  // lineage (host establishment, adopt, §8.4 backoff between
+  // attempts, edge-IP fallback); the bridge state is "connected"
+  // while at least one lineage is healthy and only falls to
+  // "reconnecting" when the whole pool is down.
   async _runLoop() {
+    const loops = [];
+    for (let i = 0; i < this.sessions.size; i++) loops.push(this._lineageLoop());
+    await Promise.all(loops);
+    if (this.state !== "error") this._setState("disconnected");
+  }
+
+  async _lineageLoop() {
     while (this._want) {
       let client = null;
       try {
         client = await this._establishClient();
-        this.client = client;
+        if (!this.client || this.client.state !== "open") this.client = client;
         this.failures = 0;
         this._rollDay(); this.stats.carriers++;
-        this.connectedSince = Date.now();
-        this._setState("connected");
+        if (this.state !== "connected") {
+          this.connectedSince = Date.now();
+          this._setState("connected");
+        }
         this._emit("stats", { stats: { ...this.stats } });
         // NP-1117-16: the session manager now owns this lineage —
         // rotations (15-min + open budget) swap this.client under us
         // via onSwap; adopt() resolves only when the lineage truly
         // ends (the then-current session died with no successor).
         await this.sessions.adopt(client);
-        this.connectedSince = null;
-        if (this.client && this.client.state === "dead") this.client = null;
+        if (this.client === client && client.state === "dead") this.client = this.sessions.pick();
         if (!this._want) break;
-        this.log("carrier down; will reconnect");
+        if (this.sessions.healthyCount() === 0) this.log("carrier down; will reconnect");
       } catch (e) {
         if (this.client === client) this.client = null;
-        this.connectedSince = null;
         const msg = String(e && e.message || e);
         if (this._want && AUTH_FATAL.test(msg)) {
+          // Fatal for every lineage alike (the PSK is shared): stop
+          // the whole pool, not just this loop.
           this._want = false;
           this._setState("error", `fatal: ${msg}`);
+          this._wakeAll();
           return;
         }
         if (!this._want) break;
@@ -209,7 +232,7 @@ export class CoreBridge {
       // candidate IPs entirely — the carrier then never comes up and
       // every SOCKS request is refused). After the threshold, fall
       // back to domain resolution for the rest of the session and say
-      // so; the dead IP is not retried. TUN bearer <redacted> are exempt:
+      // so; the dead IP is not retried. TUN bearer locks are exempt:
       // under a lock the dial set is a routing-safety matter, not a
       // preference.
       if (this.failures >= EDGE_FALLBACK_THRESHOLD && this.bearerLock === null
@@ -219,12 +242,25 @@ export class CoreBridge {
         this.log(`edge ip unreachable, fell back to domain (was ${this._edgeDeadIp})`);
       }
       const delay = backoffDelay(this.failures, this.backoffBaseMs, this.backoffCapMs);
-      this._setState("reconnecting", `attempt ${this.failures}, next in ${delay}ms`);
-      await new Promise((res) => { this._wake = res; setTimeout(res, delay).unref?.(); });
-      this._wake = null;
+      if (this.sessions.healthyCount() === 0) {
+        this.connectedSince = null;
+        if (this.state !== "reconnecting") {
+          this._setState("reconnecting", `attempt ${this.failures}, next in ${delay}ms`);
+        }
+      }
+      await this._sleep(delay);
     }
-    if (this.state !== "error") this._setState("disconnected");
   }
+
+  _sleep(ms) {
+    return new Promise((res) => {
+      const wake = () => { clearTimeout(timer); this._wakes.delete(wake); res(); };
+      const timer = setTimeout(wake, ms);
+      timer.unref?.();
+      this._wakes.add(wake);
+    });
+  }
+  _wakeAll() { for (const w of [...this._wakes]) w(); }
 
   // SOCKS entry lifecycle (plan §2): default port, increment while occupied.
   async startSocks(preferredPort = 1080, host = "127.0.0.1") {
@@ -233,7 +269,7 @@ export class CoreBridge {
     for (let port = preferredPort; port < preferredPort + 20; port++) {
       try {
         const server = await startSocks({
-          getClient: () => (this.state === "connected" ? this.client : null),
+          getClient: (exclude) => (this.state === "connected" ? this.sessions.pick(exclude) : null),
           host, port, log: (m) => this.log(`socks: ${m}`),
           openHooks: { onOutboundExhausted: (c) => this.sessions.noteOutboundFailure(c) },
         });
@@ -265,7 +301,7 @@ export class CoreBridge {
 
   async disconnect() {
     this._want = false;
-    if (this._wake) { const w = this._wake; this._wake = null; w(); }
+    this._wakeAll();
     this.sessions.stop();
     await this.stopSocks();
     if (this.client) { try { this.client.close(); } catch { /* ignore */ } this.client = null; }
@@ -298,6 +334,7 @@ export class CoreBridge {
       state: this.state, detail: this.stateDetail,
       connectedSince: this.connectedSince,
       socksPort: this.socksPort, queuedNow: this.queuedNow,
+      liveCarriers: this.sessions.healthyCount(), poolSize: this.poolSize,
       edgeIp: this.edgeIp,
       effectiveEdgeIp: this.effectiveEdgeIp(),
       bearerLock: this.bearerLock === null ? null : [...this.bearerLock],

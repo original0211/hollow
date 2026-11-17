@@ -26,6 +26,19 @@ test("missing config -> defaults; partial config merges over defaults", () => {
   assert.equal(m.socksPort, 1080); // default preserved
 });
 
+test("poolSize (NP-1117-23): default 4, clamps into [1, 8], junk falls back", () => {
+  const dir = freshHome();
+  assert.equal(loadConfig().poolSize, 4);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ poolSize: 99 }));
+  assert.equal(loadConfig().poolSize, 8);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ poolSize: 0 }));
+  assert.equal(loadConfig().poolSize, 1);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ poolSize: "junk" }));
+  assert.equal(loadConfig().poolSize, 4);
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ poolSize: 6 }));
+  assert.equal(loadConfig().poolSize, 6);
+});
+
 test("corrupt config.json -> defaults, no throw (app keeps running)", () => {
   const dir = freshHome();
   fs.writeFileSync(path.join(dir, "config.json"), "{not json!!");

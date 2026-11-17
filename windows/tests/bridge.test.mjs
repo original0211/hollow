@@ -18,6 +18,8 @@ execFileSync("node", [path.join(winDir, "tools", "prepare-vendor.mjs")], { stdio
 
 const { CoreBridge, backoffDelay } = await import("../src/core-bridge.js");
 const { HollowServer } = await import("../vendor/shared/server-core.js");
+const { HollowClient } = await import("../vendor/shared/client-core.js");
+const { SessionManager } = await import("../vendor/shared/session-manager.js");
 const { deriveVerifier } = await import("../vendor/shared/protocol.js");
 
 function memoryTransportPair() {
@@ -72,7 +74,7 @@ const waitFor = async (fn, ms = 8000) => {
 };
 const mkBridge = (opts = {}) => new CoreBridge({
   workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1,
-  makeTransport: makeFactory(), backoffBaseMs: 40, backoffCapMs: 200, ...opts,
+  makeTransport: makeFactory(), backoffBaseMs: 40, backoffCapMs: 200, poolSize: 1, ...opts,
 });
 
 test("backoffDelay: §8.4 shape (1s doubling, 60s cap, ±25% jitter)", () => {
@@ -432,4 +434,109 @@ test("open budget (NP-1117-16 d): 0x06 at the budget rotates and retries once on
   assert.equal(got, "migrate");
   sock.destroy();
   await b.disconnect();
+});
+
+// ---------------------------------------------------------------------------
+// NP-1117-23: session pool (striping). Placement = least-loaded healthy
+// carrier; one carrier's death/rotation never touches the others.
+test("pool (NP-1117-23): placement balances new streams across 4 carriers", async () => {
+  const servers = [];
+  const b = mkBridge({ poolSize: 4, makeTransport: makeFactory(VERIFIER, { onCarrier: (st, server) => servers.push(server) }) });
+  await b.connect();
+  await waitFor(() => b.sessions.healthyCount() === 4);
+  assert.equal(servers.length, 4);
+  const streams = [];
+  for (let i = 0; i < 8; i++) {
+    const s = b.sessions.pick().openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+    await s.opened;
+    streams.push(s);
+  }
+  assert.deepEqual(servers.map((s) => s.streams.size).sort(), [2, 2, 2, 2]);
+  for (const s of streams) s.reset(0);
+  await b.disconnect();
+});
+
+test("pool (NP-1117-23): a single stream is never split across carriers", async () => {
+  const servers = [];
+  const b = mkBridge({ poolSize: 4, makeTransport: makeFactory(VERIFIER, { onCarrier: (st, server) => servers.push(server) }) });
+  await b.connect();
+  await waitFor(() => b.sessions.healthyCount() === 4);
+  const s = b.sessions.pick().openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+  await s.opened;
+  const payload = crypto.randomBytes(32 * 1024);
+  const got = [];
+  s.onData = (d) => got.push(Buffer.from(d));
+  s.write(payload);
+  await waitFor(() => Buffer.concat(got).length >= payload.length);
+  assert.ok(Buffer.concat(got).equals(payload));
+  assert.deepEqual(servers.map((x) => x.streams.size).sort(), [0, 0, 0, 1]);
+  s.reset(0);
+  await b.disconnect();
+});
+
+test("pool (NP-1117-23): one carrier's death is isolated; the pool replenishes it", async () => {
+  const transports = [];
+  const servers = [];
+  const b = mkBridge({ poolSize: 4, makeTransport: makeFactory(VERIFIER, { onCarrier: (st, server) => { transports.push(st); servers.push(server); } }) });
+  await b.connect();
+  await waitFor(() => b.sessions.healthyCount() === 4);
+  const streams = [];
+  for (let i = 0; i < 4; i++) {
+    const s = b.sessions.pick().openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+    await s.opened;
+    streams.push(s);
+  }
+  const dead = new Set();
+  streams.forEach((s, i) => {
+    const mark = () => dead.add(i);
+    s.onEnd = mark; s.onReset = mark; s.onFail = mark;
+  });
+  transports[1].close(); // kill carrier #2's leg
+  await waitFor(() => dead.size === 1);
+  assert.equal(b.state, "connected"); // the pool never went down
+  for (let i = 0; i < 4; i++) {
+    if (!dead.has(i)) await echoRoundTrip(streams[i], `alive-${i}`);
+  }
+  // Replenishment: a fifth establishment restores 4 healthy carriers.
+  await waitFor(() => servers.length >= 5 && b.sessions.healthyCount() === 4);
+  for (const s of streams) { try { s.reset(0); } catch { /* already gone */ } }
+  await b.disconnect();
+});
+
+test("pool (NP-1117-23): a budget rotation stays inside its own lineage", async () => {
+  const servers = [];
+  const establish = async () => {
+    const [ct, st] = memoryTransportPair();
+    const server = new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    servers.push(server);
+    const client = new HollowClient({ transport: ct, psk: PSK, keyId: 1 });
+    await client.handshake();
+    return client;
+  };
+  const sessions = new SessionManager({ establish, size: 2, rotationMs: 0, log: () => {} });
+  const cA = await establish();
+  const endA = sessions.adopt(cA);
+  const cB = await establish();
+  const endB = sessions.adopt(cB);
+  endA.catch(() => {}); endB.catch(() => {});
+  // A long-lived stream on B, opened BEFORE A's rotation.
+  const sB = cB.openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+  await sB.opened;
+  // Burn A's open budget (the client-core threshold, 40) with short
+  // streams: rotation fires on A's lineage only.
+  for (let i = 0; i < 40; i++) {
+    const s = cA.openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+    await s.opened;
+    s.reset(0);
+  }
+  await waitFor(() => sessions.rotations === 1);
+  assert.equal(servers.length, 3); // exactly one replacement, for A
+  assert.equal(cB.state, "open"); // B's session untouched
+  await echoRoundTrip(sB, "b-survives"); // B's in-flight stream intact
+  sB.reset(0);
+  sessions.stop();
 });

@@ -46,8 +46,14 @@ async function openWithRetry(getClient, opts, retry = {}, log = () => {}, hooks 
   const t0 = Date.now();
   let delay = baseMs;
   let migrated = false;
+  // NP-1117-23: after a 0x06 migration the retry asks the host to
+  // place the stream AWAY from the carrier that just failed (the
+  // session pool avoids it while any alternative exists). Hosts with
+  // a single session simply ignore the argument.
+  let exclude = null;
   for (;;) {
-    const client = getClient();
+    const client = getClient(exclude);
+    exclude = null;
     if (!client || client.state !== "open") {
       const e = new Error("no live session");
       e.code = undefined;
@@ -62,6 +68,7 @@ async function openWithRetry(getClient, opts, retry = {}, log = () => {}, hooks 
         migrated = true; // at most one migration per connection, ever
         if (await hooks.onOutboundExhausted(client)) {
           log("open rejected 0x06 on a budget-exhausted session; rotated, retrying once");
+          exclude = client;
           continue;
         }
         throw e;

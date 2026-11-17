@@ -1,6 +1,6 @@
-// Session manager (NP-1117-16, plan A): ONE rotation machine shared by
-// the CLI serve loop and the Windows CoreBridge. It owns the lineage
-// of HollowClient sessions for a host:
+// Session lineage (NP-1117-16, plan A): ONE rotation machine for ONE
+// carrier, shared by the CLI serve loop and the Windows CoreBridge.
+// It owns the lineage of HollowClient sessions for a host:
 //
 //   - The host establishes the first session (with all of its own
 //     policy: backoff, auth-fatal, edge fallback) and hands it to
@@ -28,7 +28,7 @@ export const DRAIN_GRACE_MS = 10 * 60 * 1000; // bounded drain for retired sessi
 const DRAIN_POLL_MS = 200;
 const ROTATE_FAILURE_COOLDOWN_MS = 5000;
 
-export class SessionManager {
+class SessionLineage {
   constructor({
     establish, // async () => HollowClient (handshaken, host-instrumented)
     log = () => {},
@@ -56,6 +56,10 @@ export class SessionManager {
   }
 
   current() { return this._current; }
+
+  // Pool support (NP-1117-23): does this lineage own the session
+  // (as its current or as a draining retiree)?
+  has(client) { return client === this._current || this._draining.has(client); }
 
   // Register a host-established session as the lineage's current.
   // Returns a promise that resolves when the lineage ends.
@@ -215,5 +219,126 @@ export class SessionManager {
     this._draining.clear();
     const waiters = this._waiters.splice(0);
     for (const res of waiters) res();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session pool (NP-1117-23): N independent lineages behind one facade.
+// The striping A/B (NP-1117-22) showed aggregate throughput scaling
+// near-linearly with independent carriers — each carrier is its own
+// TCP/WebSocket leg with its own head-of-line blocking domain, and the
+// server simply sees N ordinary independent sessions; the protocol is
+// untouched. Placement: a new stream goes to the healthy carrier with
+// the fewest active streams (ties broken round-robin); a stream
+// belongs to its carrier for life and is never split across carriers.
+// Every lineage keeps the full NP-1117-16 semantics (open-budget
+// rotation, reactive 0x06 rotation, 15-minute timer, drain). One
+// lineage ending never blocks placement on the others; the host runs
+// one supervisor loop per slot and replenishes a slot by adopt()ing a
+// fresh session when that lineage's promise resolves.
+export const DEFAULT_POOL_SIZE = 4;
+export const MAX_POOL_SIZE = 8;
+
+export class SessionManager {
+  constructor({
+    establish, // async () => HollowClient (handshaken, host-instrumented)
+    log = () => {},
+    rotateThreshold = SESSION_ROTATE_THRESHOLD,
+    rotationMs = ROTATION_MS,
+    drainGraceMs = DRAIN_GRACE_MS,
+    onSwap = () => {}, // (newClient, oldClient) after an atomic swap in any lineage
+    onLineageEnd = () => {}, // one lineage's current session is gone
+    size = DEFAULT_POOL_SIZE,
+  }) {
+    this.establish = establish;
+    this.log = log;
+    this.size = Math.max(1, Math.min(MAX_POOL_SIZE, Math.floor(size) || 1));
+    this._lineageOpts = { establish, log, rotateThreshold, rotationMs, drainGraceMs };
+    this._onSwap = onSwap;
+    this._onLineageEnd = onLineageEnd;
+    this._slots = []; // { lineage, busy }
+    this._rr = 0; // round-robin cursor for placement ties
+    this._stopped = false;
+  }
+
+  _newSlot() {
+    const slot = { lineage: null, busy: false };
+    slot.lineage = new SessionLineage({
+      ...this._lineageOpts,
+      onSwap: (next, old) => { this._onSwap(next, old); },
+      onLineageEnd: () => {
+        slot.busy = false;
+        this._onLineageEnd();
+      },
+    });
+    this._slots.push(slot);
+    return slot;
+  }
+
+  // Register a host-established session into a free slot; the
+  // returned promise resolves when THAT lineage ends. The host runs
+  // exactly one supervisor loop per slot, so a free slot always
+  // exists — overflow is a host bug, not a runtime condition.
+  adopt(client) {
+    let slot = this._slots.find((s) => !s.busy);
+    if (!slot) {
+      if (this._slots.length >= this.size) {
+        throw new Error(`session pool exhausted (size ${this.size})`);
+      }
+      slot = this._newSlot();
+    }
+    slot.busy = true;
+    return slot.lineage.adopt(client);
+  }
+
+  // Placement for a NEW stream: the healthy carrier with the fewest
+  // active streams; ties round-robin. `exclude` (the carrier a stream
+  // just failed on) is avoided while any alternative exists.
+  pick(exclude = null) {
+    const healthy = [];
+    for (const slot of this._slots) {
+      const c = slot.lineage.current();
+      if (c && c.state === "open") healthy.push(c);
+    }
+    if (!healthy.length) return null;
+    let pool = healthy.filter((c) => c !== exclude);
+    if (!pool.length) pool = healthy;
+    let min = Infinity;
+    for (const c of pool) min = Math.min(min, c.streams.size);
+    const tied = pool.filter((c) => c.streams.size === min);
+    const chosen = tied[this._rr % tied.length];
+    this._rr++;
+    return chosen;
+  }
+
+  // A representative live session (the least loaded), or null.
+  current() { return this.pick(); }
+
+  healthyCount() {
+    let n = 0;
+    for (const slot of this._slots) {
+      const c = slot.lineage.current();
+      if (c && c.state === "open") n++;
+    }
+    return n;
+  }
+
+  get rotations() {
+    return this._slots.reduce((sum, s) => sum + s.lineage.rotations, 0);
+  }
+
+  // SOCKS-layer 0x06 hook: route to the lineage that owns the
+  // failing session (as its current or as a draining retiree).
+  async noteOutboundFailure(client) {
+    if (this._stopped || !client) return false;
+    for (const slot of this._slots) {
+      if (slot.lineage.has(client)) return slot.lineage.noteOutboundFailure(client);
+    }
+    return false;
+  }
+
+  stop() {
+    this._stopped = true;
+    for (const slot of this._slots) slot.lineage.stop();
   }
 }
