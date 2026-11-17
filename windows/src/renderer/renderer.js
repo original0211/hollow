@@ -44,7 +44,24 @@ function render() {
     }
   }
   $("stats").textContent = parts.join(" · ");
-  $("queued-banner").style.display = snapshot.queuedNow > 0 ? "block" : "none";
+  renderQueuedBanner();
+}
+
+// NP-1117-12: the banner follows the LIVE queued count (bridge emits
+// on every change). Showing is immediate; hiding is debounced ~1 s so
+// a sub-second queue drain does not flicker the banner on and off.
+let queuedHideTimer = null;
+function renderQueuedBanner() {
+  const banner = $("queued-banner");
+  if (snapshot.queuedNow > 0) {
+    if (queuedHideTimer) { clearTimeout(queuedHideTimer); queuedHideTimer = null; }
+    banner.style.display = "block";
+  } else if (banner.style.display === "block" && !queuedHideTimer) {
+    queuedHideTimer = setTimeout(() => {
+      queuedHideTimer = null;
+      if (snapshot.queuedNow <= 0) $("queued-banner").style.display = "none";
+    }, 1000);
+  }
 }
 async function refresh() {
   const s = await window.hollow.getState();

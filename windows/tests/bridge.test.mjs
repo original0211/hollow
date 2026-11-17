@@ -219,3 +219,59 @@ test("edge ip fallback (NP-1117-07 d3): bearer lock is exempt", async () => {
   assert.ok(!logs.some((m) => m.includes("fell back to domain")));
   await b.disconnect();
 });
+
+test("queued count follows the live queue: fades on establish, on carrier death, on local reset (NP-1117-12)", async () => {
+  const b = mkBridge();
+  const queuedEvents = [];
+  b.onEvent((ev) => { if (ev.type === "queued") queuedEvents.push(ev.queuedNow); });
+  // Minimal fake client/stream with client-core's surface: onQueued
+  // callback slot, an `opened` promise, and a reset() method.
+  const mkStream = (id) => {
+    let res, rej;
+    const opened = new Promise((r, j) => { res = r; rej = j; });
+    return {
+      id, state: "opening", onQueued: null, opened,
+      _res: res, _rej: rej, resetCalls: 0,
+      reset() { this.resetCalls++; this.state = "reset"; },
+    };
+  };
+  let nextId = 1;
+  const fakeClient = { openStream: () => mkStream(nextId++) };
+  b._instrument(fakeClient);
+  const tick = () => new Promise((r) => setTimeout(r, 10));
+
+  // cell 1 (the required one): queued -> established -> count fades
+  const s1 = fakeClient.openStream({});
+  s1.onQueued({ position: 1, estWaitMs: 0, maxWaitMs: 5000 });
+  assert.equal(b.queuedNow, 1);
+  s1._res(0); // OPEN_OK
+  await tick();
+  assert.equal(b.queuedNow, 0);
+
+  // cell 2 (the actual latch): queued -> carrier dies (client-core
+  // _die rejects `opened` but never moves s.state out of "queued")
+  const s2 = fakeClient.openStream({});
+  s2.onQueued({ position: 1, estWaitMs: 0, maxWaitMs: 5000 });
+  assert.equal(b.queuedNow, 1);
+  s2._rej(new Error("carrier closed"));
+  await tick();
+  assert.equal(b.queuedNow, 0);
+
+  // cell 3: queued -> local reset before any server answer
+  const s3 = fakeClient.openStream({});
+  s3.onQueued({ position: 2, estWaitMs: 0, maxWaitMs: 5000 });
+  assert.equal(b.queuedNow, 1);
+  s3.reset();
+  assert.equal(b.queuedNow, 0);
+  assert.equal(s3.resetCalls, 1);
+
+  // repeated OPEN_QUEUED updates for one stream count once
+  const s4 = fakeClient.openStream({});
+  s4.onQueued({ position: 3, estWaitMs: 0, maxWaitMs: 5000 });
+  s4.onQueued({ position: 1, estWaitMs: 0, maxWaitMs: 5000 });
+  assert.equal(b.queuedNow, 1);
+  s4._res(0);
+  await tick();
+  assert.equal(b.queuedNow, 0);
+  assert.deepEqual(queuedEvents, [1, 0, 1, 0, 1, 0, 1, 0]);
+});

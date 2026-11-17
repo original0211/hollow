@@ -81,6 +81,15 @@ export class CoreBridge {
   }
 
   // Wrap a fresh client: count streams, surface OPEN_QUEUED transitions.
+  // NP-1117-12: the queued count is EVENT-driven off client-core's own
+  // queue surface (the stream's onQueued callback + the settlement of
+  // its `opened` promise), never a poll of s.state. The old 50 ms state
+  // poll latched the banner: HollowClient._die() settles a queued
+  // stream's promises but never moves s.state out of "queued", so on
+  // carrier death/rotation the count was never returned and the banner
+  // stayed up for the rest of the session. `opened` settles on EVERY
+  // exit — OPEN_OK resolve, OPEN_REJECT reject, carrier death reject —
+  // and a local reset() is wrapped to settle the count too.
   _instrument(client) {
     const origOpen = client.openStream.bind(client);
     client.openStream = (opts) => {
@@ -88,20 +97,29 @@ export class CoreBridge {
       this._rollDay(); this.stats.streams++;
       this._emit("stats", { stats: { ...this.stats } });
       let counted = false;
-      const iv = setInterval(() => {
-        if (s.state === "queued" && !counted) {
+      const settle = () => {
+        if (!counted) return;
+        counted = false;
+        this.queuedNow = Math.max(0, this.queuedNow - 1);
+        this._emit("queued", { queuedNow: this.queuedNow, active: this.queuedNow > 0 });
+      };
+      const prevOnQueued = s.onQueued;
+      s.onQueued = (info) => {
+        if (prevOnQueued) prevOnQueued(info);
+        if (!counted) {
           counted = true; this.queuedNow++;
           this.log(`stream ${s.id} queued (server busy)`);
           this._emit("queued", { queuedNow: this.queuedNow, active: true });
-        } else if (s.state !== "queued" && counted) {
-          counted = false; this.queuedNow = Math.max(0, this.queuedNow - 1);
-          this._emit("queued", { queuedNow: this.queuedNow, active: this.queuedNow > 0 });
-          clearInterval(iv);
-        } else if (["rejected", "closed", "reset", "failed"].includes(s.state)) {
-          clearInterval(iv);
         }
-      }, 50);
-      iv.unref?.();
+      };
+      // `opened` may already be settled by the time we attach (it
+      // cannot — openStream returns before any frame can arrive — but
+      // .then on a settled promise still fires, so this is safe either
+      // way). Both branches settle: resolve = established, reject =
+      // refused or carrier died mid-queue.
+      s.opened.then(settle, settle);
+      const origReset = s.reset.bind(s);
+      s.reset = (code) => { settle(); origReset(code); };
       return s;
     };
     return client;
