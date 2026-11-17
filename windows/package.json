@@ -42,5 +42,5 @@
     "ui-smoke": "node tools/run-ui-smoke.mjs"
   },
   "type": "module",
-  "version": "0.2.7"
+  "version": "0.2.9"
 }
