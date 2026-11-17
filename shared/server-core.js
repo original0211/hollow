@@ -256,16 +256,34 @@ export class HollowServer {
       sock = await this.connectFn({ hostname: open.host, port: open.port });
       if (sock.opened) await sock.opened;
     } catch (e) { connectErr = e; }
-    if (this.dead || !this.streams.has(streamId)) {
+    // NP-1117-10 (must-fix B): the mid-establishment death check is by
+    // OBJECT IDENTITY, not by id presence. A client may reset a stream
+    // and reuse its id while the old establishment is still in flight;
+    // presence would let the old establishment attach its socket to
+    // the detached old object and pump frames under the new stream's id.
+    if (this.dead || this.streams.get(streamId) !== s) {
       if (sock) { try { sock.close(); } catch {} }
       this._releaseInFlight();
       return;
     }
     if (sock) {
-      s.gate = GATE.CONNECT; s.socket = sock;
-      s.writer = sock.writable.getWriter();
-      this._sendFrame(buildFrame(FT.OPEN_OK, streamId, new Uint8Array([GATE.CONNECT])), true);
-      this._pumpSocket(s);
+      try {
+        s.gate = GATE.CONNECT; s.socket = sock;
+        s.writer = sock.writable.getWriter();
+        this._sendFrame(buildFrame(FT.OPEN_OK, streamId, new Uint8Array([GATE.CONNECT])), true);
+        this._pumpSocket(s);
+      } catch (e) {
+        // NP-1117-10 (must-fix A): the socket can die in the window
+        // between connect success and writer acquisition. Without this
+        // guard the throw escaped _startOpen and the in-flight slot
+        // (and the stream entry) leaked silently. Clean both, answer
+        // the OPEN honestly, and release the slot below.
+        this.streams.delete(streamId);
+        this._closeSocket(s);
+        try {
+          this._sendFrame(buildFrame(FT.OPEN_REJECT, streamId, rejectPayload(ERR.TARGET_UNREACHABLE, 0)), true);
+        } catch { /* the carrier itself is gone; cleanup already done */ }
+      }
       // §7.5 (v0.2.0): opened — the establishment has concluded and
       // the slot returns here; the established socket holds no slot.
       this._releaseInFlight();
@@ -281,11 +299,13 @@ export class HollowServer {
       s.gate = GATE.FETCH; s.fetchBuf = [];
       this.fetchActive++;
       s.occupiesFetch = true;
+      // §7.5 fetch gate (NP-1117-10 must-fix C, frozen letter): unlike
+      // the connect gate, the slot is HELD past gate selection — until
+      // response headers arrive or the transaction fails (see
+      // _runFetch / _releaseFetchSlot). The §7.4 fetchActive account
+      // above runs in parallel, not instead.
+      s.holdsInFlightSlot = true;
       this._sendFrame(buildFrame(FT.OPEN_OK, streamId, new Uint8Array([GATE.FETCH])), true);
-      // §7.5: the gate is selected — the establishment has concluded
-      // and the slot returns. The fetch transaction's own span stays
-      // governed by the separate §7.4 fetchActive account (above).
-      this._releaseInFlight();
       return;
     }
     // §7.3 step 3: map error
@@ -300,13 +320,27 @@ export class HollowServer {
 
   // §7.5 pairing (NP-1117-08): _startOpen increments occupancy exactly
   // once, and every establishment concludes through exactly one call
-  // here — established (connect), gate-selected (fetch), rejected, or
-  // the session died mid-flight. Queued OPENs never increment (they
-  // have not started establishing), so queue timeout / client cancel /
-  // teardown of the queue need no release.
+  // here — established (connect), rejected, or the session died
+  // mid-flight. The fetch gate is the one deliberate exception in
+  // timing (must-fix C): its slot is returned by _releaseFetchSlot
+  // when response headers arrive or the transaction fails. Queued
+  // OPENs never increment (they have not started establishing), so
+  // queue timeout / client cancel / teardown of the queue need no
+  // release.
   _releaseInFlight() {
     this.occupancy--;
     this._drainQueue();
+  }
+
+  // §7.5 fetch gate (must-fix C): release a fetch-gated stream's held
+  // slot. The flag flips exactly once, whichever path fires first —
+  // headers arrived (_runFetch), transaction failed (_runFetch fail),
+  // or the stream was freed before either (_freeStream backstop).
+  _releaseFetchSlot(s) {
+    if (s.holdsInFlightSlot) {
+      s.holdsInFlightSlot = false;
+      this._releaseInFlight();
+    }
   }
 
   _drainQueue() {
@@ -329,9 +363,12 @@ export class HollowServer {
     this.streams.delete(s.id);
     this._closeSocket(s);
     if (s.occupiesFetch) { this.fetchActive--; s.occupiesFetch = false; }
-    // No §7.5 release here (NP-1117-08): an established stream holds
-    // no slot — its slot was returned when its establishment concluded
-    // (see _releaseInFlight). Decrementing here would double-count.
+    // Connect-gated streams hold no §7.5 slot at this point (returned
+    // when the establishment concluded — decrementing here would
+    // double-count). A fetch-gated stream freed before its headers
+    // arrived still holds its slot; release it as a backstop
+    // (must-fix C — the flag keeps it exactly-once).
+    this._releaseFetchSlot(s);
   }
 
   // P2 (NP-1116-04): arm/re-arm the idle linger for an outEof stream.
@@ -512,7 +549,8 @@ export class HollowServer {
   async _runFetch(s) {
     const raw = concat(...s.fetchBuf);
     s.fetchBuf = [];
-    const fail = (code) => { this._resetStream(s.id, code); };
+    // §7.5 (must-fix C): every transaction failure releases the held slot.
+    const fail = (code) => { this._releaseFetchSlot(s); this._resetStream(s.id, code); };
     // parse request head
     const headEnd = indexOfDoubleCRLF(raw);
     if (headEnd < 0) return fail(ERR.FETCH_PROFILE_UNSUPPORTED);
@@ -550,6 +588,10 @@ export class HollowServer {
     } catch {
       return fail(ERR.FETCH_FALLBACK_FAILED);
     }
+    // §7.5 (must-fix C): response headers have arrived — the fetch
+    // gate's slot returns here; the body transfer that follows holds
+    // no slot (the §7.4 fetchActive account still spans the stream).
+    this._releaseFetchSlot(s);
     // synthesize HTTP/1.1 response head (§7.4)
     const statusText = resp.statusText || "";
     let head = `HTTP/1.1 ${resp.status} ${statusText}\r\n`;
