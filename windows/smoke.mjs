@@ -13,11 +13,21 @@ const log = (m) => console.log(new Date().toISOString(), m);
 
 const bridge = new CoreBridge({ workerUrl: process.env.HOLLOW_WORKER_URL || cfg.workerUrl, psk, keyId: cfg.keyId, log });
 await bridge.connect();
+// NP-1117-29: since the NP-1117-23 session pool, bridge.client is
+// only a representative session — wait for a healthy pooled carrier
+// and open the stream on it, the same placement the SOCKS entry uses.
+let client = null;
+for (let i = 0; i < 200 && !client; i++) {
+  client = bridge.sessions.pick();
+  if (!client) await new Promise((r) => setTimeout(r, 100));
+}
+if (!client) { console.error("SMOKE FAIL: no healthy carrier"); process.exit(1); }
 log("handshake ok");
-// Stream-level fetch through the live client (the SOCKS entry shares this
-// exact path; it was proven in M1 and gets its app wiring in M2-1).
+// Stream-level fetch through a live pooled carrier (the SOCKS entry
+// shares this exact path; it was proven in M1 and gets its app
+// wiring in M2-1).
 const url = new URL(target);
-const stream = bridge.client.openStream({ host: url.hostname, port: Number(url.port || 80), schemeHint: 0, gatePolicy: 0 });
+const stream = client.openStream({ host: url.hostname, port: Number(url.port || 80), schemeHint: 0, gatePolicy: 0 });
 const gate = await stream.opened;
 log(`stream opened via gate ${gate}`);
 const req = `GET ${url.pathname} HTTP/1.0\r\nHost: ${url.hostname}\r\n\r\n`;
