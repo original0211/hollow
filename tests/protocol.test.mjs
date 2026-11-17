@@ -93,7 +93,7 @@ function nodeConnect({ port }) {
   });
 }
 
-async function makePair(pskClient, pskServer, connectFn = nodeConnect) {
+async function makePair(pskClient, pskServer, connectFn = nodeConnect, serverOpts = {}) {
   const [ta, tb] = memoryTransportPair();
   const v = await deriveVerifier(pskServer);
   const server = new HollowServer({
@@ -101,6 +101,7 @@ async function makePair(pskClient, pskServer, connectFn = nodeConnect) {
     verifiers: new Map([[1, v]]),
     ownHost: "hollow.example.workers.dev",
     zoneSuffix: "example.workers.dev",
+    ...serverOpts,
     connectFn,
     fetchFn: async () => { throw new Error("no fetch in local harness"); },
   });
@@ -168,7 +169,9 @@ test("E2E: 7th stream queues with OPEN_QUEUED while 6 establishments are in flig
   const connectFn = ({ port: p }) => new Promise((resolve) => {
     pending.push(() => { nodeConnect({ port: p }).then(resolve); });
   });
-  const { client } = await makePair(psk, psk, connectFn);
+  // NP-1117-14 raised the production default to 16; the queue
+  // machinery is exercised here at the pinned boundary of 6.
+  const { client } = await makePair(psk, psk, connectFn, { maxInFlightOpens: 6 });
   await client.handshake();
   const streams = [];
   for (let i = 0; i < 6; i++) streams.push(client.openStream({ host: "localhost", port }));

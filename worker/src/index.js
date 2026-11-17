@@ -1344,7 +1344,7 @@ const HALF_CONN = CONN_WINDOW_INIT / 2;
 const CONNECT_SPECIAL_ERROR = "proxy request failed, cannot connect to the specified address";
 
 class HollowServer {
-  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = MAX_OCCUPANCY }) {
+  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = 16, queueDepth = 64 }) {
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
@@ -1359,9 +1359,16 @@ class HollowServer {
     // establishment concludes — success or failure. Established streams
     // hold no slot. (The pre-v0.2.0 code counted the stream's whole
     // lifetime; six browser keep-alive streams then wedged the session.)
-    // The cap stays 6, as a named local parameter per §7.5's closing
-    // positioning (admission parameter; interface unchanged).
+    // §7.5 positions the cap as a LOCAL admission parameter; the values
+    // here were tuned under NP-1117-14 (Brody-approved): 16 in flight
+    // (was 6) + a 64-deep FIFO queue (was 32), wait cap unchanged at
+    // 5,000 ms. protocol.js keeps the spec-era constants (MAX_OCCUPANCY
+    // 6 / QUEUE_DEPTH 32) as the historical record — admission runs
+    // only here on the server; the client never pre-judges it. The
+    // client-side counterpart is the bounded 0x01 retry in the SOCKS
+    // layer (NP-1117-14 item 2).
     this.maxInFlightOpens = maxInFlightOpens;
+    this.queueDepth = queueDepth;
     this.occupancy = 0;
     this.fetchActive = 0;
     this.streamErrors = 0;
@@ -1537,7 +1544,7 @@ class HollowServer {
       return;
     }
     if (this.occupancy >= this.maxInFlightOpens) {
-      if (this.queue.length >= QUEUE_DEPTH) {
+      if (this.queue.length >= this.queueDepth) {
         this._sendFrame(buildFrame(FT.OPEN_REJECT, f.streamId,
           rejectPayload(ERR.CONCURRENCY_LIMIT, QUEUE_RETRY_AFTER_MS)), true);
         return;

@@ -19,9 +19,45 @@ const repForOpenError = (code) => {
   }
 };
 
-export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {} }) {
+// NP-1117-14: bounded local retry for 0x01 (concurrency_limit) OPEN
+// rejects. Server admission is finite (16 in flight + 64 queue), so a
+// heavy burst can still draw an instant 0x01; instead of failing the
+// SOCKS connection on the spot, re-OPEN under a fresh stream id with
+// exponential backoff + jitter, honoring the server's retry_after as
+// a floor, inside a ~10 s total budget. The SOCKS side stays pending
+// the whole time (no REP / no HTTP status is sent until the outcome
+// is final). ONLY 0x01 retries — every other code fails immediately.
+// Rejected streams are forgotten by client-core on OPEN_REJECT, so
+// retries leave nothing behind in the stream table.
+export const OPEN_RETRY_BASE_MS = 250;
+export const OPEN_RETRY_CAP_MS = 10000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function openWithRetry(client, opts, retry = {}, log = () => {}) {
+  const baseMs = retry.baseMs ?? OPEN_RETRY_BASE_MS;
+  const capMs = retry.capMs ?? OPEN_RETRY_CAP_MS;
+  const t0 = Date.now();
+  let delay = baseMs;
+  for (;;) {
+    const s = client.openStream(opts);
+    try {
+      await s.opened;
+      return s;
+    } catch (e) {
+      if (!e || e.code !== ERR.CONCURRENCY_LIMIT) throw e;
+      const elapsed = Date.now() - t0;
+      if (elapsed >= capMs) throw e;
+      const jittered = delay * (1 + (Math.random() * 0.5 - 0.25));
+      const wait = Math.min(capMs - elapsed, Math.max(jittered, e.retryAfterMs || 0));
+      log(`open rejected 0x01 (concurrency_limit); retrying in ${Math.round(wait)} ms`);
+      await sleep(Math.max(0, Math.round(wait)));
+      delay = Math.min(delay * 2, 2000);
+    }
+  }
+}
+
+export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {}, openRetry = {} }) {
   const server = net.createServer((sock) => {
-    handleConn(sock, getClient, log).catch(() => { try { sock.destroy(); } catch {} });
+    handleConn(sock, getClient, log, openRetry).catch(() => { try { sock.destroy(); } catch {} });
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -86,17 +122,17 @@ function makeReader(sock) {
   };
 }
 
-async function handleConn(sock, getClient, log) {
+async function handleConn(sock, getClient, log, openRetry = {}) {
   sock.on("error", () => {});
   const reader = makeReader(sock);
   const first = await reader.readN(1);
   if (!first) { sock.destroy(); return; }
-  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log);
-  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log); // 'C'
+  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry);
+  if (first[0] === 0x43) return handleHttpConnect(sock, reader, first, getClient, log, openRetry); // 'C'
   sock.destroy();
 }
 
-async function handleSocks(sock, reader, getClient, log) {
+async function handleSocks(sock, reader, getClient, log, openRetry = {}) {
   const readN = reader.readN;
   const nmethods = await readN(1);
   if (!nmethods) { sock.destroy(); return; }
@@ -135,8 +171,7 @@ async function handleSocks(sock, reader, getClient, log) {
   if (!client || client.state !== "open") { reply(sock, REP.GENERAL); return; }
   let stream;
   try {
-    stream = client.openStream({ host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 });
-    await stream.opened;
+    stream = await openWithRetry(client, { host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 }, openRetry, log);
   } catch (e) {
     reply(sock, e && e.code !== undefined ? repForOpenError(e.code) : REP.GENERAL);
     return;
@@ -149,7 +184,7 @@ async function handleSocks(sock, reader, getClient, log) {
 // HTTP CONNECT (NP-1117-07): the other dialect browsers speak to this
 // port. Same open path, same pump; failures are HTTP status lines, and
 // anything that is not a well-formed CONNECT is destroyed.
-async function handleHttpConnect(sock, reader, first, getClient, log) {
+async function handleHttpConnect(sock, reader, first, getClient, log, openRetry = {}) {
   const headBuf = await reader.readUntil("\r\n\r\n", 16384);
   if (!headBuf) { sock.destroy(); return; }
   const headText = Buffer.concat([first, headBuf]).toString("latin1");
@@ -163,8 +198,7 @@ async function handleHttpConnect(sock, reader, first, getClient, log) {
   if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
   let stream;
   try {
-    stream = client.openStream({ host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 });
-    await stream.opened;
+    stream = await openWithRetry(client, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log);
   } catch {
     httpReply(sock, 502, "Bad Gateway");
     return;

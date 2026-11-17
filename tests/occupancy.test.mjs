@@ -250,3 +250,25 @@ test("must-fix C: fetch gate holds its slot until response headers arrive (slow 
   assert.equal(server.fetchActive, 0);
   client.close();
 });
+
+test("burst cell x48 (NP-1117-14): 48 at once under the tuned admission (16 in flight + 64 queue), zero rejected, zero timeouts", async () => {
+  const { server: echo, port } = await startEcho();
+  const { client, server } = await makePair(nodeConnect);
+  const N = 48;
+  const streams = [];
+  const t0 = Date.now();
+  for (let i = 0; i < N; i++) {
+    streams.push(client.openStream({ host: "localhost", port, schemeHint: 0, gatePolicy: 0 }));
+  }
+  const settled = await Promise.all(streams.map((s) => s.opened.then(
+    () => ({ ok: true }),
+    (e) => ({ ok: false, code: e && e.code }),
+  )));
+  const elapsed = Date.now() - t0;
+  assert.ok(settled.every((r) => r.ok), `all 48 must open (failures: ${JSON.stringify(settled.filter((r) => !r.ok))})`);
+  assert.equal(server.streams.size, N);
+  assert.equal(server.occupancy, 0);
+  assert.ok(elapsed < 5000, `no stream may ride the 5,000 ms queue timeout (took ${elapsed} ms)`);
+  client.close();
+  echo.close();
+});

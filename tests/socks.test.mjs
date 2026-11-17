@@ -154,3 +154,94 @@ test("live dual-protocol: SOCKS5 and HTTP CONNECT both carry a stream on one por
     echo.close();
   }
 });
+
+// ---- NP-1117-14: bounded 0x01 retry at the SOCKS layer ----
+import { ERR } from "../shared/protocol.js";
+
+function rejectingStream(code) {
+  const e = new Error("open rejected " + code);
+  e.code = code; e.retryAfterMs = 0;
+  const s = fakeStream();
+  s.opened = Promise.reject(e);
+  return s;
+}
+async function socksConnect(port, payloadAfter = null) {
+  const sock = net.connect(port, "127.0.0.1");
+  await new Promise((r) => sock.once("connect", r));
+  const recv = [];
+  sock.on("data", (d) => recv.push(d));
+  sock.write(Buffer.from([0x05, 0x01, 0x00])); // greeting: no-auth
+  await new Promise((r) => setTimeout(r, 30));
+  const t0 = Date.now();
+  sock.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 80])); // CONNECT 1.2.3.4:80
+  // wait for the 10-byte request reply (after the 2-byte greeting reply)
+  for (;;) {
+    const bytes = Buffer.concat(recv);
+    if (bytes.length >= 12) {
+      const rep = bytes[2 + 1];
+      if (payloadAfter) sock.write(payloadAfter);
+      return { sock, rep, elapsed: Date.now() - t0, bytes };
+    }
+    if (Date.now() - t0 > 8000) throw new Error("no SOCKS reply");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+test("0x01 retry (c): two concurrency_limit rejects then success — SOCKS succeeds, exactly one live stream", async () => {
+  const created = [];
+  const good = fakeStream();
+  const writes = [];
+  good.write = (d) => { writes.push(Buffer.from(d)); return true; };
+  const fakeClient = {
+    state: "open",
+    openStream: () => {
+      const s = created.length < 2 ? rejectingStream(ERR.CONCURRENCY_LIMIT) : good;
+      created.push(s);
+      return s;
+    },
+  };
+  const server = await startSocks({ getClient: () => fakeClient, port: 0, host: "127.0.0.1", openRetry: { baseMs: 20, capMs: 2000 } });
+  const port = server.address().port;
+  const { sock, rep } = await socksConnect(port, Buffer.from("ping"));
+  assert.equal(rep, 0x00); // REP.SUCCESS after the retries
+  assert.equal(created.length, 3); // 2 rejected attempts + 1 success
+  assert.equal(created[0].onData, null); // rejected streams were never pumped
+  assert.equal(created[1].onData, null);
+  assert.ok(good.onData !== null); // only the surviving stream is attached
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(Buffer.concat(writes).toString(), "ping");
+  sock.destroy();
+  server.close();
+});
+
+test("0x01 retry (d): persistent concurrency_limit fails only after the budget, near the cap", async () => {
+  let calls = 0;
+  const fakeClient = {
+    state: "open",
+    openStream: () => { calls++; return rejectingStream(ERR.CONCURRENCY_LIMIT); },
+  };
+  const server = await startSocks({ getClient: () => fakeClient, port: 0, host: "127.0.0.1", openRetry: { baseMs: 20, capMs: 300 } });
+  const port = server.address().port;
+  const { sock, rep, elapsed } = await socksConnect(port);
+  assert.equal(rep, 0x05); // REP.REFUSED (repForOpenError for 0x01)
+  assert.ok(calls >= 3, `expected several attempts, got ${calls}`);
+  assert.ok(elapsed >= 250 && elapsed < 2500, `elapsed ${elapsed} ms should sit near the 300 ms cap`);
+  sock.destroy();
+  server.close();
+});
+
+test("0x01 retry (e): target_unreachable (0x05) fails immediately, never retried", async () => {
+  let calls = 0;
+  const fakeClient = {
+    state: "open",
+    openStream: () => { calls++; return rejectingStream(ERR.TARGET_UNREACHABLE); },
+  };
+  const server = await startSocks({ getClient: () => fakeClient, port: 0, host: "127.0.0.1", openRetry: { baseMs: 20, capMs: 300 } });
+  const port = server.address().port;
+  const { sock, rep, elapsed } = await socksConnect(port);
+  assert.equal(rep, 0x05); // REP.REFUSED for target_unreachable
+  assert.equal(calls, 1); // no retry
+  assert.ok(elapsed < 250, `elapsed ${elapsed} ms must be immediate`);
+  sock.destroy();
+  server.close();
+});
