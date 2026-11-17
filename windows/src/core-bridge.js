@@ -84,6 +84,11 @@ export class CoreBridge {
     this._wakes = new Set();
     this._listeners = new Set();
     this.stats = { carriers: 0, streams: 0, day: new Date().toISOString().slice(0, 10) };
+    // NP-1118-01 (a): wire byte counters for the status view's rate
+    // readout. Display-only: counted at the transport boundary of
+    // every established carrier (all bytes over the tunnel socket,
+    // framing included), never fed back into any protocol decision.
+    this.traffic = { up: 0, down: 0 };
     // NP-1117-16: the shared session manager owns rotations (15-min
     // timer + the 40-open budget) with drain semantics. This bridge
     // keeps its own connect/backoff/auth policy for the FIRST session
@@ -197,7 +202,7 @@ export class CoreBridge {
     }
     let client;
     try {
-      const transport = await this.makeTransport(dialIp);
+      const transport = this._countTransport(await this.makeTransport(dialIp));
       if (!this._want) { try { transport.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
       client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
       await client.handshake();
@@ -214,6 +219,18 @@ export class CoreBridge {
       this.log(`carrier established: slot ${slotIndex}, entry domain (no candidate for this slot)`);
     }
     return client;
+  }
+
+  // NP-1118-01 (a): wrap a freshly created transport with the wire
+  // byte counters (see this.traffic). The wrap is transparent: same
+  // object, same callbacks, just tallied.
+  _countTransport(t) {
+    if (!t || typeof t.send !== "function" || typeof t.onMessage !== "function") return t;
+    const send = t.send.bind(t);
+    t.send = (b) => { this.traffic.up += (b && (b.length ?? b.byteLength)) || 0; send(b); };
+    const onMessage = t.onMessage.bind(t);
+    t.onMessage = (cb) => onMessage((data) => { this.traffic.down += (data && (data.length ?? data.byteLength)) || 0; cb(data); });
+    return t;
   }
 
   onEvent(cb) { this._listeners.add(cb); return () => this._listeners.delete(cb); }
@@ -445,6 +462,8 @@ export class CoreBridge {
       edgeIp: this.edgeIp,
       slotEdges: Object.fromEntries(this._slotEdge),
       edgeCandidates: this.edgeCandidates ? this.edgeCandidates.map((c) => c.ip) : null,
+      edgeCandidateRtts: this.edgeCandidates ? Object.fromEntries(this.edgeCandidates.map((c) => [c.ip, c.rttMs])) : {},
+      traffic: { ...this.traffic },
       effectiveEdgeIp: this.effectiveEdgeIp(),
       bearerLock: this.bearerLock === null ? null : [...this.bearerLock],
       stats: { ...this.stats },

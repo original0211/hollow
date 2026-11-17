@@ -1,6 +1,8 @@
-// Renderer (M2-3): state card, pairing page, import/export with the in-app
-// confirmation step. Untrusted strings (import previews, worker URLs) are
-// rendered exclusively via textContent — never innerHTML.
+// Renderer (NP-1118-01 rework): status hero first, settings that
+// apply on change, plain-language errors, diagnostics in a drawer.
+// Presentation only — every value shown comes from the bridge /
+// main-process state, and untrusted strings (import previews, worker
+// URLs) are rendered exclusively via textContent, never innerHTML.
 const $ = (id) => document.getElementById(id);
 // Bridge defense (NP-1114-35): if the preload failed to load, window
 // .hollow is undefined and the old failure mode was total silent death
@@ -12,7 +14,9 @@ if (!window.hollow) {
   throw new Error("window.hollow missing — preload failed to load");
 }
 const logEl = $("log");
-let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "" };
+let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "", liveCarriers: 0, poolSize: 0, slotEdges: {}, edgeCandidateRtts: {}, edgeIp: null, traffic: { up: 0, down: 0 } };
+let trafficRates = { upRate: 0, downRate: 0 };
+let landingInfo = null;
 
 function appendLog(line) {
   logEl.textContent += line + "\n";
@@ -25,62 +29,209 @@ function fmtDuration(ms) {
   const ss = String(s % 60).padStart(2, "0");
   return `${hh}:${mm}:${ss}`;
 }
-function render() {
-  $("state").textContent = "状态：" + snapshot.state;
-  $("detail").textContent = snapshot.detail || "";
-  const parts = [];
-  if (snapshot.connectedSince) parts.push("已连接 " + fmtDuration(Date.now() - snapshot.connectedSince));
-  if (snapshot.socksPort) parts.push("SOCKS 127.0.0.1:" + snapshot.socksPort);
-  if (snapshot.stats) parts.push(`今日 载体 ${snapshot.stats.carriers} · 流 ${snapshot.stats.streams}`);
-  const tunEl = $("tun-status");
-  if (tunEl) {
-    const tv = snapshot.tun;
-    if (tv && tv.active) {
-      tunEl.style.display = "block";
-      const grace = tv.graceRemainingMs !== null && tv.graceRemainingMs !== undefined ? ` · 重连宽限剩余 ${Math.ceil(tv.graceRemainingMs / 1000)}s` : "";
-      tunEl.textContent = `TUN：助手${tv.helperAlive ? "存活" : "未连接"} · 模式 ${tv.mode} · DNS 查询 ${tv.dns.queries}/解析 ${tv.dns.resolved}/SERVFAIL ${tv.dns.servfail}（连接 ${tv.dns.conns}） · UDP 丢弃 ${tv.droppedUdp}${grace} · ${tv.notices.join(" · ")}`;
-    } else {
-      tunEl.style.display = "none";
-    }
-  }
-  $("stats").textContent = parts.join(" · ");
-  renderQueuedBanner();
+function fmtRate(bps) {
+  if (!Number.isFinite(bps) || bps <= 0) return "0 B/s";
+  if (bps < 1024) return `${Math.round(bps)} B/s`;
+  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / 1024 / 1024).toFixed(2)} MB/s`;
+}
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// NP-1117-12: the banner follows the LIVE queued count (bridge emits
-// on every change). Showing is immediate; hiding is debounced ~1 s so
-// a sub-second queue drain does not flicker the banner on and off.
-let queuedHideTimer = null;
-function renderQueuedBanner() {
-  const banner = $("queued-banner");
+// ---- (e) plain-language error mapping -------------------------------
+// Known failure surfaces become a Chinese cause + a next step; the
+// raw line always stays available under 详情. Unknown failures get
+// the generic card, never a bare English code as the whole message.
+function humanizeError(raw) {
+  const s = String(raw || "");
+  if (/psk\.bin is \d+ bytes|PSK_CORRUPT|corrupt/i.test(s) && /psk/i.test(s)) {
+    return { title: "密钥文件已损坏", body: "本机保存的配对密钥文件不完整，应用不会自动重建（以免悄悄断开配对）。下一步：重新导入一份配置，或退出应用后删除配置目录里的 psk.bin 再启动（将生成新密钥，需要重新配对）。" };
+  }
+  if (/TUN 助手未运行|TUN.*尚未启用/.test(s)) {
+    return { title: "TUN 模式尚未启用", body: "TUN 需要系统助手进程配合，助手拉起不在当前版本内。下一步：改用「全局」或「PAC 分流」模式。" };
+  }
+  if (/socks start failed/i.test(s)) {
+    return { title: "本地 SOCKS 端口被占用", body: "设置里的 SOCKS 端口已被其他程序占用，连接未建立、系统代理也没有启用。下一步：在设置里换一个空闲端口（改完即生效），或关掉占用该端口的程序后重连。" };
+  }
+  if (/undecryptable|AeadUnavailable|X25519|fatal:|handshake.*(fail|reject)|Finished/i.test(s)) {
+    return { title: "密钥不匹配，握手被拒绝", body: "本机密钥与服务端保存的配对值不一致，服务端拒绝了握手。下一步：把「配对」区的配对 V 复制到 Worker 的 secret PSK_V_HEX 后重试；或重新导入一份正确配置。" };
+  }
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|timed out|timeout|fetch failed|network|getaddrinfo/i.test(s)) {
+    return { title: "无法连通 Worker", body: "连不上设置里的 Worker 地址。下一步：检查地址是否正确、本机网络是否正常；如果刚改过地址，确认无误后点「立即重连」。" };
+  }
+  return { title: "连接失败", body: "连接没有建立起来。可以点「立即重连」再试一次；如果反复失败，请展开下方详情或打开诊断日志查看原始信息。" };
+}
+
+// ---- (a) status hero --------------------------------------------------
+function stateView() {
+  const st = snapshot.state;
+  if (st === "connected") {
+    if (snapshot.poolSize > 0 && snapshot.liveCarriers < snapshot.poolSize) {
+      return { label: "已降级", dot: "warn", detail: `承载 ${snapshot.liveCarriers}/${snapshot.poolSize} 在线，速度与稳定性会打折，系统会自动补齐。` };
+    }
+    return { label: "已连接", dot: "ok", detail: snapshot.detail || "" };
+  }
+  if (st === "reconnecting") return { label: "已降级 · 重连中", dot: "warn", detail: "连接中断，正在自动重连…" };
+  if (st === "connecting") return { label: "连接中", dot: "busy", detail: "正在与服务端握手…" };
+  if (st === "error") return { label: "连接失败", dot: "err", detail: "" };
+  return { label: "未连接", dot: "", detail: snapshot.detail || "" };
+}
+function render() {
+  const v = stateView();
+  $("state").textContent = v.label;
+  $("state-dot").className = "dot" + (v.dot ? " " + v.dot : "");
+  $("detail").textContent = v.detail;
+  // readings
+  const connected = snapshot.state === "connected" || snapshot.state === "reconnecting";
+  $("rate-down").textContent = connected ? fmtRate(trafficRates.downRate) : "—";
+  $("rate-up").textContent = connected ? fmtRate(trafficRates.upRate) : "—";
+  $("health").textContent = snapshot.poolSize ? `${snapshot.liveCarriers}/${snapshot.poolSize}` : "—";
+  $("duration").textContent = snapshot.connectedSince ? fmtDuration(Date.now() - snapshot.connectedSince) : "—";
+  const pins = Object.entries(snapshot.slotEdges || {}).sort((a, b) => Number(a[0]) - Number(b[0]));
+  if (pins.length) {
+    $("entries").textContent = pins.map(([, ip]) => {
+      const rtt = (snapshot.edgeCandidateRtts || {})[ip];
+      return Number.isFinite(rtt) ? `${ip} · ${Math.round(rtt)} ms` : String(ip);
+    }).join("　");
+  } else if (snapshot.edgeIp) {
+    $("entries").textContent = String(snapshot.edgeIp);
+  } else {
+    $("entries").textContent = snapshot.state === "connected" ? "默认解析" : "—";
+  }
+  $("landing").textContent = landingInfo
+    ? `${landingInfo.colo || "?"} / ${landingInfo.country || "?"}${landingInfo.edgeIp ? "（经优选 IP " + landingInfo.edgeIp + "）" : "（默认路由）"}`
+    : "—";
+  $("socks-addr").textContent = snapshot.socksPort ? `127.0.0.1:${snapshot.socksPort}` : "—";
+  const t = snapshot.traffic || { up: 0, down: 0 };
+  $("traffic-total").textContent = `↓ ${fmtBytes(t.down)} · ↑ ${fmtBytes(t.up)}`;
+  $("day-stats").textContent = snapshot.stats ? `今日 载体 ${snapshot.stats.carriers} · 流 ${snapshot.stats.streams}` : "";
+  const tunEl = $("tun-status");
+  const tv = snapshot.tun;
+  if (tv && tv.active) {
+    tunEl.style.display = "block";
+    const grace = tv.graceRemainingMs !== null && tv.graceRemainingMs !== undefined ? ` · 重连宽限剩余 ${Math.ceil(tv.graceRemainingMs / 1000)}s` : "";
+    tunEl.textContent = `TUN：助手${tv.helperAlive ? "存活" : "未连接"} · 模式 ${tv.mode} · DNS 查询 ${tv.dns.queries}/解析 ${tv.dns.resolved}/SERVFAIL ${tv.dns.servfail}（连接 ${tv.dns.conns}） · UDP 丢弃 ${tv.droppedUdp}${grace} · ${tv.notices.join(" · ")}`;
+  } else {
+    tunEl.style.display = "none";
+  }
+  // main toggle button follows the state
+  const btn = $("btn-toggle");
+  if (snapshot.state === "connected" || snapshot.state === "reconnecting") { btn.textContent = "断开"; btn.disabled = false; }
+  else if (snapshot.state === "connecting") { btn.textContent = "连接中…"; btn.disabled = true; }
+  else { btn.textContent = "连接"; btn.disabled = false; }
+  // error card
+  const card = $("error-card");
+  if (snapshot.state === "error") {
+    const h = humanizeError(snapshot.detail);
+    $("error-title").textContent = h.title;
+    $("error-body").textContent = h.body;
+    $("error-raw").textContent = snapshot.detail || "";
+    card.hidden = false;
+  } else {
+    card.hidden = true;
+  }
+  renderBusyLine();
+}
+
+// (e) The busy banner is a formal status element now: it follows
+// the live queued count, appearing at once and fading ~1 s after
+// the queue drains (NP-1117-12 debounce kept).
+let busyHideTimer = null;
+function renderBusyLine() {
+  const el = $("busy-line");
   if (snapshot.queuedNow > 0) {
-    if (queuedHideTimer) { clearTimeout(queuedHideTimer); queuedHideTimer = null; }
-    banner.style.display = "block";
-  } else if (banner.style.display === "block" && !queuedHideTimer) {
-    queuedHideTimer = setTimeout(() => {
-      queuedHideTimer = null;
-      if (snapshot.queuedNow <= 0) $("queued-banner").style.display = "none";
+    if (busyHideTimer) { clearTimeout(busyHideTimer); busyHideTimer = null; }
+    el.style.display = "block";
+  } else if (el.style.display === "block" && !busyHideTimer) {
+    busyHideTimer = setTimeout(() => {
+      busyHideTimer = null;
+      if (snapshot.queuedNow <= 0) $("busy-line").style.display = "none";
     }, 1000);
   }
+}
+
+// ---- settings: apply on change (c) ------------------------------------
+const FIELD_NOTES = { workerUrl: "note-workerUrl", proxyMode: "note-proxyMode", socksPort: "note-socksPort", directHosts: "note-directHosts", metaPath: "note-metaPath", edgesPath: "note-edgesPath", poolSize: "note-poolSize", pacPort: "note-pacPort" };
+function setNote(field, text, kind) {
+  const el = $(FIELD_NOTES[field]);
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = "field-note" + (kind ? " " + kind : "");
+}
+function fieldErrorText(field, raw) {
+  const s = String(raw || "");
+  if (field === "socksPort" || field === "pacPort") return "端口不合要求：须为 1–65535 的整数。";
+  if (field === "poolSize") return "承载数不合要求：须为 1–8 的整数。";
+  if (field === "workerUrl") return "地址不合要求（须为 wss:// 地址，本机调试才可用 ws://localhost）：" + s;
+  if (field === "metaPath" || field === "edgesPath") return "路径不合要求：" + s;
+  return s;
+}
+let reconnectNeeded = false;
+function updateReconnectBar() { $("reconnect-bar").hidden = !reconnectNeeded; }
+async function applySetting(field, value, control) {
+  setNote(field, "应用中…", "");
+  if (control) control.disabled = true;
+  try {
+    const r = await window.hollow.saveSettings({ [field]: value });
+    if (r && r.errors && r.errors[field]) {
+      setNote(field, fieldErrorText(field, r.errors[field]), "err");
+      refresh(); // snap the control back to the value actually in force
+      return;
+    }
+    if (r && r.needsReconnect) {
+      reconnectNeeded = true; updateReconnectBar();
+      setNote(field, "已保存，需重连后生效。", "warn");
+    } else {
+      setNote(field, "已生效", "ok");
+      setTimeout(() => setNote(field, "", ""), 2500);
+    }
+  } catch (e) {
+    setNote(field, "应用失败：" + e.message, "err");
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+async function reconnectNow() {
+  reconnectNeeded = false; updateReconnectBar();
+  try { await window.hollow.disconnect(); } catch { /* not connected */ }
+  try { await window.hollow.connect(); } catch (e) { appendLog("reconnect error: " + e.message); }
+  refresh();
+}
+$("btn-reconnect").addEventListener("click", reconnectNow);
+$("btn-reconnect2").addEventListener("click", reconnectNow);
+
+// refresh() writes the in-force values into the controls — except
+// the one being edited right now, so an in-progress edit is never
+// snapped back under the user's fingers.
+function setControlValue(id, value) {
+  const el = $(id);
+  if (document.activeElement === el) return;
+  el.value = value;
 }
 async function refresh() {
   const s = await window.hollow.getState();
   snapshot = { ...snapshot, ...s };
   if (Array.isArray(s.logs)) { logEl.textContent = ""; s.logs.forEach(appendLog); }
   if (s.settings) {
-    $("worker-url").value = s.settings.workerUrl || "";
-    // NP-1117-07 (d2): never bounce an unsaved mode selection back to
-    // the saved value on refresh — keep the user's pick and show the
-    // unsaved badge until they save.
-    if (!modeDirty) $("proxy-mode").value = s.settings.proxyMode || "off";
-    $("direct-hosts").value = (s.settings.directHosts || []).join("\n");
-    $("meta-path").value = s.settings.metaPath || "";
+    setControlValue("worker-url", s.settings.workerUrl || "");
+    setControlValue("proxy-mode", s.settings.proxyMode || "off");
+    setControlValue("direct-hosts", (s.settings.directHosts || []).join("\n"));
+    setControlValue("meta-path", s.settings.metaPath || "");
+    setControlValue("edges-path", s.settings.edgesPath || "");
+    setControlValue("socks-port", s.settings.socksPort ?? "");
+    setControlValue("pool-size", s.settings.poolSize ?? "");
+    setControlValue("pac-port", s.settings.pacPort ?? "");
+    $("pac-seg").textContent = s.settings.pacSeg || "（尚未生成，首次启用 PAC 时生成）";
     const tunMode = s.settings.proxyMode === "tun";
     const defRadio = $("edge-mode-default");
     if (defRadio) defRadio.disabled = tunMode;
     const note = $("edge-default-note");
     if (note) note.style.display = tunMode ? "block" : "none";
-    $("edges-path").value = s.settings.edgesPath || "";
   }
   if (s.psk) {
     $("psk-status").textContent = s.psk.state === "corrupt"
@@ -92,6 +243,26 @@ async function refresh() {
   }
   render();
 }
+
+// ---- connection toggle --------------------------------------------------
+$("btn-toggle").addEventListener("click", async () => {
+  try {
+    if (snapshot.state === "connected" || snapshot.state === "reconnecting") await window.hollow.disconnect();
+    else await window.hollow.connect();
+  } catch (e) { appendLog("toggle error: " + e.message); }
+  refresh();
+});
+
+// ---- settings field wiring (change = apply) ------------------------------
+$("worker-url").addEventListener("change", (e) => applySetting("workerUrl", e.target.value.trim(), e.target));
+$("proxy-mode").addEventListener("change", (e) => applySetting("proxyMode", e.target.value, e.target));
+$("socks-port").addEventListener("change", (e) => applySetting("socksPort", Number(e.target.value), e.target));
+$("direct-hosts").addEventListener("change", (e) => applySetting("directHosts", e.target.value.split("\n"), e.target));
+$("meta-path").addEventListener("change", (e) => applySetting("metaPath", e.target.value, e.target));
+$("edges-path").addEventListener("change", (e) => applySetting("edgesPath", e.target.value, e.target));
+$("pool-size").addEventListener("change", (e) => applySetting("poolSize", Number(e.target.value), e.target));
+$("pac-port").addEventListener("change", (e) => applySetting("pacPort", Number(e.target.value), e.target));
+
 // ---- import confirmation (correction 4): preview -> explicit click ----
 function showImportConfirm(preview) {
   $("imp-worker").textContent = preview.workerUrl;
@@ -128,7 +299,7 @@ $("btn-copy-v").addEventListener("click", async () => {
 $("btn-test").addEventListener("click", async () => {
   $("test-result").textContent = "握手测试中…";
   const r = await window.hollow.testConnection();
-  $("test-result").textContent = r.ok ? `✓ 握手成功（${r.ms} ms）` : `✗ 握手失败：${r.error || ""}（${r.ms ?? "?"} ms）`;
+  $("test-result").textContent = r.ok ? `✓ 握手成功（${r.ms} ms）` : `✗ ${humanizeError(r.error).title}：${humanizeError(r.error).body}（${r.ms ?? "?"} ms）`;
   refresh();
 });
 $("btn-export").addEventListener("click", async () => {
@@ -146,28 +317,6 @@ $("btn-qr").addEventListener("click", async () => {
   const r = await window.hollow.qrOwnConfig(withPsk);
   if (r.ok) { $("qr-img").src = r.dataUrl; $("qr-img").style.display = "block"; }
   else $("import-result").textContent = "二维码生成失败：" + (r.error || "");
-});
-// ---- connection & settings ----
-$("btn-connect").addEventListener("click", async () => { try { await window.hollow.connect(); } catch (e) { appendLog("connect error: " + e.message); } refresh(); });
-$("btn-disconnect").addEventListener("click", async () => { try { await window.hollow.disconnect(); } catch (e) { appendLog("disconnect error: " + e.message); } refresh(); });
-// NP-1117-07 (d2): unsaved-mode tracking (see refresh()).
-let modeDirty = false;
-$("proxy-mode").addEventListener("change", () => {
-  modeDirty = true;
-  $("proxy-mode-unsaved").style.display = "inline";
-});
-$("btn-save").addEventListener("click", async () => {
-  const r = await window.hollow.saveSettings({
-    workerUrl: $("worker-url").value.trim(),
-    proxyMode: $("proxy-mode").value,
-    directHosts: $("direct-hosts").value.split("\n"),
-    metaPath: $("meta-path").value,
-    edgesPath: $("edges-path").value,
-  });
-  appendLog("settings saved: " + r.workerUrl + " / proxy " + r.proxyMode);
-  modeDirty = false;
-  $("proxy-mode-unsaved").style.display = "none";
-  refresh();
 });
 // ---- edge selection (M2-4) ----
 let edgeState = { edges: [], results: {}, edgeMode: "default", preferredEdgeIp: null };
@@ -216,19 +365,29 @@ $("btn-refresh-edges").addEventListener("click", async () => {
 });
 window.hollow.onEdgeProgress(({ ip, result }) => { edgeState.results[ip] = result; renderEdges(); });
 window.hollow.onMeta((m) => {
-  $("landing").textContent = `落地：${m.colo || "?"} / ${m.country || "?"}${m.edgeIp ? "（经优选 IP " + m.edgeIp + "）" : "（默认路由）"}`;
+  landingInfo = { colo: m.colo, country: m.country, edgeIp: m.edgeIp ?? null };
+  render();
 });
 (async () => {
   const s = await window.hollow.getEdges();
   edgeState = { ...edgeState, ...s };
   syncEdgeRadios(); renderEdges();
 })();
+// ---- diagnostics drawer (g) ----
+$("btn-copy-logs").addEventListener("click", async (e) => {
+  e.preventDefault();
+  const btn = $("btn-copy-logs");
+  const r = await window.hollow.copyLogs();
+  btn.textContent = r && r.ok ? "已复制" : "复制失败";
+  setTimeout(() => { btn.textContent = "复制日志"; }, 2000);
+});
 window.hollow.onLog(appendLog);
 window.hollow.onEvent((ev) => {
   if (ev.type === "state") { snapshot.state = ev.state; snapshot.detail = ev.detail || ""; if (ev.state !== "connected") snapshot.connectedSince = null; refresh(); }
   if (ev.type === "stats") { snapshot.stats = ev.stats; render(); }
   if (ev.type === "socks") { snapshot.socksPort = ev.socksPort; render(); }
   if (ev.type === "queued") { snapshot.queuedNow = ev.queuedNow; render(); }
+  if (ev.type === "traffic") { trafficRates = { upRate: ev.upRate, downRate: ev.downRate }; snapshot.traffic = { up: ev.up, down: ev.down }; render(); }
 });
 setInterval(render, 1000);
 refresh();

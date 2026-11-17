@@ -623,3 +623,26 @@ test("dispersion: a fresh measurement clears demotions — the candidate rises a
   await waitFor(() => bridge.sessions.healthyCount() === 1);
   await bridge.disconnect();
 });
+
+// NP-1118-01 (a): the wire byte counters behind the status view's
+// rate readout actually count — an echo exchange over a pooled
+// carrier moves both totals, and the snapshot exposes them.
+test("traffic counters (NP-1118-01): an echo exchange moves up/down; snapshot exposes traffic", async () => {
+  const bridge = mkBridge({ poolSize: 2 });
+  try {
+    await bridge.connect();
+    await waitFor(() => bridge.sessions.healthyCount() === 2);
+    const before = bridge.snapshot();
+    assert.equal(typeof before.traffic.up, "number");
+    assert.equal(typeof before.traffic.down, "number");
+    const client = bridge.sessions.pick();
+    const s = client.openStream({ host: "localhost", port: echoPort, schemeHint: 0, gatePolicy: 0 });
+    await s.opened;
+    const got = new Promise((res) => { let buf = ""; s.onData = (d) => { buf += Buffer.from(d).toString(); if (buf.length >= 4) res(buf); }; });
+    s.write(new TextEncoder().encode("ping"));
+    assert.equal(await got, "ping");
+    const after = bridge.snapshot();
+    assert.ok(after.traffic.up > before.traffic.up, "up counted the sent bytes");
+    assert.ok(after.traffic.down > before.traffic.down, "down counted the echoed bytes");
+  } finally { await bridge.disconnect(); }
+});

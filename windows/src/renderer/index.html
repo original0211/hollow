@@ -8,8 +8,8 @@
 </head>
 <body>
   <h1>Hollow</h1>
-  <div class="sub">Windows MVP · M2-3 配置与配对</div>
-  <div class="banner" id="queued-banner">服务端繁忙，已排队（等待中…）</div>
+  <div class="sub">安全隧道客户端</div>
+
   <div class="confirm" id="import-confirm">
     <div><strong>确认导入这份配置？</strong></div>
     <div>目标 Worker 地址：<span class="mono" id="imp-worker"></span></div>
@@ -18,16 +18,43 @@
     <button class="danger" id="btn-imp-confirm">确认导入并覆盖</button>
     <button id="btn-imp-cancel">取消</button>
   </div>
-  <div class="card">
-    <div class="state" id="state">状态：—</div>
+
+  <!-- (a) Status hero: the connection state is the subject. -->
+  <section class="card hero">
+    <div class="hero-top">
+      <span class="dot" id="state-dot"></span>
+      <div class="state" id="state">状态：—</div>
+    </div>
     <div class="sub" id="detail"></div>
-    <div class="sub" id="stats"></div>
+    <div class="statusline" id="busy-line">服务端繁忙，正在排队等待空位…</div>
+    <div class="readings">
+      <div class="reading"><span class="r-label">下载速率</span><span class="r-value" id="rate-down">—</span></div>
+      <div class="reading"><span class="r-label">上传速率</span><span class="r-value" id="rate-up">—</span></div>
+      <div class="reading"><span class="r-label">承载健康</span><span class="r-value" id="health">—</span></div>
+      <div class="reading"><span class="r-label">已连接</span><span class="r-value" id="duration">—</span></div>
+      <div class="reading wide"><span class="r-label">入口（实测往返）</span><span class="r-value" id="entries">—</span></div>
+      <div class="reading wide"><span class="r-label">落地（经 /meta 实测）</span><span class="r-value" id="landing">—</span></div>
+      <div class="reading"><span class="r-label">本地入口</span><span class="r-value" id="socks-addr">—</span></div>
+      <div class="reading"><span class="r-label">本次流量（隧道线速字节）</span><span class="r-value" id="traffic-total">—</span></div>
+    </div>
+    <div class="sub" id="day-stats"></div>
     <div class="sub" id="tun-status"></div>
-    <div class="sub" id="landing"></div>
-    <button class="primary" id="btn-connect">连接</button>
-    <button id="btn-disconnect">断开</button>
-  </div>
-  <div class="card">
+    <button class="primary big" id="btn-toggle">连接</button>
+  </section>
+
+  <!-- (e) Human error surface: plain-language cause + next step,
+       raw detail folded away. -->
+  <section class="card error-card" id="error-card" hidden>
+    <div class="err-title" id="error-title">连接失败</div>
+    <div class="err-body" id="error-body"></div>
+    <details class="details">
+      <summary>详情（原始信息）</summary>
+      <pre class="rawdetail" id="error-raw"></pre>
+    </details>
+    <button id="btn-reconnect">立即重连</button>
+  </section>
+
+  <section class="card">
     <h2>配对</h2>
     <div class="sub" id="psk-status"></div>
     <div>服务端配对 V（写入 Worker secret <span class="mono">PSK_V_HEX</span>）</div>
@@ -35,29 +62,34 @@
     <button id="btn-copy-v">复制 V</button>
     <button id="btn-test">测试连接（真实握手）</button>
     <div class="sub" id="test-result"></div>
-  </div>
-  <div class="card">
+  </section>
+
+  <!-- (b)+(c) Settings: user fields up front, protocol internals in
+       the advanced fold; every field applies on change. -->
+  <section class="card">
     <h2>设置</h2>
-    <label>Worker 地址</label>
+    <label for="worker-url">Worker 地址</label>
     <input type="text" id="worker-url" spellcheck="false">
-    <label>系统代理模式</label>
+    <div class="field-note" id="note-workerUrl"></div>
+
+    <label for="proxy-mode">系统代理模式</label>
     <select id="proxy-mode">
       <option value="off">关闭（仅 SOCKS）</option>
       <option value="global">全局</option>
       <option value="pac">PAC 分流</option>
-      <option value="tun">TUN 模式（路由接管）</option>
+      <option value="tun" disabled>TUN 模式（尚未启用：助手拉起不在当前版本）</option>
     </select>
-    <span id="proxy-mode-unsaved" style="display:none;color:#b58900;font-size:12px">未保存（点「保存设置」后生效）</span>
-    <label>PAC 直连域名名单（一行一个，直连不走代理；内网/localhost 恒直连）</label>
+    <div class="field-note" id="note-proxyMode"></div>
+
+    <label for="socks-port">SOCKS 端口</label>
+    <input type="number" id="socks-port" min="1" max="65535">
+    <div class="field-note" id="note-socksPort"></div>
+
+    <label for="direct-hosts">PAC 直连域名名单（一行一个，直连不走代理；内网/localhost 恒直连）</label>
     <textarea id="direct-hosts" rows="3" spellcheck="false"></textarea>
-    <label>高级 · 元数据端点路径（由部署决定，经配对或在此填写；留空 = 不启用落地识别）</label>
-    <input type="text" id="meta-path" spellcheck="false" placeholder="/…/meta">
-    <label>高级 · 名单端点路径</label>
-    <input type="text" id="edges-path" spellcheck="false" placeholder="/…/edges.json">
-    <button id="btn-save">保存</button>
-  </div>
-  <div class="card">
-    <h2>优选 IP（落地以实测 colo 为准，不承诺国家）</h2>
+    <div class="field-note" id="note-directHosts"></div>
+
+    <h3>优选 IP（落地以实测 colo 为准，不承诺国家）</h3>
     <div>
       <label><input type="radio" name="edge-mode" value="default" id="edge-mode-default"> 跟随默认解析</label>
       <div id="edge-default-note">TUN 模式下不可用：开启 TUN 时先解析并钉住解析结果（防环路口径）。</div>
@@ -68,10 +100,34 @@
     <button id="btn-refresh-edges">从服务器刷新名单</button>
     <div class="sub" id="edge-status"></div>
     <div id="edge-list"></div>
-  </div>
-  <div class="card">
+
+    <details class="advanced" id="adv-settings">
+      <summary>高级设置（协议内部项，一般无需改动）</summary>
+      <label for="meta-path">元数据端点路径（由部署决定，经配对或在此填写；留空 = 不启用落地识别）</label>
+      <input type="text" id="meta-path" spellcheck="false" placeholder="/…/meta">
+      <div class="field-note" id="note-metaPath"></div>
+      <label for="edges-path">名单端点路径</label>
+      <input type="text" id="edges-path" spellcheck="false" placeholder="/…/edges.json">
+      <div class="field-note" id="note-edgesPath"></div>
+      <label for="pool-size">承载条带数（1–8，改后需重连生效）</label>
+      <input type="number" id="pool-size" min="1" max="8">
+      <div class="field-note" id="note-poolSize"></div>
+      <label for="pac-port">PAC 端点首选端口</label>
+      <input type="number" id="pac-port" min="1" max="65535">
+      <div class="field-note" id="note-pacPort"></div>
+      <label>PAC 路径随机段（本机生成，只读）</label>
+      <div class="mono" id="pac-seg">—</div>
+    </details>
+
+    <div class="reconnect-bar" id="reconnect-bar" hidden>
+      <span>部分设置需重连后生效。</span>
+      <button id="btn-reconnect2">立即重连</button>
+    </div>
+  </section>
+
+  <section class="card">
     <h2>导入 / 导出</h2>
-    <label>粘贴 hollow:// 链接或配置 JSON（先预览、确认后才落盘）</label>
+    <label for="import-text">粘贴 hollow:// 链接或配置 JSON（先预览、确认后才落盘）</label>
     <textarea id="import-text" rows="3" spellcheck="false"></textarea>
     <button id="btn-imp-preview">预览导入</button>
     <button id="btn-imp-file">从 .hollow.json 文件导入</button>
@@ -85,8 +141,14 @@
       <label><input type="checkbox" id="chk-qr-psk"> 二维码含 PSK（仅限自己的设备间转移）</label>
     </div>
     <img class="qr" id="qr-img" alt="本机配置二维码">
-  </div>
-  <div class="card"><h2>活动日志</h2><pre id="log"></pre></div>
+  </section>
+
+  <!-- (g) The activity log is a diagnostics drawer now. -->
+  <details class="card drawer" id="log-drawer">
+    <summary>诊断日志 <button id="btn-copy-logs" type="button">复制日志</button></summary>
+    <pre id="log"></pre>
+  </details>
+
   <script src="./renderer.js"></script>
 </body>
 </html>

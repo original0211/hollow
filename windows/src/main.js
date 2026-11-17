@@ -11,7 +11,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { CoreBridge } from "./core-bridge.js";
-import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
+import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir, validPort } from "./config.js";
 import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl, validateHttpPath } from "./pairing.js";
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge, rankedEdges } from "./edges.js";
 import { makePacProvider, startPacServer } from "./pac.js";
@@ -54,6 +54,26 @@ function log(m) {
 }
 
 let win = null, tray = null, bridge = null, proxyOn = false, bridgeError = null;
+
+// NP-1118-01 (a): 1 s traffic sampler — turns the bridge's cumulative
+// wire counters into per-second rates for the status view.
+// Display-only; the counters never feed any decision.
+let lastTraffic = null, lastTrafficAt = 0, lastTrafficBridge = null;
+setInterval(() => {
+  if (!bridge || !win || win.isDestroyed()) { lastTraffic = null; lastTrafficBridge = null; return; }
+  const t = bridge.snapshot().traffic;
+  const now = Date.now();
+  if (lastTraffic && lastTrafficBridge === bridge && now > lastTrafficAt) {
+    const dt = (now - lastTrafficAt) / 1000;
+    win.webContents.send("hollow:event", {
+      type: "traffic",
+      upRate: Math.max(0, Math.round((t.up - lastTraffic.up) / dt)),
+      downRate: Math.max(0, Math.round((t.down - lastTraffic.down) / dt)),
+      up: t.up, down: t.down,
+    });
+  }
+  lastTraffic = t; lastTrafficAt = now; lastTrafficBridge = bridge;
+}, 1000);
 
 function getBridge() {
   if (!bridge) {
@@ -405,7 +425,7 @@ setInterval(() => {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 560, height: 760, show: false,
+    width: 620, height: 840, show: false,
     webPreferences: { preload: path.join(here, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   // Renderer containment (NP-1114-07): no new windows, no navigation away.
@@ -476,6 +496,7 @@ else {
     }
     createWindow(); createTray();
     if (process.env.HOLLOW_UI_SMOKE === "1") void runUiSmoke();
+    if (process.env.HOLLOW_TOUR_DIR) void runTour();
     const link = process.argv.find((a) => typeof a === "string" && a.startsWith("hollow://"));
     if (link) setTimeout(() => stageImport(link, "os-link"), 600);
   });
@@ -492,6 +513,60 @@ else {
 // artifact. Loads the real window, waits for the first render, then
 // asserts the bridge is exposed and refresh() rewrote the placeholders.
 // Exit code is the verdict; HOLLOW_UI_SMOKE_OUT optionally gets JSON.
+// NP-1118-01 screenshot tour (evidence tooling, env-gated like the
+// UI smoke): HOLLOW_TOUR_DIR=<dir> HOLLOW_TOUR_MODE=good|bad drives
+// the real window through the states the delivery receipt needs and
+// captures each frame. Never active in normal runs.
+async function runTour() {
+  const dir = process.env.HOLLOW_TOUR_DIR;
+  const mode = process.env.HOLLOW_TOUR_MODE || "good";
+  const shot = async (name) => {
+    try {
+      const img = await win.webContents.capturePage();
+      fs.writeFileSync(path.join(dir, name), img.toPNG());
+      console.log(`TOUR shot ${name}`);
+    } catch (e) { console.log(`TOUR shot ${name} failed: ${e.message}`); }
+  };
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error("did-finish-load timeout")), 20000);
+      win.webContents.once("did-finish-load", () => { clearTimeout(to); resolve(); });
+    });
+    await new Promise((r) => setTimeout(r, 1200));
+    if (mode === "bad") {
+      await doConnect().catch(() => {});
+      const t0 = Date.now();
+      while (Date.now() - t0 < 45000) { if (bridge && bridge.state === "error") break; await new Promise((r) => setTimeout(r, 250)); }
+      await new Promise((r) => setTimeout(r, 900));
+      await shot("shot-error.png");
+    } else {
+      await shot("shot-disconnected.png");
+      await doConnect().catch(() => {});
+      const ok = bridge ? await waitConnected(bridge, 45000) : false;
+      // Wait for the STEADY state — full pool, continuously
+      // connected for >= 2 s — so the shot does not catch a mid-ramp
+      // degrade or a re-establishment window.
+      if (bridge) {
+        const t0 = Date.now();
+        for (;;) {
+          const snap = bridge.snapshot();
+          if (bridge.sessions.healthyCount() >= bridge.poolSize && snap.connectedSince && Date.now() - snap.connectedSince > 2000) break;
+          if (Date.now() - t0 > 45000) break;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+      await new Promise((r) => setTimeout(r, 800));
+      await shot("shot-connected.png");
+      await win.webContents.executeJavaScript(`(() => { const d = document.getElementById("adv-settings"); if (d) { d.open = true; d.scrollIntoView(); } return !!d; })()`);
+      await new Promise((r) => setTimeout(r, 600));
+      await shot("shot-advanced.png");
+      console.log(`TOUR connected=${ok}`);
+    }
+  } catch (e) { console.log(`TOUR failed: ${e.message}`); }
+  app.exit(0);
+}
+
 async function runUiSmoke() {
   const finish = (code, verdict) => {
     console.log("UI-SMOKE " + JSON.stringify(verdict));
@@ -521,14 +596,21 @@ ipcMain.handle("hollow:getState", () => ({
   netcfgBackup: (() => { try { const r = readNetcfgBackup(configDir()); return { kind: r.kind, problems: r.problems }; } catch { return { kind: "corrupt", problems: ["read failed"] }; } })(),
   ...(bridge ? bridge.snapshot() : { state: bridgeError ? "error" : "disconnected", detail: bridgeError || "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
   logs: logs.slice(-80),
-  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "" },
+  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "", poolSize: cfg.poolSize, pacPort: cfg.pacPort, pacSeg: cfg.pacSeg || "" },
   psk: pskStatus(),
   pskFileExists: fs.existsSync(path.join(configDir(), "psk.bin")),
 }));
 ipcMain.handle("hollow:connect", async () => { await doConnect(); return bridge.snapshot(); });
 ipcMain.handle("hollow:disconnect", async () => { await doDisconnect(); return bridge ? bridge.snapshot() : { state: "disconnected" }; });
 ipcMain.handle("hollow:saveSettings", async (_e, s) => {
+  // NP-1118-01 (c): settings apply on change — every field reports
+  // its own outcome (applied / error / needsReconnect) so the UI can
+  // show it in place instead of silently snapping back. Partial
+  // payloads are fine: only the fields present are touched. Config
+  // semantics and field meanings are unchanged.
   const prevMode = cfg.proxyMode;
+  const errors = {};
+  let needsReconnect = false;
   if (typeof s.workerUrl === "string" && s.workerUrl !== cfg.workerUrl) {
     // Same validation as the import path (NP-1114-12): wss only, ws only for
     // localhost — the settings page must not be a laxer door than pairing.
@@ -536,9 +618,13 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
       validateWorkerUrl(s.workerUrl);
       cfg = { ...cfg, workerUrl: s.workerUrl };
       log(`settings saved: workerUrl=${s.workerUrl}`);
-    } catch (e) { log(`settings workerUrl rejected: ${e.message} (kept ${cfg.workerUrl})`); }
+      if (bridge && bridge.state === "connected") needsReconnect = true; // a live bridge keeps the URL it was built with
+    } catch (e) { errors.workerUrl = e.message; log(`settings workerUrl rejected: ${e.message} (kept ${cfg.workerUrl})`); }
   }
-  if (["off", "global", "pac", "tun"].includes(s.proxyMode)) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
+  if (s.proxyMode !== undefined) {
+    if (!["off", "global", "pac", "tun"].includes(s.proxyMode)) errors.proxyMode = "unknown proxy mode";
+    else if (s.proxyMode !== cfg.proxyMode) { cfg = { ...cfg, proxyMode: s.proxyMode }; log(`settings saved: proxyMode=${s.proxyMode}`); }
+  }
   if (Array.isArray(s.directHosts)) {
     cfg = { ...cfg, directHosts: s.directHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean).slice(0, 200) };
     log(`settings saved: ${cfg.directHosts.length} direct hosts`);
@@ -552,27 +638,72 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
       if (v === "") { cfg = { ...cfg, [key]: null }; log(`settings saved: ${key} cleared`); }
       else {
         try { validateHttpPath(v, key); cfg = { ...cfg, [key]: v }; log(`settings saved: ${key} set`); }
-        catch (e) { log(`settings ${key} rejected: ${e.message}`); }
+        catch (e) { errors[key] = e.message; log(`settings ${key} rejected: ${e.message}`); }
       }
     }
+  }
+  // Fields the NP-1118-01 settings layer exposes (all pre-existing
+  // config fields — newly editable, semantics untouched).
+  let socksChanged = false;
+  if (s.socksPort !== undefined) {
+    const p = validPort(s.socksPort);
+    if (p === null) errors.socksPort = "invalid port (expected integer 1-65535)";
+    else if (p !== cfg.socksPort) { cfg = { ...cfg, socksPort: p }; socksChanged = true; log(`settings saved: socksPort=${p}`); }
+  }
+  if (s.poolSize !== undefined) {
+    const n = Math.floor(Number(s.poolSize));
+    if (!Number.isFinite(n) || n < 1 || n > 8) errors.poolSize = "invalid pool size (expected 1-8)";
+    else if (n !== cfg.poolSize) {
+      cfg = { ...cfg, poolSize: n };
+      log(`settings saved: poolSize=${n}`);
+      if (bridge && bridge.state === "connected") needsReconnect = true; // pool size is a bridge construction parameter
+    }
+  }
+  let pacPortChanged = false;
+  if (s.pacPort !== undefined) {
+    const p = validPort(s.pacPort);
+    if (p === null) errors.pacPort = "invalid port (expected integer 1-65535)";
+    else if (p !== cfg.pacPort) { cfg = { ...cfg, pacPort: p }; pacPortChanged = true; log(`settings saved: pacPort=${p}`); }
   }
   safeSave();
   // Apply on the next connect: drop a non-connected bridge so it rebuilds.
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
-  // NP-1117-07 (d2): a saved mode change applies NOW when connected —
-  // the sysproxy branch re-runs against the live bridge (switching to
-  // "off" restores the registry immediately). Transitions involving
-  // TUN keep their connect-time sequencing (the bearer <redacted> must
-  // precede the dial), so they apply on the next connect and say so.
-  if (cfg.proxyMode !== prevMode && bridge && bridge.state === "connected" && process.platform === "win32") {
-    if (modeFamily(cfg.proxyMode) === "sysproxy" && modeFamily(prevMode) === "sysproxy") {
-      try { await applyProxyMode(bridge); }
-      catch (e) { log(`system proxy mode apply failed: ${e.message}`); }
-    } else {
-      log(`proxy mode change (${prevMode} -> ${cfg.proxyMode}) involves TUN — applies on the next connect`);
+  // Live application of what can move now.
+  if (bridge && bridge.state === "connected") {
+    if (socksChanged && bridge.socksPort) {
+      // Restart the SOCKS entry on the new port, then re-assert the
+      // system proxy (its written form carries the port).
+      try {
+        await bridge.stopSocks();
+        await bridge.startSocks(cfg.socksPort);
+        if (proxyOn && process.platform === "win32" && modeFamily(cfg.proxyMode) === "sysproxy") await applyProxyMode(bridge);
+      } catch (e) { errors.socksPort = e.message; log(`socks port apply failed: ${e.message}`); }
+    }
+    if (pacPortChanged && pacServer) {
+      try {
+        await stopPac();
+        if (proxyOn && cfg.proxyMode === "pac" && process.platform === "win32") await applyProxyMode(bridge);
+      } catch (e) { errors.pacPort = e.message; log(`pac port apply failed: ${e.message}`); }
     }
   }
-  return { workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts };
+  // Mode changes (NP-1117-07 d2, widened by NP-1118-01 c): when
+  // connected, a change that stays outside the TUN family applies
+  // NOW through the same applyProxyMode path — including to "off",
+  // which restores the registry immediately rather than at
+  // disconnect (same end state, earlier; flagged in the NP-1118-01
+  // receipt). Transitions involving TUN keep their connect-time
+  // sequencing (the bearer <redacted> must precede the dial), so they are
+  // reported as needsReconnect instead of being applied halfway.
+  if (cfg.proxyMode !== prevMode && bridge && bridge.state === "connected") {
+    if (process.platform === "win32" && modeFamily(cfg.proxyMode) !== "tun" && modeFamily(prevMode) !== "tun") {
+      try { await applyProxyMode(bridge); }
+      catch (e) { errors.proxyMode = e.message; log(`system proxy mode apply failed: ${e.message}`); }
+    } else {
+      needsReconnect = true;
+      log(`proxy mode change (${prevMode} -> ${cfg.proxyMode}) applies on the next connect`);
+    }
+  }
+  return { ok: Object.keys(errors).length === 0, errors, needsReconnect, workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts, socksPort: cfg.socksPort, poolSize: cfg.poolSize, pacPort: cfg.pacPort };
 });
 
 // ---- Edge-IP selection (M2-4) ----
@@ -701,6 +832,9 @@ ipcMain.handle("hollow:copyVerifier", () => {
   if (st.verifier) clipboard.writeText(st.verifier);
   return { ok: !!st.verifier };
 });
+// NP-1118-01 (g): the diagnostics drawer copies the same log lines
+// the app keeps in memory — nothing new is collected.
+ipcMain.handle("hollow:copyLogs", () => { clipboard.writeText(logs.join("\n")); return { ok: true, lines: logs.length }; });
 ipcMain.handle("hollow:testConnection", async () => {
   // A real handshake against the configured Worker with the current PSK —
   // the pairing acceptance probe. Uses a throwaway client, not the bridge.

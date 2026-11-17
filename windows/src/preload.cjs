@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("hollow", {
   // pairing & import (M2-3)
   testConnection: () => ipcRenderer.invoke("hollow:testConnection"),
   copyVerifier: () => ipcRenderer.invoke("hollow:copyVerifier"),
+  copyLogs: () => ipcRenderer.invoke("hollow:copyLogs"),
   importPreview: (text) => ipcRenderer.invoke("hollow:importPreview", { text }),
   importFromFile: () => ipcRenderer.invoke("hollow:importFromFile"),
   importFromQrFile: () => ipcRenderer.invoke("hollow:importFromQrFile"),
