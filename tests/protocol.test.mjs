@@ -157,26 +157,39 @@ test("E2E: banned targets rejected with spec error codes", async () => {
   client.close();
 });
 
-test("E2E: 7th stream queues with OPEN_QUEUED, released when a slot frees", async () => {
+test("E2E: 7th stream queues with OPEN_QUEUED while 6 establishments are in flight, released as one concludes (NP-1117-08)", async () => {
+  // §7.5 (spec v0.2.0): only IN-FLIGHT establishments occupy — with
+  // instant local establishments the old form of this test (7th queues
+  // behind 6 ESTABLISHED streams) no longer applies; queueing is now
+  // exercised by holding 6 establishments in flight at once.
   const psk = randomBytes(32);
   const { server: echo, port } = await startEcho();
-  const { client } = await makePair(psk, psk);
+  const pending = []; // establishment releasers, in connect() call order
+  const connectFn = ({ port: p }) => new Promise((resolve) => {
+    pending.push(() => { nodeConnect({ port: p }).then(resolve); });
+  });
+  const { client } = await makePair(psk, psk, connectFn);
   await client.handshake();
   const streams = [];
-  for (let i = 0; i < 6; i++) {
-    const s = client.openStream({ host: "localhost", port });
-    await s.opened;
-    streams.push(s);
-  }
+  for (let i = 0; i < 6; i++) streams.push(client.openStream({ host: "localhost", port }));
   const s7 = client.openStream({ host: "localhost", port });
-  const queuedP = new Promise((res) => { s7.onQueued = res; });
-  const info = await queuedP;
+  const info = await new Promise((res) => { s7.onQueued = res; });
   assert.equal(info.position, 1);
   assert.equal(info.maxWaitMs, 5000);
-  // free a slot by resetting one stream
-  streams[0].reset();
+  // conclude one establishment -> its slot returns -> the queued OPEN starts
+  pending.shift()();
+  const gate0 = await streams[0].opened;
+  assert.equal(gate0, GATE.CONNECT);
+  const t0 = Date.now();
+  while (pending.length < 6 && Date.now() - t0 < 2000) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(pending.length, 6); // 5 remaining originals + the dequeued 7th
+  pending.pop()(); // conclude the 7th's establishment (pushed last)
   const gate = await s7.opened;
   assert.equal(gate, GATE.CONNECT);
+  // conclude the rest and let them settle before closing anything, so
+  // no establishment is still in flight against a closing echo server
+  for (const fn of pending.splice(0)) fn();
+  await Promise.all(streams.map((s) => s.opened.catch(() => {})));
   client.close();
   echo.close();
 });
@@ -371,7 +384,13 @@ test("E2E: over-window DATA is RESET with flow_control_violation", async () => {
   client.close();
 });
 
-test("occupancy wedge (NP-1116-01): remote EOF holds §7.5 slots until the app closes", async () => {
+test("occupancy wedge revisited (NP-1117-08): remote-EOF streams hold NO §7.5 slot under spec v0.2.0", async () => {
+  // The NP-1116-01 wedge shape, re-run under the rewritten §7.5: the
+  // original form of this test asserted the slots ARE held until the
+  // app closes (lifetime counting). Spec v0.2.0 §7.5 counts only
+  // in-flight establishments, so the wedge cannot form: the streams
+  // below are retained by the §6.3/P2 half-close discipline (streams
+  // map), not by occupancy, and new streams open freely.
   // Fake target: first write is echoed, then the readable side EOFs —
   // the tcpbin idle-close shape that wedged the M4 soak for an hour.
   function fakeTarget() {
@@ -401,17 +420,17 @@ test("occupancy wedge (NP-1116-01): remote EOF holds §7.5 slots until the app c
     await ended; // server CLOSE arrived; app deliberately does NOT close
     streams.push(s);
   }
-  assert.equal(server.occupancy, 6);
+  // All six establishments concluded long ago: no slot is held, even
+  // though the app never closed and the streams still exist server-side.
+  assert.equal(server.occupancy, 0);
+  assert.equal(server.streams.size, 6);
   const s7 = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
-  await assert.rejects(s7.opened, (e) => e.code === ERR.CONCURRENCY_LIMIT);
-  assert.equal(server.occupancy, 6);
-  // The app fulfils its CLOSE obligation -> slots release (§6.3).
+  await s7.opened; // no queueing, no concurrency_limit — the wedge is gone
+  assert.equal(server.occupancy, 0);
+  // The app fulfils its CLOSE obligation -> the streams themselves free (§6.3).
   for (const s of streams) s.closeWrite();
   await new Promise((r) => setTimeout(r, 300));
-  assert.equal(server.occupancy, 0);
-  const s8 = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
-  await s8.opened;
-  assert.equal(server.occupancy, 1);
+  assert.equal(server.streams.size, 1); // only s7 remains
   client.close();
 });
 
@@ -449,7 +468,10 @@ test("P2 linger (NP-1116-04): outEof stream is RESET stream_timeout after the id
   s.onData = () => {};
   s.write(new Uint8Array(300).fill(0x61));
   await ended; // server CLOSE (outEof); app does not close
-  assert.equal(server.occupancy, 1);
+  // NP-1117-08: the established stream holds no §7.5 slot (occupancy 0);
+  // what retains it is the linger — visible in the streams map.
+  assert.equal(server.occupancy, 0);
+  assert.equal(server.streams.size, 1);
   const code = await resetP; // linger expires -> RESET 0x10
   assert.equal(code, ERR.STREAM_TIMEOUT);
   assert.equal(server.occupancy, 0);
@@ -499,7 +521,8 @@ test("P2 linger is idle-based (NP-1116-04): client DATA re-arms it", async () =>
   }
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(resetCode, null); // ~700 ms > 400 ms linger, but never idle that long
-  assert.equal(server.occupancy, 1);
+  assert.equal(server.occupancy, 0); // NP-1117-08: established, no slot held
+  assert.equal(server.streams.size, 1);
   const code = await new Promise((res) => { s.onReset = res; }); // now idle -> fires
   assert.equal(code, ERR.STREAM_TIMEOUT);
   assert.equal(server.occupancy, 0);
@@ -518,7 +541,7 @@ test("P3 write failure (NP-1116-04): dead target socket -> RESET target_unreacha
   await client.handshake();
   const s = client.openStream({ host: "target.example", port: 4242, schemeHint: 0, gatePolicy: 0 });
   await s.opened;
-  assert.equal(server.occupancy, 1);
+  assert.equal(server.occupancy, 0); // NP-1117-08: slot returned at establishment
   const resetP = new Promise((res) => { s.onReset = res; });
   s.write(new Uint8Array(100).fill(0x63));
   const code = await resetP;

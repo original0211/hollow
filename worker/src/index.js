@@ -1344,7 +1344,7 @@ const HALF_CONN = CONN_WINDOW_INIT / 2;
 const CONNECT_SPECIAL_ERROR = "proxy request failed, cannot connect to the specified address";
 
 class HollowServer {
-  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000 }) {
+  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = MAX_OCCUPANCY }) {
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
@@ -1353,6 +1353,15 @@ class HollowServer {
     this.state = "hello"; // hello | wait-finished | open | dead
     this.streams = new Map();
     this.queue = []; // FIFO of {streamId, open} (§7.5)
+    // §7.5 as rewritten by spec v0.2.0 (NP-1117-08): occupancy counts
+    // IN-FLIGHT ESTABLISHMENTS only. An OPEN takes a slot when its
+    // establishment starts and returns it the moment the outbound
+    // establishment concludes — success or failure. Established streams
+    // hold no slot. (The pre-v0.2.0 code counted the stream's whole
+    // lifetime; six browser keep-alive streams then wedged the session.)
+    // The cap stays 6, as a named local parameter per §7.5's closing
+    // positioning (admission parameter; interface unchanged).
+    this.maxInFlightOpens = maxInFlightOpens;
     this.occupancy = 0;
     this.fetchActive = 0;
     this.streamErrors = 0;
@@ -1527,7 +1536,7 @@ class HollowServer {
       this._sendFrame(buildFrame(FT.OPEN_REJECT, f.streamId, rejectPayload(bad, 0)), true);
       return;
     }
-    if (this.occupancy >= MAX_OCCUPANCY) {
+    if (this.occupancy >= this.maxInFlightOpens) {
       if (this.queue.length >= QUEUE_DEPTH) {
         this._sendFrame(buildFrame(FT.OPEN_REJECT, f.streamId,
           rejectPayload(ERR.CONCURRENCY_LIMIT, QUEUE_RETRY_AFTER_MS)), true);
@@ -1556,7 +1565,7 @@ class HollowServer {
   }
 
   async _startOpen(streamId, open) {
-    this.occupancy++;
+    this.occupancy++; // §7.5: the establishment is now in flight
     const s = {
       id: streamId, open, gate: null, socket: null, writer: null,
       sendWindow: STREAM_WINDOW_INIT, recvWindow: STREAM_WINDOW_INIT,
@@ -1572,8 +1581,7 @@ class HollowServer {
     } catch (e) { connectErr = e; }
     if (this.dead || !this.streams.has(streamId)) {
       if (sock) { try { sock.close(); } catch {} }
-      this.occupancy--;
-      this._drainQueue();
+      this._releaseInFlight();
       return;
     }
     if (sock) {
@@ -1581,6 +1589,9 @@ class HollowServer {
       s.writer = sock.writable.getWriter();
       this._sendFrame(buildFrame(FT.OPEN_OK, streamId, new Uint8Array([GATE.CONNECT])), true);
       this._pumpSocket(s);
+      // §7.5 (v0.2.0): opened — the establishment has concluded and
+      // the slot returns here; the established socket holds no slot.
+      this._releaseInFlight();
       return;
     }
     // §7.3 step 2: specific error text -> fetch fallback (once)
@@ -1594,6 +1605,10 @@ class HollowServer {
       this.fetchActive++;
       s.occupiesFetch = true;
       this._sendFrame(buildFrame(FT.OPEN_OK, streamId, new Uint8Array([GATE.FETCH])), true);
+      // §7.5: the gate is selected — the establishment has concluded
+      // and the slot returns. The fetch transaction's own span stays
+      // governed by the separate §7.4 fetchActive account (above).
+      this._releaseInFlight();
       return;
     }
     // §7.3 step 3: map error
@@ -1602,13 +1617,23 @@ class HollowServer {
     else if (/refused|timed? ?out|timeout|unreachable/i.test(msg)) code = ERR.TARGET_UNREACHABLE;
     if (canFallback && this.fetchActive >= FETCH_CONCURRENCY) code = ERR.FETCH_FALLBACK_FAILED;
     this.streams.delete(streamId);
-    this.occupancy--;
     this._sendFrame(buildFrame(FT.OPEN_REJECT, streamId, rejectPayload(code, 0)), true);
+    this._releaseInFlight();
+  }
+
+  // §7.5 pairing (NP-1117-08): _startOpen increments occupancy exactly
+  // once, and every establishment concludes through exactly one call
+  // here — established (connect), gate-selected (fetch), rejected, or
+  // the session died mid-flight. Queued OPENs never increment (they
+  // have not started establishing), so queue timeout / client cancel /
+  // teardown of the queue need no release.
+  _releaseInFlight() {
+    this.occupancy--;
     this._drainQueue();
   }
 
   _drainQueue() {
-    while (this.occupancy < MAX_OCCUPANCY && this.queue.length > 0 && !this.dead) {
+    while (this.occupancy < this.maxInFlightOpens && this.queue.length > 0 && !this.dead) {
       const entry = this.queue.shift();
       clearTimeout(entry.timer);
       this._startOpen(entry.streamId, entry.open);
@@ -1621,13 +1646,15 @@ class HollowServer {
     s.socket = null;
   }
 
-  _freeStream(s, { releaseSlot = true } = {}) {
+  _freeStream(s) {
     if (!this.streams.has(s.id)) return;
     if (s.lingerTimer) { clearTimeout(s.lingerTimer); s.lingerTimer = null; }
     this.streams.delete(s.id);
     this._closeSocket(s);
     if (s.occupiesFetch) { this.fetchActive--; s.occupiesFetch = false; }
-    if (releaseSlot) { this.occupancy--; this._drainQueue(); }
+    // No §7.5 release here (NP-1117-08): an established stream holds
+    // no slot — its slot was returned when its establishment concluded
+    // (see _releaseInFlight). Decrementing here would double-count.
   }
 
   // P2 (NP-1116-04): arm/re-arm the idle linger for an outEof stream.
