@@ -18,7 +18,7 @@
 
 能力微探针实测：Workers WebCrypto **不支持** `CHACHA20-POLY1305` 的 importKey（报 `Unrecognized key import algorithm`）；同一运行时在 `nodejs_compat` 下的 `node:crypto` 原生支持 `chacha20-poly1305`（往返验证通过）。Worker 因此启用 `nodejs_compat` 并用 node:crypto 执行 AEAD；CLI 端（Node）同一路径。属平台成熟实现、非自造加密，算法/密钥长度/nonce 构造/AAD 均按 spec §6 不变。
 
-**NP-1117-04 补记（AEAD 运行时回退）**：Electron 34 的 BoringSSL 版 node:crypto 不提供 chacha20-poly1305（`ERR_CRYPTO_UNKNOWN_CIPHER`），Windows 应用曾因此不可能握手成功且被误报为记录损坏。现 `shared/crypto.js` 在加载时探测原生算法：缺失时回退到 vendored 的纯 JS 实现（@noble/ciphers 2.4.0 的 chacha20poly1305，`shared/vendor/`，LICENSE 与 SHA-256 钉记在册），有原生时仍走原生、不得误走 JS；协议字节零变化（RFC 8439 A.5 黄金向量＋双后端逐字节一致，`tests/aead.test.mjs`）。错误分类：能力缺失抛具名 `AeadUnavailableError`（客户端文案明示运行时缺 AEAD），认证失败维持返回 null 的 fail-closed 语义。CI 的 windows-build 增设 Electron 运行时握手冒烟（`windows/tools/electron-aead-smoke.mjs`，本地 server-core 全握手＋回显），此类运行时缺失在 CI 即红、不再带病出厂。
+**NP-1117-04 补记（AEAD 运行时回退）**：Electron 34 的 BoringSSL 版 node:crypto 不提供 chacha20-poly1305（`ERR_CRYPTO_UNKNOWN_CIPHER`），Windows 应用曾因此不可能握手成功且被误报为记录损坏。现 `shared/crypto.js` 在加载时探测原生算法：缺失时回退到 vendored 的纯 JS 实现（@noble/ciphers 2.4.0 的 chacha20poly1305，`shared/vendor/`，LICENSE 与 SHA-256 钉记在册），有原生时仍走原生、不得误走 JS；协议字节零变化（RFC 8439 A.5 黄金向量＋双后端逐字节一致，`tests/aead.test.mjs`）。错误分类：能力缺失抛具名 `AeadUnavailableError`（客户端文案明示运行时缺 AEAD），认证失败维持返回 null 的 fail-closed 语义。CI 的 windows-build 增设 Electron 运行时握手冒烟（`windows/tools/electron-aead-smoke.mjs`，本地 server-core 全握手＋回显），此类运行时缺失在 CI 即红、不再带病出厂。 **NP-1117-06 续记**：同型吞错 x25519Derive 已同批修——运行时能力缺失（WebCrypto 无 X25519）抛具名 `X25519UnavailableError`、客户端文案明示运行时缺 X25519；低阶点与畸形对端公钥维持返回 null、语义未动（`tests/x25519.test.mjs`，含桩掉 WebCrypto 的能力缺失用例）。
 
 X25519、HMAC-SHA256、SHA-256 双端均走 WebCrypto subtle；HKDF 按 RFC 5869 用 HMAC 手工 Extract/Expand（双端同一实现，保证语义一致）。
 

@@ -1,7 +1,7 @@
 // Hollow client session core (spec v0.1 §4, §5, §6, §7.5 client side).
 // Transport-agnostic: transport = { send(bytes), close(), onMessage, onClose }
 // carrying raw WebSocket messages (hello plaintext, then AEAD records).
-import { randomBytes, x25519Generate, x25519Derive, AeadUnavailableError } from "./crypto.js";
+import { randomBytes, x25519Generate, x25519Derive, AeadUnavailableError, X25519UnavailableError } from "./crypto.js";
 import {
   PROTO_VERSION, FT, ERR, GATE, BUCKETS,
   CONN_WINDOW_INIT, STREAM_WINDOW_INIT, MERGE_WINDOW_MS, MAX_PAYLOAD,
@@ -84,7 +84,14 @@ export class HollowClient {
     if (this.state !== "idle") throw new Error("bad state");
     this.state = "hello";
     const done = new Promise((res, rej) => { this._hsResolve = res; this._hsReject = rej; });
-    const kp = await x25519Generate();
+    let kp;
+    try {
+      kp = await x25519Generate();
+    } catch (e) {
+      // NP-1117-06: capability missing is not a key failure.
+      if (e instanceof X25519UnavailableError) this._die("X25519 unavailable in this runtime (WebCrypto)");
+      throw e;
+    }
     this._eph = kp;
     this._clientRandom = randomBytes(32);
     const padding = randomBytes(Math.floor(Math.random() * 129));
@@ -129,7 +136,14 @@ export class HollowClient {
       return;
     }
     this._serverHello = bytes;
-    const dh = await x25519Derive(this._eph.privateKey, sh.publicRaw);
+    let dh;
+    try {
+      dh = await x25519Derive(this._eph.privateKey, sh.publicRaw);
+    } catch (e) {
+      // NP-1117-06: capability missing is not a key failure.
+      if (e instanceof X25519UnavailableError) { this._die("X25519 unavailable in this runtime (WebCrypto)"); try { this.transport.close(); } catch {} return; }
+      throw e;
+    }
     if (!dh) { this._die("x25519 failed"); try { this.transport.close(); } catch {} return; }
     const verifier = await deriveVerifier(this.psk);
     const keys = await deriveSession({

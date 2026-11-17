@@ -808,15 +808,56 @@ async function hkdfExpand(prk, info, len) {
   return out;
 }
 
+// ---- X25519 capability classification (NP-1117-06) ----
+// Same pattern as the AEAD classification (NP-1117-04): a runtime that
+// cannot run X25519 at all (WebCrypto lacks the algorithm) is a named,
+// thrown error; a bad peer key stays a returned null (below).
+class X25519UnavailableError extends Error {
+  constructor(message = "X25519 unavailable in this runtime (WebCrypto)") {
+    super(message);
+    this.name = "X25519UnavailableError";
+    this.code = "X25519_UNAVAILABLE";
+  }
+}
+
+let x25519Capability = null; // null = unprobed; boolean after the probe
+async function probeX25519() {
+  if (x25519Capability !== null) return x25519Capability;
+  try {
+    if (!globalThis.crypto || !crypto.subtle) { x25519Capability = false; return false; }
+    await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    x25519Capability = true;
+  } catch (e) {
+    // Only a definitive NotSupportedError marks the capability missing;
+    // any other probe failure leaves the verdict to the operation itself.
+    x25519Capability = e && e.name === "NotSupportedError" ? false : true;
+  }
+  return x25519Capability;
+}
+
+// Test-only hook (tests/x25519.test.mjs): forget the probe verdict so a
+// stubbed WebCrypto is re-probed. Not used by any production path.
+function _resetX25519ProbeForTest() { x25519Capability = null; }
+
 async function x25519Generate() {
-  const kp = await crypto.subtle.generateKey(
-    { name: "X25519" }, true, ["deriveBits"]);
-  const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-  return { privateKey: kp.privateKey, publicRaw: pub };
+  try {
+    const kp = await crypto.subtle.generateKey(
+      { name: "X25519" }, true, ["deriveBits"]);
+    const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+    return { privateKey: kp.privateKey, publicRaw: pub };
+  } catch (e) {
+    if (e && e.name === "NotSupportedError") {
+      x25519Capability = false;
+      throw new X25519UnavailableError();
+    }
+    throw e;
+  }
 }
 
 // Returns 32-byte shared secret, or null on failure / low-order peer key.
+// Throws X25519UnavailableError when the runtime lacks X25519 entirely.
 async function x25519Derive(privateKey, peerPublicRaw) {
+  if (!(await probeX25519())) throw new X25519UnavailableError();
   try {
     const pub = await crypto.subtle.importKey(
       "raw", peerPublicRaw, { name: "X25519" }, false, []);
