@@ -4,14 +4,13 @@
 import { randomBytes, x25519Generate, x25519Derive, AeadUnavailableError, X25519UnavailableError } from "./crypto.js";
 import {
   PROTO_VERSION, FT, ERR, GATE, BUCKETS,
-  CONN_WINDOW_INIT, STREAM_WINDOW_INIT, MERGE_WINDOW_MS, MAX_PAYLOAD,
+  CONN_WINDOW_INIT, STREAM_WINDOW_INIT, CONN_WINDOW_GRANT, STREAM_WINDOW_GRANT,
+  MERGE_WINDOW_MS, MAX_PAYLOAD,
   buildClientHello, parseServerHello, deriveVerifier, deriveSession,
   finishedMac, buildFrame, parseFrames, sealRecords, RecordReceiver,
   buildOpenPayload, eq, RecordSender,
 } from "./protocol.js";
 
-const HALF_STREAM = STREAM_WINDOW_INIT / 2;
-const HALF_CONN = CONN_WINDOW_INIT / 2;
 
 export class ClientStream {
   constructor(client, id) {
@@ -20,7 +19,10 @@ export class ClientStream {
     this.gate = null;
     this.pending = []; // Uint8Array chunks awaiting send window
     this.sendWindow = STREAM_WINDOW_INIT;
-    this.recvWindow = STREAM_WINDOW_INIT; // credit we granted the server (§6.5)
+    // §6.5 v0.2.1: credit we grant the server is our GRANT target (the
+    // server learns it via our top-up WINDOW_UPDATE at stream creation;
+    // its send side still starts from STREAM_WINDOW_INIT).
+    this.recvWindow = client.streamWindowGrant;
     this.recvUnacked = 0; // bytes delivered to app, not yet window-updated
     this.localClosed = false; // we sent CLOSE
     this.remoteClosed = false; // peer sent CLOSE
@@ -65,9 +67,16 @@ export const SESSION_OPEN_HARD_CAP = 50; // measured platform ceiling (approx.)
 export const SESSION_ROTATE_THRESHOLD = 40; // rotate here; margin = 10
 
 export class HollowClient {
-  constructor({ transport, psk, keyId = 1 }) {
+  constructor({ transport, psk, keyId = 1, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT }) {
     this.transport = transport;
     this.psk = psk; this.keyId = keyId;
+    // §6.5 v0.2.1 (NP-1117-25): receiver grant targets. Passing the
+    // INIT values reproduces pre-v0.2.1 behavior exactly (top-up is 0),
+    // which is also the per-endpoint rollback switch.
+    this.streamWindowGrant = streamWindowGrant;
+    this.connWindowGrant = connWindowGrant;
+    this.halfStream = streamWindowGrant / 2;
+    this.halfConn = connWindowGrant / 2;
     this.state = "idle"; // idle | hello | wait-finished | open | dead
     // NP-1117-16: outbound budget bookkeeping (see constants above).
     this.opensSent = 0; // OPEN frames sent on THIS session
@@ -78,7 +87,7 @@ export class HollowClient {
     this.nextStreamId = 1;
     this.sender = null; this.receiver = null;
     this.connSendWindow = CONN_WINDOW_INIT;
-    this.connRecvWindow = CONN_WINDOW_INIT;
+    this.connRecvWindow = connWindowGrant;
     this.connRecvUnacked = 0;
     this.streamErrors = 0;
     this.wireSizes = []; // observed WS message sizes (records + hello), for F-8
@@ -197,11 +206,29 @@ export class HollowClient {
     const mac = await finishedMac(this._keys.fC, this._th, "client");
     this.sender.push(buildFrame(FT.FINISH, 0, mac), true);
     this.state = "open";
+    // §6.5 v0.2.1: top up the server's connection window from the
+    // legacy INIT to our grant target (a pre-v0.2.1 server just sees
+    // extra credit arrive; its own accounting is unaffected).
+    this._topUp(0, this.connWindowGrant - CONN_WINDOW_INIT);
     if (this._hsResolve) { this._hsResolve(); this._hsResolve = null; }
   }
 
   _sendFrame(frameBytes, immediate) {
     if (this.sender) this.sender.push(frameBytes, immediate);
+  }
+
+  _sendWindowUpdate(streamId, inc) {
+    const p = new Uint8Array(4);
+    new DataView(p.buffer).setUint32(0, inc);
+    this._sendFrame(buildFrame(FT.WINDOW_UPDATE, streamId, p), true);
+  }
+
+  // §6.5 v0.2.1: express the difference between the legacy INIT
+  // window (all a pre-v0.2.1 sender assumes) and our grant target as
+  // an explicit WINDOW_UPDATE. Zero/negative differences send nothing,
+  // which is exactly the legacy behavior.
+  _topUp(streamId, inc) {
+    if (inc > 0) this._sendWindowUpdate(streamId, inc);
   }
 
   openStream({ host, port, schemeHint = 0, gatePolicy = 0 }) {
@@ -211,6 +238,10 @@ export class HollowClient {
     this.streams.set(id, s);
     const payload = buildOpenPayload({ host, port, schemeHint, gatePolicy });
     this._sendFrame(buildFrame(FT.OPEN, id, payload), true);
+    // §6.5 v0.2.1: top up the server's per-stream window for the
+    // return direction (rides right behind OPEN on the same carrier;
+    // the record sender's FIFO order is preserved).
+    this._topUp(id, this.streamWindowGrant - STREAM_WINDOW_INIT);
     // NP-1117-16: the OPEN is on the wire — count it (retries included:
     // every re-OPEN consumes budget exactly like a first attempt).
     this.opensSent++;
@@ -250,14 +281,14 @@ export class HollowClient {
     // §6.5: WINDOW_UPDATE when accumulated consumption >= half the window,
     // per-stream and connection level independently.
     s.recvUnacked += n;
-    if (s.recvUnacked >= HALF_STREAM) {
+    if (s.recvUnacked >= this.halfStream) {
       const inc = s.recvUnacked; s.recvUnacked = 0; s.recvWindow += inc;
       const p = new Uint8Array(4);
       new DataView(p.buffer).setUint32(0, inc);
       this._sendFrame(buildFrame(FT.WINDOW_UPDATE, s.id, p), true);
     }
     this.connRecvUnacked += n;
-    if (this.connRecvUnacked >= HALF_CONN) {
+    if (this.connRecvUnacked >= this.halfConn) {
       const inc = this.connRecvUnacked; this.connRecvUnacked = 0; this.connRecvWindow += inc;
       const p = new Uint8Array(4);
       new DataView(p.buffer).setUint32(0, inc);

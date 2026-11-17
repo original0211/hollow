@@ -12,6 +12,17 @@ export const MAX_PAYLOAD = 16373; // §6.1: 16384 - 2 (len head) - 9 (frame head
 export const FRAME_HEAD = 9;
 export const CONN_WINDOW_INIT = 1 << 20; // §6.5: 1 MiB
 export const STREAM_WINDOW_INIT = 256 * 1024; // §6.5: 256 KiB
+// §6.5 as of spec v0.2.1 (NP-1117-25): the INIT values above stay the
+// symmetric starting assumption every endpoint may rely on (they are
+// what a pre-v0.2.1 peer grants and expects). A v0.2.1 receiver grants
+// up to the GRANT targets below, expressed on the wire as an immediate
+// WINDOW_UPDATE top-up when the session/stream starts (conn: right
+// after the handshake; stream: at creation), so mixed old/new pairs
+// interoperate: the old peer simply never receives a smaller grant
+// than the INIT it assumed, and a new sender never assumes more than
+// the INIT until a top-up actually arrives.
+export const CONN_WINDOW_GRANT = 8 << 20; // §6.5 v0.2.1: 8 MiB
+export const STREAM_WINDOW_GRANT = 1 << 20; // §6.5 v0.2.1: 1 MiB
 export const MERGE_WINDOW_MS = 2; // §6.4
 export const MAX_OCCUPANCY = 6; // §7.5 (worst case, U-1 open)
 export const QUEUE_DEPTH = 32; // §7.5

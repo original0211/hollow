@@ -21,6 +21,12 @@ const (
 	FrameHead        = 9
 	ConnWindowInit   = 1 << 20 // §6.5
 	StreamWindowInit = 256 * 1024
+	// §6.5 as of spec v0.2.1 (NP-1117-25): receiver grant targets,
+	// expressed as an immediate WINDOW_UPDATE top-up at session /
+	// stream start; the INIT values stay the symmetric starting
+	// assumption (see the JS original, shared/protocol.js).
+	ConnWindowGrant   = 8 << 20 // §6.5 v0.2.1: 8 MiB
+	StreamWindowGrant = 1 << 20 // §6.5 v0.2.1: 1 MiB
 	MergeWindow      = 2 * time.Millisecond // §6.4
 	RecordFailLimit  = 3                    // §6.1 consecutive
 	StreamErrorLimit = 10                   // §8.2

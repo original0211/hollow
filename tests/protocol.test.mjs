@@ -9,7 +9,7 @@ import { once } from "node:events";
 import { Readable, Writable } from "node:stream";
 import {
   FT, ERR, GATE, buildFrame, parseFrames, sealRecords, RecordReceiver,
-  deriveVerifier, MAX_PAYLOAD, u32be,
+  deriveVerifier, MAX_PAYLOAD, u32be, STREAM_WINDOW_INIT, CONN_WINDOW_INIT,
 } from "../shared/protocol.js";
 import { randomBytes, chachaSeal } from "../shared/crypto.js";
 import { HollowClient } from "../shared/client-core.js";
@@ -372,7 +372,11 @@ test("E2E: over-window DATA is RESET with flow_control_violation", async () => {
     opened: Promise.resolve(),
     close() {},
   });
-  const { client } = await makePair(psk, psk, blackhole);
+  // NP-1117-25: this cell pins the server to the pre-v0.2.1 grant
+  // (= the INIT window) so the violation boundary is the legacy
+  // 256 KiB; the v0.2.1 grant levels are covered in windows-v021.
+  const { client } = await makePair(psk, psk, blackhole,
+    { streamWindowGrant: STREAM_WINDOW_INIT, connWindowGrant: CONN_WINDOW_INIT });
   await client.handshake();
   const s = client.openStream({ host: "localhost", port: 9 });
   await s.opened;

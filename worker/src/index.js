@@ -978,6 +978,17 @@ const MAX_PAYLOAD = 16373; // §6.1: 16384 - 2 (len head) - 9 (frame head)
 const FRAME_HEAD = 9;
 const CONN_WINDOW_INIT = 1 << 20; // §6.5: 1 MiB
 const STREAM_WINDOW_INIT = 256 * 1024; // §6.5: 256 KiB
+// §6.5 as of spec v0.2.1 (NP-1117-25): the INIT values above stay the
+// symmetric starting assumption every endpoint may rely on (they are
+// what a pre-v0.2.1 peer grants and expects). A v0.2.1 receiver grants
+// up to the GRANT targets below, expressed on the wire as an immediate
+// WINDOW_UPDATE top-up when the session/stream starts (conn: right
+// after the handshake; stream: at creation), so mixed old/new pairs
+// interoperate: the old peer simply never receives a smaller grant
+// than the INIT it assumed, and a new sender never assumes more than
+// the INIT until a top-up actually arrives.
+const CONN_WINDOW_GRANT = 8 << 20; // §6.5 v0.2.1: 8 MiB
+const STREAM_WINDOW_GRANT = 1 << 20; // §6.5 v0.2.1: 1 MiB
 const MERGE_WINDOW_MS = 2; // §6.4
 const MAX_OCCUPANCY = 6; // §7.5 (worst case, U-1 open)
 const QUEUE_DEPTH = 32; // §7.5
@@ -1339,12 +1350,17 @@ function resetPayload(code) {
 
 
 
-const HALF_STREAM = STREAM_WINDOW_INIT / 2;
-const HALF_CONN = CONN_WINDOW_INIT / 2;
 const CONNECT_SPECIAL_ERROR = "proxy request failed, cannot connect to the specified address";
 
 class HollowServer {
-  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = 16, queueDepth = 64 }) {
+  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = 16, queueDepth = 64, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT }) {
+    // §6.5 v0.2.1 (NP-1117-25): receiver grant targets; passing the
+    // INIT values reproduces pre-v0.2.1 behavior exactly (top-up is
+    // 0), which is also the per-endpoint rollback switch.
+    this.streamWindowGrant = streamWindowGrant;
+    this.connWindowGrant = connWindowGrant;
+    this.halfStream = streamWindowGrant / 2;
+    this.halfConn = connWindowGrant / 2;
     this.transport = transport;
     this.verifiers = verifiers;
     this.ownHost = ownHost;
@@ -1378,7 +1394,7 @@ class HollowServer {
     this.streamLingerMs = streamLingerMs;
     this.lingerReleases = 0;
     this.connSendWindow = CONN_WINDOW_INIT;
-    this.connRecvWindow = CONN_WINDOW_INIT;
+    this.connRecvWindow = connWindowGrant;
     this.connRecvUnacked = 0;
     this.sender = null; this.receiver = null;
     this.dead = false;
@@ -1408,6 +1424,20 @@ class HollowServer {
     try { this.transport.closeCarrier(); } catch { try { this.transport.close(); } catch {} }
   }
   _sendFrame(bytes, immediate) { if (this.sender) this.sender.push(bytes, immediate); }
+
+  _sendWindowUpdate(streamId, inc) {
+    const p = new Uint8Array(4);
+    new DataView(p.buffer).setUint32(0, inc);
+    this._sendFrame(buildFrame(FT.WINDOW_UPDATE, streamId, p), true);
+  }
+
+  // §6.5 v0.2.1: express the difference between the legacy INIT
+  // window (all a pre-v0.2.1 sender assumes) and our grant target as
+  // an explicit WINDOW_UPDATE. Zero/negative differences send
+  // nothing, which is exactly the legacy behavior.
+  _topUp(streamId, inc) {
+    if (inc > 0) this._sendWindowUpdate(streamId, inc);
+  }
   _noteStreamError() {
     this.streamErrors++;
     if (this.streamErrors >= STREAM_ERROR_LIMIT) this._carrierFail();
@@ -1470,6 +1500,9 @@ class HollowServer {
       return this._carrierFail();
     }
     this.state = "open";
+    // §6.5 v0.2.1: top up the client's connection window from the
+    // legacy INIT to our grant target.
+    this._topUp(0, this.connWindowGrant - CONN_WINDOW_INIT);
   }
 
   _onRecord(bytes) {
@@ -1575,11 +1608,16 @@ class HollowServer {
     this.occupancy++; // §7.5: the establishment is now in flight
     const s = {
       id: streamId, open, gate: null, socket: null, writer: null,
-      sendWindow: STREAM_WINDOW_INIT, recvWindow: STREAM_WINDOW_INIT,
+      sendWindow: STREAM_WINDOW_INIT, recvWindow: this.streamWindowGrant,
       recvUnacked: 0, remoteClosed: false, localClosed: false,
       fetchBuf: null, dead: false, pumpPaused: false,
     };
     this.streams.set(streamId, s);
+    // §6.5 v0.2.1: top up the client's per-stream window for the
+    // client->server direction (a pre-v0.2.1 client just sees extra
+    // credit; if the gate goes on to reject the stream, the credit
+    // dies with it).
+    this._topUp(streamId, this.streamWindowGrant - STREAM_WINDOW_INIT);
     // §7.3 step 1: connect gate first
     let sock = null, connectErr = null;
     try {
@@ -1823,12 +1861,12 @@ class HollowServer {
   _consume(s, n) {
     s.recvUnacked += n;
     this.connRecvUnacked += n;
-    if (s.recvUnacked >= HALF_STREAM) {
+    if (s.recvUnacked >= this.halfStream) {
       const inc = s.recvUnacked; s.recvUnacked = 0; s.recvWindow += inc;
       const p = new Uint8Array(4); new DataView(p.buffer).setUint32(0, inc);
       this._sendFrame(buildFrame(FT.WINDOW_UPDATE, s.id, p), true);
     }
-    if (this.connRecvUnacked >= HALF_CONN) {
+    if (this.connRecvUnacked >= this.halfConn) {
       const inc = this.connRecvUnacked; this.connRecvUnacked = 0; this.connRecvWindow += inc;
       const p = new Uint8Array(4); new DataView(p.buffer).setUint32(0, inc);
       this._sendFrame(buildFrame(FT.WINDOW_UPDATE, 0, p), true);

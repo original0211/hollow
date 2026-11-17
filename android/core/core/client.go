@@ -22,11 +22,6 @@ type Transport interface {
 	Close()
 }
 
-const (
-	halfStreamWindow = StreamWindowInit / 2
-	halfConnWindow   = ConnWindowInit / 2
-)
-
 // QueuedInfo is the parsed OPEN_QUEUED payload (§7.5).
 type QueuedInfo struct {
 	Position  int
@@ -119,6 +114,11 @@ func (s *ClientStream) WaitOpen() (byte, error) {
 }
 
 type ClientOptions struct {
+	// §6.5 v0.2.1 grant targets; 0 selects the protocol defaults
+	// (StreamWindowGrant / ConnWindowGrant). Setting them to the
+	// INIT values reproduces pre-v0.2.1 behavior exactly.
+	StreamWindowGrant int
+	ConnWindowGrant   int
 	PSK   []byte
 	KeyID byte // zero means 1, as the JS default
 
@@ -142,6 +142,10 @@ type HollowClient struct {
 
 	streams         map[uint32]*ClientStream
 	nextStreamID    uint32
+	streamWindowGrant int
+	connWindowGrant   int
+	halfStreamWindow  int
+	halfConnWindow    int
 	sender          *RecordSender
 	receiver        *RecordReceiver
 	connSendWindow  int
@@ -169,6 +173,14 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 	if keyID == 0 {
 		keyID = 1
 	}
+	streamGrant := opts.StreamWindowGrant
+	if streamGrant == 0 {
+		streamGrant = StreamWindowGrant
+	}
+	connGrant := opts.ConnWindowGrant
+	if connGrant == 0 {
+		connGrant = ConnWindowGrant
+	}
 	c := &HollowClient{
 		transport:      t,
 		psk:            opts.PSK,
@@ -177,8 +189,12 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 		State:          "idle",
 		streams:        map[uint32]*ClientStream{},
 		nextStreamID:   1,
+		streamWindowGrant: streamGrant,
+		connWindowGrant:   connGrant,
+		halfStreamWindow:  streamGrant / 2,
+		halfConnWindow:    connGrant / 2,
 		connSendWindow: ConnWindowInit,
-		connRecvWindow: ConnWindowInit,
+		connRecvWindow: connGrant,
 		hsDone:         make(chan struct{}),
 		inbox:          make(chan func(), 4096),
 	}
@@ -263,7 +279,7 @@ func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy 
 		client:     c,
 		State:      "opening",
 		sendWindow: StreamWindowInit,
-		recvWindow: StreamWindowInit,
+		recvWindow: c.streamWindowGrant,
 		openDone:   make(chan struct{}),
 	}
 	var buildErr error
@@ -286,6 +302,9 @@ func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy 
 			return
 		}
 		c.sendFrame(BuildFrame(FTOpen, s.ID, payload), true)
+		// §6.5 v0.2.1: top up the server's per-stream window for
+		// the return direction (rides right behind OPEN).
+		c.topUp(s.ID, c.streamWindowGrant-StreamWindowInit)
 	})
 	// Resolve the ID assignment synchronously for the caller: the op
 	// above runs on the loop; wait for it via a barrier.
@@ -405,6 +424,9 @@ func (c *HollowClient) onServerFinished(bytes []byte) {
 	mac := FinishedMAC(c.keys.FC, c.th, "client")
 	c.sender.Push(BuildFrame(FTFinish, 0, mac), true)
 	c.State = "open"
+	// §6.5 v0.2.1: top up the server's connection window from the
+	// legacy INIT to our grant target.
+	c.topUp(0, c.connWindowGrant-ConnWindowInit)
 	select {
 	case <-c.hsDone:
 	default:
@@ -415,6 +437,16 @@ func (c *HollowClient) onServerFinished(bytes []byte) {
 func (c *HollowClient) sendFrame(frameBytes []byte, immediate bool) {
 	if c.sender != nil {
 		c.sender.Push(frameBytes, immediate)
+	}
+}
+
+// topUp expresses the difference between the legacy INIT window and
+// our grant target as an explicit WINDOW_UPDATE (§6.5 v0.2.1).
+// Zero/negative differences send nothing — exactly the legacy
+// behavior.
+func (c *HollowClient) topUp(streamID uint32, inc int) {
+	if inc > 0 {
+		c.sendFrame(BuildFrame(FTWindowUpdate, streamID, u32be(uint32(inc))), true)
 	}
 }
 
@@ -466,14 +498,14 @@ func (c *HollowClient) onConsume(s *ClientStream, n int) {
 	// §6.5: WINDOW_UPDATE when accumulated consumption >= half the
 	// window, per stream and connection level independently.
 	s.recvUnacked += n
-	if s.recvUnacked >= halfStreamWindow {
+	if s.recvUnacked >= c.halfStreamWindow {
 		inc := s.recvUnacked
 		s.recvUnacked = 0
 		s.recvWindow += inc
 		c.sendFrame(BuildFrame(FTWindowUpdate, s.ID, u32be(uint32(inc))), true)
 	}
 	c.connRecvUnacked += n
-	if c.connRecvUnacked >= halfConnWindow {
+	if c.connRecvUnacked >= c.halfConnWindow {
 		inc := c.connRecvUnacked
 		c.connRecvUnacked = 0
 		c.connRecvWindow += inc
