@@ -19,7 +19,7 @@
 // others: string, or null when the registry value is absent.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { configDir } from "./config.js";
+import { assertPort, configDir } from "./config.js";
 import { readSnapshot, removeSnapshot, writeSnapshotAtomic } from "./snapshot.js";
 
 const run = promisify(execFile);
@@ -31,7 +31,13 @@ export const NO_PROXY = { ProxyEnable: 0, ProxyServer: null, ProxyOverride: null
 // proxy; the socks= scheme prefix is what makes it a SOCKS proxy
 // (NP-1117-07 — the bare form blackholed all browsing: browsers sent
 // HTTP CONNECT to a SOCKS5-only port).
-export const writtenFor = (port) => ({ ProxyEnable: 1, ProxyServer: `socks=127.0.0.1:${port}`, ProxyOverride: BYPASS, AutoConfigURL: null });
+// NP-1117-19 (item 1): the port is validated before it is baked into
+// a registry string — an invalid port throws here instead of writing
+// "socks=127.0.0.1:null" into the user's Internet Settings.
+export const writtenFor = (port) => {
+  const p = assertPort(port, "socks port");
+  return { ProxyEnable: 1, ProxyServer: `socks=127.0.0.1:${p}`, ProxyOverride: BYPASS, AutoConfigURL: null };
+};
 // PAC form (M2-4): manual proxy off, AutoConfigURL points at the app's
 // loopback PAC endpoint. The snapshot/self-heal machinery is form-agnostic —
 // it records and restores whichever written state was applied.
@@ -160,7 +166,25 @@ export function createSysProxy({ adapter, dir, log = () => {}, now = () => new D
     return { healed: r.restored, mode: r.mode, verified: r.verified };
   }
 
-  return { enableGlobal, enablePac, restore, selfHealOnStartup, readCurrent };
+  return { enableGlobal, enablePac, restore, selfHealOnStartup, readCurrent, verifyAgainst };
+}
+
+// NP-1117-19 (item 4): the mode-switch sequence, factored out of the
+// app main so its ORDER is unit-testable. pac->global writes the
+// registry FIRST (enableGlobal) and stops the PAC server only after —
+// the old order (stopPac, then enable) left AutoConfigURL pointing
+// at a dead endpoint for the whole switch window. global->pac starts
+// the PAC endpoint before writing its URL, for the same reason.
+export async function applyProxyModeCore(mode, ops) {
+  if (mode === "global") {
+    await ops.enableGlobal();
+    await ops.stopPac();
+  } else if (mode === "pac") {
+    await ops.startPac();
+    await ops.enablePac();
+  } else {
+    await ops.teardown();
+  }
 }
 
 // ---- win32 adapter (reg.exe + PowerShell WinINET refresh) ----
@@ -224,4 +248,12 @@ export async function selfHealOnStartup(log) {
   const sp = defaultSysProxy(log);
   if (!sp) return { healed: false, mode: "not-windows" };
   return sp.selfHealOnStartup();
+}
+// NP-1117-19 (item 5): runtime re-verification against the state this
+// app wrote — used by the app main on bridge state events while the
+// proxy is on. Returns null off-Windows (nothing to verify).
+export async function verifyAgainst(expected, log) {
+  const sp = defaultSysProxy(log);
+  if (!sp) return null;
+  return sp.verifyAgainst(expected);
 }

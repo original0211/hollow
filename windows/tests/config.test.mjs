@@ -49,3 +49,21 @@ test("writePsk is atomic: roundtrip exact, no tmp residue", () => {
   assert.deepEqual([...loadPsk()], [...psk]);
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.includes(".tmp-")), []);
 });
+
+test("loadConfig port coercion (NP-1117-19 a): polluted ports fall back, numeric strings coerce", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hollow-cfg-polluted-"));
+  const prev = process.env.HOLLOW_HOME;
+  process.env.HOLLOW_HOME = dir;
+  try {
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ socksPort: null, pacPort: "junk" }));
+    let c = loadConfig();
+    assert.equal(c.socksPort, 1080);
+    assert.equal(c.pacPort, 18080);
+    fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ socksPort: "2443", pacPort: 65536 }));
+    c = loadConfig();
+    assert.equal(c.socksPort, 2443);
+    assert.equal(c.pacPort, 18080);
+  } finally {
+    if (prev === undefined) delete process.env.HOLLOW_HOME; else process.env.HOLLOW_HOME = prev;
+  }
+});

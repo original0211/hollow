@@ -38,6 +38,22 @@ const DEFAULTS = {
   exitRegion: null, // plan §7 reserve: read but ignored until the spec supplement lands
 };
 
+// NP-1117-19 (item 1): port validation shared by every layer that
+// turns a port into a string. validPort coerces (numeric strings are
+// fine) and returns the int or null; assertPort throws instead. A
+// malformed endpoint must never reach the registry or a PAC file —
+// the audit reproduced a PAC emitting "SOCKS5 127.0.0.1:null" out of
+// a polluted config.
+export function validPort(v) {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+}
+export function assertPort(v, name = "port") {
+  const p = validPort(v);
+  if (p === null) throw new Error(`invalid ${name}: ${JSON.stringify(v) ?? String(v)} (expected integer 1-65535)`);
+  return p;
+}
+
 export function loadConfig() {
   const dir = configDir();
   fs.mkdirSync(dir, { recursive: true });
@@ -45,6 +61,13 @@ export function loadConfig() {
   let cfg = { ...DEFAULTS };
   if (fs.existsSync(file)) {
     try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(file, "utf8")) }; } catch { /* keep defaults */ }
+  }
+  // NP-1117-19 (item 1): coerce the port fields at the source — a
+  // polluted config.json (null / string / out of range) falls back to
+  // the defaults instead of propagating into PAC/registry strings.
+  for (const k of ["socksPort", "pacPort"]) {
+    const p = validPort(cfg[k]);
+    cfg[k] = p === null ? DEFAULTS[k] : p;
   }
   return cfg;
 }

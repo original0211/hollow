@@ -91,3 +91,64 @@ test("PAC server: serves on loopback with the PAC content type, 404 elsewhere", 
     assert.equal(other.status, 404);
   } finally { await srv.close(); }
 });
+
+// ---- NP-1117-19: PAC hardening (port validation, isInNet guard, provider) ----
+import { makePacProvider, DIRECT_ONLY_PAC } from "../src/pac.js";
+
+test("port validation (NP-1117-19 a): buildPac throws on polluted ports, coerces numeric strings", () => {
+  for (const bad of [null, undefined, "abc", "", 0, -1, 65536, 1.5, NaN]) {
+    assert.throws(() => buildPac({ socksPort: bad }), /invalid socksPort/, `port ${String(bad)}`);
+  }
+  const pac = buildPac({ socksPort: "1081" });
+  assert.match(pac, /SOCKS5 127\.0\.0\.1:1081/);
+  assert.ok(!/null|undefined/.test(pac.split("\n").filter((l) => l.includes("SOCKS5")).join("")), "no polluted endpoint string");
+});
+
+test("isInNet literal guard (NP-1117-19 c): hostnames never enter the DNS-resolving net check", () => {
+  const pac = buildPac({ socksPort: 1081, directHosts: ["example.com"] });
+  let inNetCalls = 0;
+  const find = new Function("isPlainHostName", "isInNet", "dnsDomainIs", pac + "\nreturn FindProxyForURL;")(
+    (h) => !h.includes("."),
+    (h, net, mask) => {
+      inNetCalls++;
+      const p = (s) => s.split(".").map(Number);
+      const [a, m, n] = [p(h), p(mask), p(net)];
+      return a.every((o, i) => (o & m[i]) === (n[i] & m[i]));
+    },
+    (h, d) => h.endsWith(d),
+  );
+  // Private IP literals still go DIRECT through the guarded block.
+  assert.equal(find("http://192.168.1.5/", "192.168.1.5"), "DIRECT");
+  assert.ok(inNetCalls > 0);
+  assert.equal(find("http://10.1.2.3/", "10.1.2.3"), "DIRECT");
+  // A public hostname: the net check is never consulted (no DNS-driven DIRECT).
+  inNetCalls = 0;
+  assert.equal(find("https://x.com/", "x.com"), "SOCKS5 127.0.0.1:1081");
+  assert.equal(inNetCalls, 0);
+  // A public IP literal IS checked and correctly not matched.
+  assert.equal(find("https://8.8.8.8/", "8.8.8.8"), "SOCKS5 127.0.0.1:1081");
+  assert.ok(inNetCalls > 0);
+  // The direct-list string rules are untouched (and also skip isInNet).
+  inNetCalls = 0;
+  assert.equal(find("http://foo.example.com/", "foo.example.com"), "DIRECT");
+  assert.equal(inNetCalls, 0);
+});
+
+test("pac provider (NP-1117-19 b): last-good cache, DIRECT-only without cache, never a guessed port", () => {
+  let port = 1081;
+  const logs = [];
+  const prov = makePacProvider({ getPort: () => port, getDirectHosts: () => [], log: (m) => logs.push(m) });
+  const good = prov.getPac();
+  assert.match(good, /SOCKS5 127\.0\.0\.1:1081/);
+  port = null; // bridge port unknown
+  assert.equal(prov.getPac(), good); // last good, byte-identical
+  port = "abc"; // polluted — treated as unknown, not baked into a string
+  assert.equal(prov.getPac(), good);
+  const fresh = makePacProvider({ getPort: () => null, log: (m) => logs.push(m) });
+  const direct = fresh.getPac();
+  assert.equal(direct, DIRECT_ONLY_PAC);
+  assert.ok(!direct.includes("SOCKS5"));
+  const find = new Function(direct + "\nreturn FindProxyForURL;")();
+  assert.equal(find("https://anything.example/", "anything.example"), "DIRECT");
+  assert.ok(logs.some((l) => l.includes("DIRECT-only")), "fallback is logged");
+});

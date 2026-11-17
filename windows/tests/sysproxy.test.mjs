@@ -259,3 +259,42 @@ test("mode switches while connected (NP-1117-07 d2): written form follows, origi
   assert.equal(r.restored, true);
   assert.deepEqual(reg.snapshot(), USER_STATE);
 });
+
+test("writtenFor port validation (NP-1117-19 a): invalid ports throw, valid shape unchanged", () => {
+  for (const bad of [null, undefined, "abc", 0, 65536, 1.5]) {
+    assert.throws(() => writtenFor(bad), /invalid socks port/, `port ${String(bad)}`);
+  }
+  assert.equal(writtenFor("1080").ProxyServer, "socks=127.0.0.1:1080");
+  assert.equal(writtenFor(1080).ProxyServer, "socks=127.0.0.1:1080");
+});
+
+test("switch order (NP-1117-19 d): pac->global writes the registry before the PAC endpoint closes", async () => {
+  const { applyProxyModeCore } = await import("../src/sysproxy.js");
+  const order = [];
+  const ops = {
+    enableGlobal: async () => { order.push("enableGlobal"); },
+    stopPac: async () => { order.push("stopPac"); },
+    startPac: async () => { order.push("startPac"); },
+    enablePac: async () => { order.push("enablePac"); },
+    teardown: async () => { order.push("teardown"); },
+  };
+  await applyProxyModeCore("global", ops);
+  assert.deepEqual(order, ["enableGlobal", "stopPac"]);
+  order.length = 0;
+  await applyProxyModeCore("pac", ops);
+  assert.deepEqual(order, ["startPac", "enablePac"]);
+  order.length = 0;
+  await applyProxyModeCore("off", ops);
+  assert.deepEqual(order, ["teardown"]);
+});
+
+test("verifyAgainst (NP-1117-19 e mechanism): an external change is detected by key", async () => {
+  const { reg, sp } = setup({});
+  await sp.enableGlobal(1080);
+  const okv = await sp.verifyAgainst(writtenFor(1080));
+  assert.equal(okv.ok, true);
+  reg.store.set("ProxyServer", "socks=127.0.0.1:9999"); // external tamper
+  const bad = await sp.verifyAgainst(writtenFor(1080));
+  assert.equal(bad.ok, false);
+  assert.deepEqual(bad.mismatches, ["ProxyServer"]);
+});

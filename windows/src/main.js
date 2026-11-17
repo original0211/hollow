@@ -14,7 +14,7 @@ import { CoreBridge } from "./core-bridge.js";
 import { loadConfig, saveConfig, loadOrCreatePsk, loadPsk, writePsk, tightenPskAcl, verifierHex, PskCorruptError, pskStatus, configDir } from "./config.js";
 import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bgraToRgba, decodeQrFromPixels, validateWorkerUrl, validateHttpPath } from "./pairing.js";
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge } from "./edges.js";
-import { buildPac, startPacServer } from "./pac.js";
+import { makePacProvider, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
 import { HelperClient } from "./helper-client.js";
 import { HelperWatch } from "./helper-watch.js";
@@ -78,6 +78,12 @@ function getBridge() {
         restoring = true;
         log("bridge entered Error terminal state — restoring system proxy");
         teardownProxy().finally(() => { restoring = false; });
+      }
+      // NP-1117-19 (item 5): piggyback runtime proxy verification on
+      // state events while the proxy is on.
+      if (ev.type === "state" && (ev.state === "connected" || ev.state === "reconnecting")
+          && proxyOn && modeFamily(cfg.proxyMode) === "sysproxy") {
+        void verifyProxyInBackground();
       }
       // Landing identification (M2-4): on each fresh Connected, read /meta
       // through the same edge selection and surface where we landed.
@@ -188,19 +194,48 @@ async function doConnect() {
 // once); global<->pac switches the written form under the held
 // snapshot (the user's original state is never touched).
 async function applyProxyMode(b) {
-  if (cfg.proxyMode === "global") {
-    await stopPac();
-    await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
-    proxyOn = true;
-    log(`system proxy enabled (global, socks=127.0.0.1:${b.socksPort || cfg.socksPort})`);
-  } else if (cfg.proxyMode === "pac") {
-    await startPac(b);
-    await sysproxy.enablePac(pacServer.url, log);
-    proxyOn = true;
-    log(`system proxy enabled (PAC, ${pacServer.url})`);
-  } else if (cfg.proxyMode === "off") {
-    await teardownProxy();
-  }
+  // NP-1117-19 (item 4): the switch ORDER lives in
+  // sysproxy.applyProxyModeCore (unit-tested) — pac->global writes
+  // the registry before the PAC endpoint closes, never the reverse.
+  await sysproxy.applyProxyModeCore(cfg.proxyMode, {
+    enableGlobal: async () => {
+      await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
+      proxyOn = true;
+      log(`system proxy enabled (global, socks=127.0.0.1:${b.socksPort || cfg.socksPort})`);
+    },
+    stopPac,
+    startPac: async () => { await startPac(b); },
+    enablePac: async () => {
+      await sysproxy.enablePac(pacServer.url, log);
+      proxyOn = true;
+      log(`system proxy enabled (PAC, ${pacServer.url})`);
+    },
+    teardown: teardownProxy,
+  });
+}
+
+// NP-1117-19 (item 5): runtime re-verification. While our proxy is
+// on, bridge state events piggyback a check of the four registry
+// values against what we wrote; an external change is logged and the
+// current mode is re-asserted (visibly, never silently). Runs only
+// on connected/reconnecting events — a disconnected bridge never
+// touches the registry here.
+let verifyingProxy = false;
+async function verifyProxyInBackground() {
+  if (verifyingProxy || process.platform !== "win32" || !bridge) return;
+  verifyingProxy = true;
+  try {
+    let expected = null;
+    if (cfg.proxyMode === "global") expected = sysproxy.writtenFor(bridge.socksPort || cfg.socksPort);
+    else if (cfg.proxyMode === "pac" && pacServer) expected = sysproxy.writtenForPac(pacServer.url);
+    if (!expected) return;
+    const v = await sysproxy.verifyAgainst(expected, log);
+    if (v && !v.ok) {
+      log(`proxy: registry changed externally (mismatch: ${v.mismatches.join(",")}) — re-asserting ${cfg.proxyMode} mode`);
+      await applyProxyMode(bridge);
+    }
+  } catch (e) { log(`proxy: runtime verification failed: ${e.message}`); }
+  finally { verifyingProxy = false; }
 }
 
 // PAC endpoint (M2-4): serves the live PAC (SOCKS port + direct list are
@@ -209,6 +244,7 @@ async function applyProxyMode(b) {
 // would be a weak fingerprint for the proxy self-heal judgement; the random
 // segment makes our written AutoConfigURL installation-specific.
 let pacServer = null;
+let pacProvider = null;
 function ensurePacSeg() {
   if (!cfg.pacSeg) {
     cfg = { ...cfg, pacSeg: crypto.randomBytes(8).toString("hex") };
@@ -218,11 +254,20 @@ function ensurePacSeg() {
 }
 async function startPac(b) {
   if (pacServer) return pacServer;
+  // NP-1117-19 (item 2): the PAC comes from the provider — the live
+  // bridge port or the last good PAC, never a config-guessed port.
+  if (!pacProvider) {
+    pacProvider = makePacProvider({
+      getPort: () => bridge && bridge.socksPort,
+      getDirectHosts: () => cfg.directHosts || [],
+      log,
+    });
+  }
   pacServer = await startPacServer({
     preferredPort: cfg.pacPort || 18080,
     log,
     pathSeg: ensurePacSeg(),
-    getPac: () => buildPac({ socksPort: (bridge && bridge.socksPort) || cfg.socksPort, directHosts: cfg.directHosts || [] }),
+    getPac: pacProvider.getPac,
   });
   return pacServer;
 }
