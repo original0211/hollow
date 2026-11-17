@@ -1,0 +1,12 @@
+{
+  "package": "@noble/ciphers",
+  "version": "2.4.0",
+  "license": "MIT",
+  "tarballSha256": "4a398bcc280c8742d474f9162f6d3c153e52ab1078e8ab592b4720410fb3c3e9",
+  "vendoredFile": "noble-ciphers-chacha20poly1305.js",
+  "vendoredSha256": "936b595f166f0b197b63aa65772df30f47b41150427d10ba2ffb9ea25fce2fc7",
+  "exports": [
+    "chacha20poly1305"
+  ],
+  "pinnedBy": "NP-1117-04"
+}

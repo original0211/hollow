@@ -23,6 +23,9 @@ jobs:
         run: npm --prefix windows install --no-audit --no-fund
       - name: Windows skeleton syntax + vendor prep
         run: npm --prefix windows run check
+      - name: Electron runtime AEAD handshake smoke (NP-1117-04)
+        working-directory: windows
+        run: ELECTRON_RUN_AS_NODE=1 ./node_modules/.bin/electron tools/electron-aead-smoke.mjs
       - name: UI smoke — source tree (NP-1114-35 guard)
         run: xvfb-run -a npm --prefix windows run ui-smoke
       - uses: actions/setup-go@v5

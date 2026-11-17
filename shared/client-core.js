@@ -1,7 +1,7 @@
 // Hollow client session core (spec v0.1 §4, §5, §6, §7.5 client side).
 // Transport-agnostic: transport = { send(bytes), close(), onMessage, onClose }
 // carrying raw WebSocket messages (hello plaintext, then AEAD records).
-import { randomBytes, x25519Generate, x25519Derive } from "./crypto.js";
+import { randomBytes, x25519Generate, x25519Derive, AeadUnavailableError } from "./crypto.js";
 import {
   PROTO_VERSION, FT, ERR, GATE, BUCKETS,
   CONN_WINDOW_INIT, STREAM_WINDOW_INIT, MERGE_WINDOW_MS, MAX_PAYLOAD,
@@ -147,7 +147,14 @@ export class HollowClient {
   }
 
   async _onServerFinished(bytes) {
-    const opened = this.receiver.open(bytes);
+    let opened;
+    try {
+      opened = this.receiver.open(bytes);
+    } catch (e) {
+      // NP-1117-04: capability missing is not an authentication failure.
+      if (e instanceof AeadUnavailableError) { this._die("chacha20-poly1305 AEAD unavailable in this runtime"); try { this.transport.close(); } catch {} return; }
+      throw e;
+    }
     if (!opened) { this._die("server finished record undecryptable"); try { this.transport.close(); } catch {} return; }
     const parsed = parseFrames(opened.framesBlob);
     const f = parsed.frames[0];
@@ -225,7 +232,14 @@ export class HollowClient {
   }
 
   _onRecord(bytes) {
-    const opened = this.receiver.open(bytes);
+    let opened;
+    try {
+      opened = this.receiver.open(bytes);
+    } catch (e) {
+      // NP-1117-04: capability missing is not a record failure.
+      if (e instanceof AeadUnavailableError) { this._die("chacha20-poly1305 AEAD unavailable in this runtime"); try { this.transport.close(); } catch {} return; }
+      throw e;
+    }
     if (!opened) {
       if (this.receiver.consecFails >= 3) { this._die("record failure limit"); try { this.transport.close(); } catch {} }
       return;
