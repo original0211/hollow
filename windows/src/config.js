@@ -37,6 +37,8 @@ const DEFAULTS = {
   preferredEdgeIp: null, // plan §5, M2-4 (manual selection)
   exitRegion: null, // plan §7 reserve: read but ignored until the spec supplement lands
   poolSize: 4, // NP-1117-23: session pool (striping) size, 1-8
+  autoConnect: true, // NP-1118-01 (h): resume the last working configuration at startup
+  lastConnectedAt: null, // NP-1118-01 (h): set when a connection first succeeds; gates auto-connect + first-run
 };
 
 // NP-1117-19 (item 1): port validation shared by every layer that

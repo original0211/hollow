@@ -17,6 +17,7 @@ const logEl = $("log");
 let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "", liveCarriers: 0, poolSize: 0, slotEdges: {}, edgeCandidateRtts: {}, edgeIp: null, traffic: { up: 0, down: 0 } };
 let trafficRates = { upRate: 0, downRate: 0 };
 let landingInfo = null;
+let firstRunMode = false;
 
 function appendLog(line) {
   logEl.textContent += line + "\n";
@@ -85,7 +86,12 @@ function render() {
   const v = stateView();
   $("state").textContent = v.label;
   $("state-dot").className = "dot" + (v.dot ? " " + v.dot : "");
-  $("detail").textContent = v.detail;
+  $("detail").textContent = firstRunMode && snapshot.state === "disconnected" ? "还没有配置——导入一份配置即可开始。" : v.detail;
+  // (i) one-click retry lives on the hero for every failure /
+  // degraded state — no trip into the settings page.
+  const degraded = snapshot.state === "reconnecting" || snapshot.state === "error"
+    || (snapshot.state === "connected" && snapshot.poolSize > 0 && snapshot.liveCarriers < snapshot.poolSize);
+  $("btn-retry").hidden = !degraded;
   // readings
   const connected = snapshot.state === "connected" || snapshot.state === "reconnecting";
   $("rate-down").textContent = connected ? fmtRate(trafficRates.downRate) : "—";
@@ -156,7 +162,7 @@ function renderBusyLine() {
 }
 
 // ---- settings: apply on change (c) ------------------------------------
-const FIELD_NOTES = { workerUrl: "note-workerUrl", proxyMode: "note-proxyMode", socksPort: "note-socksPort", directHosts: "note-directHosts", metaPath: "note-metaPath", edgesPath: "note-edgesPath", poolSize: "note-poolSize", pacPort: "note-pacPort" };
+const FIELD_NOTES = { workerUrl: "note-workerUrl", proxyMode: "note-proxyMode", socksPort: "note-socksPort", directHosts: "note-directHosts", metaPath: "note-metaPath", edgesPath: "note-edgesPath", poolSize: "note-poolSize", pacPort: "note-pacPort", autoConnect: "note-autoConnect" };
 function setNote(field, text, kind) {
   const el = $(FIELD_NOTES[field]);
   if (!el) return;
@@ -202,6 +208,7 @@ async function reconnectNow() {
   try { await window.hollow.connect(); } catch (e) { appendLog("reconnect error: " + e.message); }
   refresh();
 }
+$("btn-retry").addEventListener("click", reconnectNow);
 $("btn-reconnect").addEventListener("click", reconnectNow);
 $("btn-reconnect2").addEventListener("click", reconnectNow);
 
@@ -216,6 +223,11 @@ function setControlValue(id, value) {
 async function refresh() {
   const s = await window.hollow.getState();
   snapshot = { ...snapshot, ...s };
+  firstRunMode = !!s.firstRun;
+  $("firstrun-card").hidden = !firstRunMode;
+  $("settings-card").hidden = firstRunMode;
+  $("pairing-card").hidden = firstRunMode;
+  $("io-card").hidden = firstRunMode;
   if (Array.isArray(s.logs)) { logEl.textContent = ""; s.logs.forEach(appendLog); }
   if (s.settings) {
     setControlValue("worker-url", s.settings.workerUrl || "");
@@ -227,6 +239,7 @@ async function refresh() {
     setControlValue("pool-size", s.settings.poolSize ?? "");
     setControlValue("pac-port", s.settings.pacPort ?? "");
     $("pac-seg").textContent = s.settings.pacSeg || "（尚未生成，首次启用 PAC 时生成）";
+    $("auto-connect").checked = s.settings.autoConnect !== false;
     const tunMode = s.settings.proxyMode === "tun";
     const defRadio = $("edge-mode-default");
     if (defRadio) defRadio.disabled = tunMode;
@@ -262,6 +275,7 @@ $("meta-path").addEventListener("change", (e) => applySetting("metaPath", e.targ
 $("edges-path").addEventListener("change", (e) => applySetting("edgesPath", e.target.value, e.target));
 $("pool-size").addEventListener("change", (e) => applySetting("poolSize", Number(e.target.value), e.target));
 $("pac-port").addEventListener("change", (e) => applySetting("pacPort", Number(e.target.value), e.target));
+$("auto-connect").addEventListener("change", (e) => applySetting("autoConnect", e.target.checked, e.target));
 
 // ---- import confirmation (correction 4): preview -> explicit click ----
 function showImportConfirm(preview) {
@@ -280,12 +294,27 @@ $("btn-imp-file").addEventListener("click", async () => { stageResult(await wind
 $("btn-imp-qrfile").addEventListener("click", async () => { stageResult(await window.hollow.importFromQrFile()); });
 $("btn-imp-clip").addEventListener("click", async () => { stageResult(await window.hollow.importFromClipboard()); });
 $("btn-imp-confirm").addEventListener("click", async () => {
+  const wasFirstRun = firstRunMode;
   const r = await window.hollow.importConfirm();
   hideImportConfirm();
   $("import-result").textContent = r.ok ? "导入已应用。" : "导入失败：" + (r.error || "");
+  $("fr-import-result").textContent = r.ok ? "导入已应用，正在发起首次连接…" : "导入失败：" + (r.error || "");
   $("import-text").value = "";
+  // (j) after a first-run import, the first connection starts
+  // itself — the single step the onboarding promised.
+  if (r.ok && wasFirstRun) { try { await window.hollow.connect(); } catch (e) { appendLog("first connect error: " + e.message); } }
   refresh();
 });
+// (j) first-run import actions: the same staging pipeline, fewer
+// choices on screen.
+async function stageResultFr(r) {
+  if (r && r.ok && r.preview) { showImportConfirm(r.preview); $("fr-import-result").textContent = "已预览，等待你确认。"; }
+  else if (r && !r.ok) { $("fr-import-result").textContent = "导入未就绪：" + (r.error || "未知错误"); }
+}
+$("btn-fr-preview").addEventListener("click", async () => { stageResultFr(await window.hollow.importPreview($("fr-import-text").value)); });
+$("btn-fr-file").addEventListener("click", async () => { stageResultFr(await window.hollow.importFromFile()); });
+$("btn-fr-qrfile").addEventListener("click", async () => { stageResultFr(await window.hollow.importFromQrFile()); });
+$("btn-fr-clip").addEventListener("click", async () => { stageResultFr(await window.hollow.importFromClipboard()); });
 $("btn-imp-cancel").addEventListener("click", async () => { await window.hollow.importCancel(); hideImportConfirm(); $("import-result").textContent = "已取消导入。"; });
 window.hollow.onImport(({ preview, source }) => {
   showImportConfirm(preview);

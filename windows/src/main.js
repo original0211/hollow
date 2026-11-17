@@ -105,6 +105,14 @@ function getBridge() {
           && proxyOn && modeFamily(cfg.proxyMode) === "sysproxy") {
         void verifyProxyInBackground();
       }
+      // NP-1118-01 (h): remember that this configuration has
+      // connected successfully once — auto-connect and the
+      // first-run gate both key off it.
+      if (ev.type === "state" && ev.state === "connected" && !cfg.lastConnectedAt) {
+        cfg = { ...cfg, lastConnectedAt: Date.now() };
+        safeSave();
+        log("first successful connection recorded (auto-connect armed)");
+      }
       // Landing identification (M2-4): on each fresh Connected, read /meta
       // through the same edge selection and surface where we landed.
       if (ev.type === "state" && ev.state === "connected") {
@@ -495,6 +503,14 @@ else {
       } catch { /* ignore */ }
     }
     createWindow(); createTray();
+    // NP-1118-01 (h): resume the last working configuration once,
+    // at startup. A single attempt through the normal connect path:
+    // a terminal failure lands in the error state with its reason
+    // (and the one-click retry), never in an extra retry loop here.
+    if (cfg.autoConnect !== false && cfg.lastConnectedAt && pskStatus().state === "ok") {
+      log("auto-connect: resuming the last successful configuration");
+      void doConnect().catch((e) => log(`auto-connect failed: ${e.message}`));
+    }
     if (process.env.HOLLOW_UI_SMOKE === "1") void runUiSmoke();
     if (process.env.HOLLOW_TOUR_DIR) void runTour();
     const link = process.argv.find((a) => typeof a === "string" && a.startsWith("hollow://"));
@@ -534,7 +550,23 @@ async function runTour() {
       win.webContents.once("did-finish-load", () => { clearTimeout(to); resolve(); });
     });
     await new Promise((r) => setTimeout(r, 1200));
-    if (mode === "bad") {
+    if (mode === "firstrun") {
+      await shot("shot-firstrun.png");
+    } else if (mode === "auto") {
+      // No manual connect: the app must have auto-connected itself.
+      if (bridge) {
+        const t0 = Date.now();
+        for (;;) {
+          const snap = bridge.snapshot();
+          if (bridge.sessions.healthyCount() >= bridge.poolSize && snap.connectedSince && Date.now() - snap.connectedSince > 2000) break;
+          if (Date.now() - t0 > 45000) break;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+      await new Promise((r) => setTimeout(r, 800));
+      await shot("shot-autoconnect.png");
+      console.log(`TOUR auto state=${bridge ? bridge.state : "no-bridge"}`);
+    } else if (mode === "bad") {
       await doConnect().catch(() => {});
       const t0 = Date.now();
       while (Date.now() - t0 < 45000) { if (bridge && bridge.state === "error") break; await new Promise((r) => setTimeout(r, 250)); }
@@ -592,11 +624,12 @@ async function runUiSmoke() {
 }
 
 ipcMain.handle("hollow:getState", () => ({
+  firstRun: (cfg.workerUrl === "wss://hollow.example.workers.dev/" || cfg.workerUrl === "wss://hollow.example.workers.dev") && !cfg.lastConnectedAt,
   tun: tunStatusView({ proxyMode: cfg.proxyMode, helperAlive: !!(helperClient && helperClient.connected && helperWatch && !helperWatch.stale && helperWatch.gaps() !== null), helperStatus: helperStatusCache, graceRemainingMs: grace.graceRemainingMs() }),
   netcfgBackup: (() => { try { const r = readNetcfgBackup(configDir()); return { kind: r.kind, problems: r.problems }; } catch { return { kind: "corrupt", problems: ["read failed"] }; } })(),
   ...(bridge ? bridge.snapshot() : { state: bridgeError ? "error" : "disconnected", detail: bridgeError || "", connectedSince: null, socksPort: null, queuedNow: 0, stats: null }),
   logs: logs.slice(-80),
-  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "", poolSize: cfg.poolSize, pacPort: cfg.pacPort, pacSeg: cfg.pacSeg || "" },
+  settings: { workerUrl: cfg.workerUrl, socksPort: cfg.socksPort, proxyMode: cfg.proxyMode, configDir: configDir(), directHosts: cfg.directHosts || [], edgeMode: cfg.edgeMode || "default", preferredEdgeIp: cfg.preferredEdgeIp || null, metaPath: cfg.metaPath || "", edgesPath: cfg.edgesPath || "", poolSize: cfg.poolSize, pacPort: cfg.pacPort, pacSeg: cfg.pacSeg || "", autoConnect: cfg.autoConnect !== false, lastConnectedAt: cfg.lastConnectedAt || null },
   psk: pskStatus(),
   pskFileExists: fs.existsSync(path.join(configDir(), "psk.bin")),
 }));
@@ -659,6 +692,10 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
       if (bridge && bridge.state === "connected") needsReconnect = true; // pool size is a bridge construction parameter
     }
   }
+  if (s.autoConnect !== undefined && typeof s.autoConnect === "boolean" && s.autoConnect !== (cfg.autoConnect !== false)) {
+    cfg = { ...cfg, autoConnect: s.autoConnect };
+    log(`settings saved: autoConnect=${s.autoConnect}`);
+  }
   let pacPortChanged = false;
   if (s.pacPort !== undefined) {
     const p = validPort(s.pacPort);
@@ -703,7 +740,7 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
       log(`proxy mode change (${prevMode} -> ${cfg.proxyMode}) applies on the next connect`);
     }
   }
-  return { ok: Object.keys(errors).length === 0, errors, needsReconnect, workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts, socksPort: cfg.socksPort, poolSize: cfg.poolSize, pacPort: cfg.pacPort };
+  return { ok: Object.keys(errors).length === 0, errors, needsReconnect, workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts, socksPort: cfg.socksPort, poolSize: cfg.poolSize, pacPort: cfg.pacPort, autoConnect: cfg.autoConnect !== false };
 });
 
 // ---- Edge-IP selection (M2-4) ----

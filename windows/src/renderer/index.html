@@ -40,6 +40,20 @@
     <div class="sub" id="day-stats"></div>
     <div class="sub" id="tun-status"></div>
     <button class="primary big" id="btn-toggle">连接</button>
+    <button id="btn-retry" hidden>一键重试</button>
+  </section>
+
+  <!-- (j) First run: one import action, nothing else. -->
+  <section class="card" id="firstrun-card" hidden>
+    <h2>开始使用</h2>
+    <div class="sub">还没有配置。导入一份配置（hollow:// 链接、.hollow.json 文件或二维码）即可连接，不需要先填任何设置。</div>
+    <label for="fr-import-text">粘贴 hollow:// 链接或配置 JSON</label>
+    <textarea id="fr-import-text" rows="3" spellcheck="false"></textarea>
+    <button class="primary" id="btn-fr-preview">导入并预览</button>
+    <button id="btn-fr-file">选择 .hollow.json 文件</button>
+    <button id="btn-fr-qrfile">从二维码图片导入</button>
+    <button id="btn-fr-clip">从剪贴板图片导入</button>
+    <div class="sub" id="fr-import-result"></div>
   </section>
 
   <!-- (e) Human error surface: plain-language cause + next step,
@@ -54,7 +68,7 @@
     <button id="btn-reconnect">立即重连</button>
   </section>
 
-  <section class="card">
+  <section class="card" id="pairing-card">
     <h2>配对</h2>
     <div class="sub" id="psk-status"></div>
     <div>服务端配对 V（写入 Worker secret <span class="mono">PSK_V_HEX</span>）</div>
@@ -66,7 +80,7 @@
 
   <!-- (b)+(c) Settings: user fields up front, protocol internals in
        the advanced fold; every field applies on change. -->
-  <section class="card">
+  <section class="card" id="settings-card">
     <h2>设置</h2>
     <label for="worker-url">Worker 地址</label>
     <input type="text" id="worker-url" spellcheck="false">
@@ -80,6 +94,9 @@
       <option value="tun" disabled>TUN 模式（尚未启用：助手拉起不在当前版本）</option>
     </select>
     <div class="field-note" id="note-proxyMode"></div>
+
+    <label><input type="checkbox" id="auto-connect"> 启动时自动连接（仅限上次成功连接过的配置）</label>
+    <div class="field-note" id="note-autoConnect"></div>
 
     <label for="socks-port">SOCKS 端口</label>
     <input type="number" id="socks-port" min="1" max="65535">
@@ -125,7 +142,7 @@
     </div>
   </section>
 
-  <section class="card">
+  <section class="card" id="io-card">
     <h2>导入 / 导出</h2>
     <label for="import-text">粘贴 hollow:// 链接或配置 JSON（先预览、确认后才落盘）</label>
     <textarea id="import-text" rows="3" spellcheck="false"></textarea>

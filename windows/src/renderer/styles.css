@@ -88,3 +88,4 @@ details.drawer pre { margin-top: var(--sp-2); }
 #tun-status { display: none; }
 #edge-default-note { display: none; }
 #error-card[hidden] { display: none; }
+[hidden] { display: none !important; }
