@@ -52,7 +52,10 @@ async function refresh() {
   if (Array.isArray(s.logs)) { logEl.textContent = ""; s.logs.forEach(appendLog); }
   if (s.settings) {
     $("worker-url").value = s.settings.workerUrl || "";
-    $("proxy-mode").value = s.settings.proxyMode || "off";
+    // NP-1117-07 (d2): never bounce an unsaved mode selection back to
+    // the saved value on refresh — keep the user's pick and show the
+    // unsaved badge until they save.
+    if (!modeDirty) $("proxy-mode").value = s.settings.proxyMode || "off";
     $("direct-hosts").value = (s.settings.directHosts || []).join("\n");
     $("meta-path").value = s.settings.metaPath || "";
     const tunMode = s.settings.proxyMode === "tun";
@@ -130,6 +133,12 @@ $("btn-qr").addEventListener("click", async () => {
 // ---- connection & settings ----
 $("btn-connect").addEventListener("click", async () => { try { await window.hollow.connect(); } catch (e) { appendLog("connect error: " + e.message); } refresh(); });
 $("btn-disconnect").addEventListener("click", async () => { try { await window.hollow.disconnect(); } catch (e) { appendLog("disconnect error: " + e.message); } refresh(); });
+// NP-1117-07 (d2): unsaved-mode tracking (see refresh()).
+let modeDirty = false;
+$("proxy-mode").addEventListener("change", () => {
+  modeDirty = true;
+  $("proxy-mode-unsaved").style.display = "inline";
+});
 $("btn-save").addEventListener("click", async () => {
   const r = await window.hollow.saveSettings({
     workerUrl: $("worker-url").value.trim(),
@@ -139,6 +148,9 @@ $("btn-save").addEventListener("click", async () => {
     edgesPath: $("edges-path").value,
   });
   appendLog("settings saved: " + r.workerUrl + " / proxy " + r.proxyMode);
+  modeDirty = false;
+  $("proxy-mode-unsaved").style.display = "none";
+  refresh();
 });
 // ---- edge selection (M2-4) ----
 let edgeState = { edges: [], results: {}, edgeMode: "default", preferredEdgeIp: null };

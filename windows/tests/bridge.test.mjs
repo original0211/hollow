@@ -185,3 +185,37 @@ test("SOCKS: occupied port increments; traffic flows; stop closes the port", asy
   await b.disconnect();
   dummy.close();
 });
+
+test("edge ip fallback (NP-1117-07 d3): 3 consecutive failures -> domain fallback, dead IP not retried", async () => {
+  const logs = [];
+  let calls = 0;
+  const b = mkBridge({
+    edgeIp: "203.0.113.7",
+    log: (m) => logs.push(m),
+    makeTransport: async () => { calls++; throw new Error("dial tcp 203.0.113.7:443: connect: connection refused"); },
+  });
+  await b.connect();
+  await waitFor(() => b.edgeIp === null);
+  assert.ok(calls >= 3, `fallback only at the threshold (calls=${calls})`);
+  assert.ok(logs.some((m) => m.includes("edge ip unreachable, fell back to domain")), "fallback must be logged with the agreed line");
+  const callsAtFallback = calls;
+  await new Promise((r) => setTimeout(r, 350));
+  assert.equal(b.edgeIp, null); // the dead IP stays dropped for the session
+  assert.ok(calls > callsAtFallback, "the loop keeps retrying on the domain route");
+  await b.disconnect();
+});
+
+test("edge ip fallback (NP-1117-07 d3): bearer lock is exempt", async () => {
+  const logs = [];
+  const b = mkBridge({
+    edgeIp: "203.0.113.7",
+    log: (m) => logs.push(m),
+    makeTransport: async () => { throw new Error("dial tcp 203.0.113.7:443: connect: connection refused"); },
+  });
+  b.setBearerLock(["203.0.113.7"]);
+  await b.connect();
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal(b.edgeIp, "203.0.113.7"); // untouched under a lock
+  assert.ok(!logs.some((m) => m.includes("fell back to domain")));
+  await b.disconnect();
+});

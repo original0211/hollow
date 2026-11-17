@@ -12,6 +12,9 @@ import { startSocks } from "../vendor/cli/src/socks.js";
 
 const AUTH_FATAL = /undecryptable|server hello rejected|finished|verifier/i;
 export const ROTATION_MS = 15 * 60 * 1000; // spec §5.6
+// NP-1117-07 (d3): consecutive carrier failures against a pinned edge IP
+// before the session falls back to default (domain) resolution.
+export const EDGE_FALLBACK_THRESHOLD = 3;
 
 export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.random) {
   // spec §8.4 as implemented by the CLI: 1s doubling to a 60s cap, ±25% jitter.
@@ -152,6 +155,20 @@ export class CoreBridge {
       }
       if (!this._want) break;
       this.failures++;
+      // NP-1117-07 (d3): a pinned edge IP that keeps failing is worse
+      // than the default route (some networks refuse direct dials to
+      // candidate IPs entirely — the carrier then never comes up and
+      // every SOCKS request is refused). After the threshold, fall
+      // back to domain resolution for the rest of the session and say
+      // so; the dead IP is not retried. TUN bearer <redacted> are exempt:
+      // under a lock the dial set is a routing-safety matter, not a
+      // preference.
+      if (this.failures >= EDGE_FALLBACK_THRESHOLD && this.bearerLock === null
+          && this.edgeIp && this._edgeDeadIp !== this.edgeIp) {
+        this._edgeDeadIp = this.edgeIp;
+        this.edgeIp = null;
+        this.log(`edge ip unreachable, fell back to domain (was ${this._edgeDeadIp})`);
+      }
       const delay = backoffDelay(this.failures, this.backoffBaseMs, this.backoffCapMs);
       this._setState("reconnecting", `attempt ${this.failures}, next in ${delay}ms`);
       await new Promise((res) => { this._wake = res; setTimeout(res, delay).unref?.(); });

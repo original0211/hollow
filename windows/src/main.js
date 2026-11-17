@@ -145,7 +145,16 @@ async function doConnect() {
     try {
       await enableTun(b);
     } catch (e) {
-      log(`TUN enable failed: ${e.message} — not connecting (no silent fallback to a bare SOCKS)`);
+      if (e && e.code === "TUN_HELPER_DOWN") {
+        // NP-1117-07 (d4): honest surface — the helper is not running,
+        // so TUN is not actually available yet; the UI must say so
+        // instead of failing in one log line. (Auto-launching the
+        // helper is a separate project, deliberately not this fix.)
+        log(`TUN enable failed: ${e.message}`);
+        b._setState("error", "TUN 助手未运行，本模式尚未启用");
+      } else {
+        log(`TUN enable failed: ${e.message} — not connecting (no silent fallback to a bare SOCKS)`);
+      }
       return;
     }
     await b.connect();
@@ -164,20 +173,33 @@ async function doConnect() {
     // a dead carrier would blackhole the user's browsing.
     const ok = await waitConnected(b);
     if (ok) {
-      try {
-        if (cfg.proxyMode === "global") {
-          await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
-          log(`system proxy enabled (global, 127.0.0.1:${b.socksPort || cfg.socksPort})`);
-        } else {
-          await startPac(b);
-          await sysproxy.enablePac(pacServer.url, log);
-          log(`system proxy enabled (PAC, ${pacServer.url})`);
-        }
-        proxyOn = true;
-      } catch (e) { log(`system proxy enable failed: ${e.message}`); }
+      try { await applyProxyMode(b); }
+      catch (e) { log(`system proxy enable failed: ${e.message}`); }
     } else {
       log("system proxy NOT enabled: carrier did not reach Connected");
     }
+  }
+}
+
+// Apply the saved sysproxy-family mode against a live bridge
+// (NP-1117-07 d2): one path for connect time AND for a settings save
+// while connected, so a mode change takes effect immediately instead
+// of at the next connect. "off" tears down (registry restored at
+// once); global<->pac switches the written form under the held
+// snapshot (the user's original state is never touched).
+async function applyProxyMode(b) {
+  if (cfg.proxyMode === "global") {
+    await stopPac();
+    await sysproxy.enableGlobal(b.socksPort || cfg.socksPort, log);
+    proxyOn = true;
+    log(`system proxy enabled (global, socks=127.0.0.1:${b.socksPort || cfg.socksPort})`);
+  } else if (cfg.proxyMode === "pac") {
+    await startPac(b);
+    await sysproxy.enablePac(pacServer.url, log);
+    proxyOn = true;
+    log(`system proxy enabled (PAC, ${pacServer.url})`);
+  } else if (cfg.proxyMode === "off") {
+    await teardownProxy();
   }
 }
 
@@ -283,7 +305,15 @@ async function resolveWorkerIps() {
 }
 async function enableTun(b) {
   const h = getHelper();
-  await h.connect();
+  try {
+    await h.connect();
+  } catch (e) {
+    // NP-1117-07 (d4): distinguish "helper not running" (pipe refuses)
+    // from plan refusals — the caller surfaces it as a named state.
+    const err = new Error(`helper pipe unreachable: ${e.message}`);
+    err.code = "TUN_HELPER_DOWN";
+    throw err;
+  }
   const plan = planTunEnable({
     edgeMode: cfg.edgeMode || "default",
     preferredEdgeIp: cfg.preferredEdgeIp || null,
@@ -444,6 +474,7 @@ ipcMain.handle("hollow:getState", () => ({
 ipcMain.handle("hollow:connect", async () => { await doConnect(); return bridge.snapshot(); });
 ipcMain.handle("hollow:disconnect", async () => { await doDisconnect(); return bridge ? bridge.snapshot() : { state: "disconnected" }; });
 ipcMain.handle("hollow:saveSettings", async (_e, s) => {
+  const prevMode = cfg.proxyMode;
   if (typeof s.workerUrl === "string" && s.workerUrl !== cfg.workerUrl) {
     // Same validation as the import path (NP-1114-12): wss only, ws only for
     // localhost — the settings page must not be a laxer door than pairing.
@@ -474,6 +505,19 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
   safeSave();
   // Apply on the next connect: drop a non-connected bridge so it rebuilds.
   if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
+  // NP-1117-07 (d2): a saved mode change applies NOW when connected —
+  // the sysproxy branch re-runs against the live bridge (switching to
+  // "off" restores the registry immediately). Transitions involving
+  // TUN keep their connect-time sequencing (the bearer <redacted> must
+  // precede the dial), so they apply on the next connect and say so.
+  if (cfg.proxyMode !== prevMode && bridge && bridge.state === "connected" && process.platform === "win32") {
+    if (modeFamily(cfg.proxyMode) === "sysproxy" && modeFamily(prevMode) === "sysproxy") {
+      try { await applyProxyMode(bridge); }
+      catch (e) { log(`system proxy mode apply failed: ${e.message}`); }
+    } else {
+      log(`proxy mode change (${prevMode} -> ${cfg.proxyMode}) involves TUN — applies on the next connect`);
+    }
+  }
   return { workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts };
 });
 

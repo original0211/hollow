@@ -237,3 +237,25 @@ test("mode switch mid-session: held backup follows the new written form, origina
   assert.equal(r.restored, true);
   assert.deepEqual(reg.snapshot(), USER_STATE);
 });
+
+test("mode switches while connected (NP-1117-07 d2): written form follows, original never moves, off restores verbatim", async () => {
+  const { reg, sp, backupFile } = setup({ ...USER_STATE });
+  const pacUrl = "http://127.0.0.1:18080/f00ba12c/proxy.pac";
+  await sp.enableGlobal(1080);
+  assert.deepEqual(reg.snapshot(), writtenFor(1080));
+  // global -> pac (what applyProxyMode does on a live save): the held
+  // backup's original must stay the user's state throughout.
+  await sp.enablePac(pacUrl);
+  assert.deepEqual(reg.snapshot(), writtenForPac(pacUrl));
+  let backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
+  assert.deepEqual(backup.original, USER_STATE);
+  // pac -> global again
+  await sp.enableGlobal(1080);
+  assert.deepEqual(reg.snapshot(), writtenFor(1080));
+  backup = JSON.parse(fs.readFileSync(backupFile, "utf8"));
+  assert.deepEqual(backup.original, USER_STATE);
+  // -> off: immediate teardown restores the user's state verbatim
+  const r = await sp.restore();
+  assert.equal(r.restored, true);
+  assert.deepEqual(reg.snapshot(), USER_STATE);
+});
