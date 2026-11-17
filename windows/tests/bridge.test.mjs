@@ -618,6 +618,8 @@ test("dispersion: a fresh measurement clears demotions — the candidate rises a
   assert.equal(bridge._edgeDisfavored.size, 0);
   bridge.sessions.pick().close(); // kill the live carrier; the slot rebuilds
   await waitFor(() => bridge.snapshot().slotEdges[0] === "10.0.0.1");
-  assert.equal(bridge.sessions.healthyCount(), 1);
+  // slotEdges registers at pick time; the new carrier may still be
+  // handshaking — wait for health instead of racing it (NP-1117-28).
+  await waitFor(() => bridge.sessions.healthyCount() === 1);
   await bridge.disconnect();
 });
