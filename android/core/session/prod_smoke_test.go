@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -161,5 +162,112 @@ func TestProductionEdgeSmoke(t *testing.T) {
 	t.Logf("meta: %v", meta)
 	if meta["colo"] == nil && meta["country"] == nil {
 		t.Fatalf("meta payload lacks colo/country: %v", meta)
+	}
+}
+
+// Lookup-dead production smoke (NP-1118-11): the dial override
+// refuses every TCP dial addressed by hostname — any code path
+// that still depends on name resolution fails loudly — and
+// rejects UDP (the sandbox proxy cannot carry it, so the
+// bootstrap resolver keeps its seed, exactly the fail-open
+// contract). The pool must still establish on bootstrap pins,
+// rank edges, and answer /meta, all against production.
+func TestProductionLookupDeadSmoke(t *testing.T) {
+	if os.Getenv("HOLLOW_PROD_SMOKE") != "1" {
+		t.Skip("env-gated production smoke")
+	}
+	cfgPath := os.Getenv("HOLLOW_SMOKE_CONFIG")
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cc struct {
+		WorkerURL string `json:"workerUrl"`
+		PSKBase64 string `json:"pskBase64"`
+		KeyID     int    `json:"keyId"`
+		MetaPath  string `json:"metaPath"`
+		EdgesPath string `json:"edgesPath"`
+	}
+	if err := json.Unmarshal(raw, &cc); err != nil {
+		t.Fatal(err)
+	}
+	psk, err := base64.StdEncoding.DecodeString(cc.PSKBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := os.Getenv("HTTPS_PROXY")
+	if proxy == "" {
+		proxy = os.Getenv("https_proxy")
+	}
+	connect, err := connectDialer(proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var nameDials []string
+	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network != "tcp" && network != "tcp4" {
+			return nil, fmt.Errorf("smoke: %s dials unsupported (proxy is TCP-only)", network)
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if net.ParseIP(host) == nil {
+			mu.Lock()
+			nameDials = append(nameDials, addr)
+			mu.Unlock()
+			return nil, fmt.Errorf("smoke: name-based dial refused: %s", addr)
+		}
+		return connect(ctx, network, addr)
+	}
+	u, _ := url.Parse(cc.WorkerURL)
+	s := &Session{
+		cfg: Config{
+			WSURL: cc.WorkerURL, PSK: psk, KeyID: cc.KeyID,
+			MetaPath: cc.MetaPath, HostBase: "https://" + u.Host, EdgesPath: cc.EdgesPath,
+			PoolSize: 4,
+		},
+		counters:     &byteCounters{},
+		stopCh:       make(chan struct{}),
+		tunFD:        -1,
+		state:        "connecting",
+		dialOverride: dialFn,
+	}
+	// The persisted last-known-good set from a previous session:
+	// one anycast address of the entry hostname.
+	s.bootstrapIPs = []string{"104.16.85.20"}
+	s.initLines()
+	startWatchdogs(s)
+	establishAll(t, s)
+	defer s.Stop()
+	st := s.State()
+	t.Logf("lookup-dead baseline: live=%d/%d slotEdges=%v", st.LiveCarriers, st.PoolSize, st.SlotEdges)
+	if st.LiveCarriers < 2 {
+		t.Fatalf("live = %d with lookup dead, want >= 2", st.LiveCarriers)
+	}
+	// Edges cycle: fetch (pinned), re-resolve (UDP refused -> seed
+	// kept), probes (pinned).
+	s.refreshEdges()
+	st = s.State()
+	t.Logf("after edges cycle: candidates=%v slotEdges=%v", st.EdgeCandidates, st.SlotEdges)
+	if len(st.EdgeCandidates) == 0 {
+		t.Fatal("no ranked candidates under lookup-dead conditions")
+	}
+	for _, l := range s.lineages() {
+		_ = l.rotateCarrier(context.Background())
+	}
+	// /meta through the best entry.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	meta, err := s.FetchMeta(ctx)
+	if err != nil {
+		t.Fatalf("FetchMeta under lookup-dead: %v", err)
+	}
+	t.Logf("meta: %v", meta)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(nameDials) > 0 {
+		t.Fatalf("name-based dials slipped through: %v", nameDials)
 	}
 }

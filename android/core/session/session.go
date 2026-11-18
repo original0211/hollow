@@ -29,13 +29,18 @@ import (
 // Config is the session configuration (pairing-supplied; M3-3 fills it
 // from the hollow:// payload, M3-2 defines the shape).
 type Config struct {
-	WSURL    string `json:"wsUrl"`    // full wss URL of the Worker endpoint
-	PSK      []byte `json:"-"`        // raw PSK bytes (never serialized here)
-	KeyID    int    `json:"keyId"`    // default 1
-	MetaPath string `json:"metaPath"` // random-segment /meta path (may be empty)
-	HostBase string `json:"hostBase"` // https base for /meta (may be empty)
+	WSURL     string `json:"wsUrl"`     // full wss URL of the Worker endpoint
+	PSK       []byte `json:"-"`         // raw PSK bytes (never serialized here)
+	KeyID     int    `json:"keyId"`     // default 1
+	MetaPath  string `json:"metaPath"`  // random-segment /meta path (may be empty)
+	HostBase  string `json:"hostBase"`  // https base for /meta (may be empty)
 	EdgesPath string `json:"edgesPath"` // random-segment /edges.json path (may be empty)
-	PoolSize int    `json:"poolSize"` // carriers in the pool; 0 = default, clamped 1-8
+	// BootstrapIPs seeds the entry hostname's last-known-good
+	// address set (persisted by the facade); OnBootstrapIPs is
+	// called when a fresh resolution changes the set (NP-1118-11).
+	BootstrapIPs   []string
+	OnBootstrapIPs func([]string)
+	PoolSize       int `json:"poolSize"` // carriers in the pool; 0 = default, clamped 1-8
 }
 
 // DefaultPoolSize mirrors the JS pool default (NP-1117-23).
@@ -87,7 +92,7 @@ type lineage struct {
 	client   *core.HollowClient
 	deathCh  chan struct{} // carrier deaths (buffered 1)
 	rotateCh chan struct{} // rotation requests (buffered 1)
-	rotateMu sync.Mutex     // serializes this lineage's rotations
+	rotateMu sync.Mutex    // serializes this lineage's rotations
 	drains   map[*core.HollowClient]struct{}
 	carriers int           // carriers established over this lineage's life
 	lastRTT  time.Duration // handshake RTT of the current carrier
@@ -426,6 +431,7 @@ type Session struct {
 	rotateEvery time.Duration // timed rotation interval (0 = 15 min)
 
 	// Entry dispersion (NP-1118-09, edges.go), guarded by mu.
+	bootstrapIPs   []string // entry hostname's resolved set (NP-1118-11), guarded by mu
 	edgeCandidates []EdgeCandidate
 	edgeFailCounts map[string]int
 	edgeDisfavored map[string]bool
@@ -640,6 +646,14 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 		cfg.KeyID = 1
 	}
 	s := &Session{cfg: cfg, protector: protector, stopCh: make(chan struct{}), tunFD: tunFD, state: "connecting", counters: &byteCounters{}}
+	// Bootstrap resolution (NP-1118-11): seed from the persisted
+	// last-known-good set, then refresh it over the protected
+	// dialer — protect()ed sockets bypass the TUN, so this works
+	// in the connected state where the system resolver answers
+	// the entry name with a definitive negative. Fail-open: an
+	// empty set degrades to plain domain dialing, as before.
+	s.bootstrapIPs = append([]string(nil), cfg.BootstrapIPs...)
+	s.refreshBootstrap(context.Background())
 	s.initLines()
 
 	ep, err := fdbased.New(&fdbased.Options{FDs: []int{tunFD}, MTU: 1280})

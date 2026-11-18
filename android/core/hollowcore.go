@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"hollow/androidcore/core"
+	"hollow/androidcore/pairing"
 	"hollow/androidcore/pump"
 	"hollow/androidcore/session"
 )
@@ -35,12 +36,12 @@ func Echo(s string) string {
 //
 //	{"wsUrl":"wss://…","pskHex":"…","keyId":1,"metaPath":"/…","hostBase":"https://…"}
 type configJSON struct {
-	WSURL    string `json:"wsUrl"`
-	PSKHex   string `json:"pskHex"`
-	KeyID    int    `json:"keyId"`
-	MetaPath string `json:"metaPath"`
-	HostBase string `json:"hostBase"`
-	PoolSize int    `json:"poolSize"`
+	WSURL     string `json:"wsUrl"`
+	PSKHex    string `json:"pskHex"`
+	KeyID     int    `json:"keyId"`
+	MetaPath  string `json:"metaPath"`
+	HostBase  string `json:"hostBase"`
+	PoolSize  int    `json:"poolSize"`
 	EdgesPath string `json:"edgesPath"`
 }
 
@@ -80,13 +81,15 @@ func StartVPN(cfgJSONText string, tunFD int, protector Protector) error {
 		return errors.New("hollowcore: session already running")
 	}
 	s, err := session.Start(session.Config{
-		WSURL:    cj.WSURL,
-		PSK:      psk,
-		KeyID:    cj.KeyID,
-		MetaPath: cj.MetaPath,
-		HostBase: cj.HostBase,
-		PoolSize: cj.PoolSize,
-		EdgesPath: cj.EdgesPath,
+		WSURL:          cj.WSURL,
+		PSK:            psk,
+		KeyID:          cj.KeyID,
+		MetaPath:       cj.MetaPath,
+		HostBase:       cj.HostBase,
+		PoolSize:       cj.PoolSize,
+		EdgesPath:      cj.EdgesPath,
+		BootstrapIPs:   pairing.LoadBootstrapIPs(pairingDir),
+		OnBootstrapIPs: func(ips []string) { _ = pairing.SaveBootstrapIPs(pairingDir, ips) },
 	}, tunFD, protector)
 	if err != nil {
 		lastStartError = err.Error()
@@ -191,21 +194,21 @@ func VPNStateJSON() string {
 		configured, wsURL, keyID = sc.PSKEnc != "", sc.WSURL, sc.KeyID
 	}
 	out, _ := json.Marshal(struct {
-		State        string     `json:"state"`
-		Detail       string     `json:"detail"`
-		SinceMs      int64      `json:"sinceMs"`
-		Carriers     int        `json:"carriers"`
-		StreamsOK    int        `json:"streams"`
-		Stats        pump.Stats `json:"stats"`
-		Configured   bool       `json:"configured"`
-		WSURL        string     `json:"wsUrl"`
-		KeyID        int        `json:"keyId"`
-		TrafficUp    int64      `json:"trafficUp"`
-		TrafficDown  int64      `json:"trafficDown"`
-		CarrierRTTMs int64      `json:"carrierRttMs"`
-		LiveCarriers int                   `json:"liveCarriers"`
-		PoolSize     int                   `json:"poolSize"`
-		SlotEdges    []string              `json:"slotEdges"`
+		State          string                  `json:"state"`
+		Detail         string                  `json:"detail"`
+		SinceMs        int64                   `json:"sinceMs"`
+		Carriers       int                     `json:"carriers"`
+		StreamsOK      int                     `json:"streams"`
+		Stats          pump.Stats              `json:"stats"`
+		Configured     bool                    `json:"configured"`
+		WSURL          string                  `json:"wsUrl"`
+		KeyID          int                     `json:"keyId"`
+		TrafficUp      int64                   `json:"trafficUp"`
+		TrafficDown    int64                   `json:"trafficDown"`
+		CarrierRTTMs   int64                   `json:"carrierRttMs"`
+		LiveCarriers   int                     `json:"liveCarriers"`
+		PoolSize       int                     `json:"poolSize"`
+		SlotEdges      []string                `json:"slotEdges"`
 		EdgeCandidates []session.EdgeCandidate `json:"edgeCandidates"`
 	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize, snap.SlotEdges, snap.EdgeCandidates})
 	return string(out)

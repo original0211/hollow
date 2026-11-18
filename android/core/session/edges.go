@@ -92,7 +92,7 @@ func (s *Session) fetchEdgesList(ctx context.Context) []string {
 	if s.cfg.HostBase == "" || s.cfg.EdgesPath == "" {
 		return builtinEdges
 	}
-	tr := &http.Transport{DialContext: s.dialContext()}
+	tr := &http.Transport{DialContext: pinDial(s.dialContext(), s.bestDialIP())}
 	hc := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.HostBase+s.cfg.EdgesPath, nil)
 	if err != nil {
@@ -202,13 +202,13 @@ func (s *Session) refreshEdges() {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
+	s.refreshBootstrap(ctx)
 	list := s.fetchEdgesList(ctx)
 	ranked := s.measureEdges(ctx, list)
 	if len(ranked) > 0 {
 		s.setEdgeCandidates(ranked)
 	}
 }
-
 
 // pickSlotEdge returns the pinned candidate IP for a lineage ("" =
 // dial by domain), reserving the pin at pick time so concurrent
@@ -219,6 +219,17 @@ func (s *Session) pickSlotEdge(slot int) string {
 	defer s.mu.Unlock()
 	list := s.edgeCandidates
 	if len(list) == 0 {
+		// No ranked candidates yet: the bootstrap set (the entry
+		// hostname's own resolved addresses, NP-1118-11) pins the
+		// slot, wrapping around the set.
+		if len(s.bootstrapIPs) > 0 {
+			ip := s.bootstrapIPs[slot%len(s.bootstrapIPs)]
+			if s.slotEdges == nil {
+				s.slotEdges = map[int]string{}
+			}
+			s.slotEdges[slot] = ip
+			return ip
+		}
 		return ""
 	}
 	// A slot past the end of the list has no primary: it dials by
