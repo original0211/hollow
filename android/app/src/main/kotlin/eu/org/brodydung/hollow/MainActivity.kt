@@ -56,6 +56,11 @@ class MainActivity : Activity() {
     private val poll = object : Runnable {
         override fun run() {
             renderState()
+            // The advanced panel used to render only at expand time,
+            // so its counters froze at whatever the session looked
+            // like in its first seconds — field readings quoted
+            // stale zeros as live values (NP-1118-11 evidence note).
+            if (advancedBody.visibility == View.VISIBLE) renderAdvanced()
             handler.postDelayed(this, 1000)
         }
     }
