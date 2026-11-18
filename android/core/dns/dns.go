@@ -47,7 +47,15 @@ type pending struct {
 // Resolver multiplexes DNS exchanges over one persistent connection.
 type Resolver struct {
 	dialers []DialFunc // upstreams in preference order (NP-1118-14)
-	timeout time.Duration
+	timeout time.Duration // base timeout (ctor); the adaptive floor
+
+	// Adaptive budget (NP-1118-19): exchange budgets scale with
+	// the measured path RTT — an external hint (the session's
+	// carrier handshake RTT) and/or the resolver's own EWMA of
+	// successful exchange durations, whichever is larger. Set
+	// once at construction via SetRTTHint.
+	hintFn func() (int64, bool)
+	ewmaMs atomic.Int64
 
 	mu      sync.Mutex
 	conn    net.Conn
@@ -105,16 +113,30 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		atomic.AddUint64(&r.servfail, 1)
 		return servfailFor(query)
 	}
-	// One attempt per upstream at most; the per-query timeout is a
-	// single budget across attempts. A transport failure (dial —
-	// handled inside register — write error, or connection death)
-	// retries on the next upstream; only a timeout SERVFAILs
-	// immediately, and it kills the connection so the next query
-	// does not burn its whole budget on a mute upstream.
-	timer := time.NewTimer(r.timeout)
-	defer timer.Stop()
-	for attempt := 0; ; attempt++ {
-		conn, dieCh, upID, p, err := r.register(query)
+	// Adaptive budgets (NP-1118-19): the per-attempt wait and the
+	// total budget scale with the measured path RTT. One attempt
+	// per upstream at most. A transport failure (dial — handled
+	// inside register — write error, or connection death) retries
+	// on the next upstream, and so does an attempt timeout: the
+	// timed-out connection is killed so the next attempt starts
+	// clean, but the upstream is NOT demoted — slow is not dead,
+	// and the cross-query winner keeps its ranking.
+	perAttempt, total := r.budgets()
+	deadline := time.Now().Add(total)
+	r.mu.Lock()
+	winner := r.nextTry
+	r.mu.Unlock()
+	for attempt := 0; attempt < len(r.dialers); attempt++ {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		wait := perAttempt
+		if wait > remaining {
+			wait = remaining
+		}
+		attemptStart := time.Now()
+		conn, dieCh, upID, p, err := r.registerFrom(query, (winner+attempt)%len(r.dialers), attempt == 0)
 		if err != nil {
 			break // every upstream failed at dial time
 		}
@@ -127,46 +149,124 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		copy(frame[2:], up)
 		if err := writeAll(conn, frame); err != nil {
 			r.deregister(upID, p)
-			r.killConn(conn)
-			if attempt+1 < len(r.dialers) {
-				continue
-			}
-			break
+			r.killConn(conn, true)
+			continue
 		}
+		timer := time.NewTimer(wait)
 		select {
 		case resp := <-p.resp:
+			timer.Stop()
+			r.noteExchangeDuration(time.Since(attemptStart))
 			atomic.AddUint64(&r.resolved, 1)
 			return resp
 		case <-dieCh:
+			timer.Stop()
 			r.deregister(upID, p)
-			if attempt+1 < len(r.dialers) {
-				continue
-			}
+			continue
 		case <-timer.C:
 			r.deregister(upID, p)
-			r.killConn(conn)
+			r.killConn(conn, false)
+			continue
 		}
-		break
 	}
 	atomic.AddUint64(&r.servfail, 1)
 	return servfailFor(query)
 }
 
+// SetRTTHint installs an external path-RTT source (milliseconds).
+func (r *Resolver) SetRTTHint(fn func() (int64, bool)) { r.hintFn = fn }
+
+// pathRTT is the best current estimate of the DNS path latency:
+// the larger of the external hint and the resolver's own EWMA of
+// successful exchanges (conservative — budgets err long).
+func (r *Resolver) pathRTT() time.Duration {
+	var ms int64
+	if r.hintFn != nil {
+		if h, ok := r.hintFn(); ok && h > ms {
+			ms = h
+		}
+	}
+	if e := r.ewmaMs.Load(); e > ms {
+		ms = e
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// budgets derives the per-attempt wait and the total exchange
+// budget from the path RTT (NP-1118-19). The per-attempt wait
+// never drops below the ctor base timeout; the total is clamped
+// to [8s, 20s] so a slow answer beats no answer on multi-second
+// paths, while a dead path still fails in bounded time.
+func (r *Resolver) budgets() (perAttempt, total time.Duration) {
+	rtt := r.pathRTT()
+	base := r.timeout
+	if base <= 0 {
+		base = 5 * time.Second
+	}
+	perAttempt = 2*rtt + time.Second
+	if perAttempt < base {
+		perAttempt = base
+	}
+	if perAttempt > 12*time.Second {
+		perAttempt = 12 * time.Second
+	}
+	total = 3*rtt + base
+	if total < 8*time.Second {
+		total = 8 * time.Second
+	}
+	if total > 20*time.Second {
+		total = 20 * time.Second
+	}
+	if total < perAttempt {
+		total = perAttempt
+	}
+	return perAttempt, total
+}
+
+func (r *Resolver) noteExchangeDuration(d time.Duration) {
+	ms := d.Milliseconds()
+	if ms <= 0 {
+		return
+	}
+	for {
+		cur := r.ewmaMs.Load()
+		next := ms
+		if cur > 0 {
+			next = (cur*7 + ms*3) / 10
+		}
+		if r.ewmaMs.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
 // register ensures the upstream connection and parks the query.
 func (r *Resolver) register(query []byte) (net.Conn, chan struct{}, uint16, *pending, error) {
 	r.mu.Lock()
+	start := r.nextTry
+	r.mu.Unlock()
+	return r.registerFrom(query, start, true)
+}
+
+// registerFrom is register with an explicit dial start index.
+// sticky establishments (the query's first attempt) move the
+// cross-query winner (nextTry) to the dialer that connected;
+// failover attempts inside one query do not.
+func (r *Resolver) registerFrom(query []byte, startIdx int, sticky bool) (net.Conn, chan struct{}, uint16, *pending, error) {
+	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.conn == nil {
-		// Try every upstream once, starting from the preferred
-		// index (the last winner, or the one after the last death).
+		// Try every upstream once, starting from startIdx.
 		var c net.Conn
 		var err error
 		for k := 0; k < len(r.dialers); k++ {
-			idx := (r.nextTry + k) % len(r.dialers)
+			idx := (startIdx + k) % len(r.dialers)
 			c, err = r.dialers[idx]()
 			if err == nil {
 				r.upIdx = idx
-				r.nextTry = idx // stick with the winner until it dies
+				if sticky {
+					r.nextTry = idx // stick with the winner until it dies
+				}
 				break
 			}
 		}
@@ -203,7 +303,7 @@ func (r *Resolver) deregister(upID uint16, p *pending) {
 // readLoop demultiplexes upstream answers until the connection dies;
 // death fails every in-flight query (their Exchange selects on dieCh).
 func (r *Resolver) readLoop(conn net.Conn, dieCh chan struct{}) {
-	defer r.killConn(conn)
+	defer r.killConn(conn, true)
 	hdr := make([]byte, 2)
 	for {
 		if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -236,8 +336,13 @@ func (r *Resolver) readLoop(conn net.Conn, dieCh chan struct{}) {
 }
 
 // killConn tears down the current connection (idempotent per conn) and
-// wakes all in-flight exchanges so they SERVFAIL promptly.
-func (r *Resolver) killConn(conn net.Conn) {
+// wakes all in-flight exchanges so they SERVFAIL promptly. With
+// demote set, the next establishment starts AFTER the dialer
+// whose connection died (NP-1118-14 failover advance); without
+// it — a mere timeout (NP-1118-19) — the winner keeps its place:
+// slow is not dead, and a slow-but-alive upstream must not lose
+// its ranking for answering late.
+func (r *Resolver) killConn(conn net.Conn, demote bool) {
 	r.mu.Lock()
 	if r.conn != conn {
 		r.mu.Unlock()
@@ -246,9 +351,7 @@ func (r *Resolver) killConn(conn net.Conn) {
 	r.conn = nil
 	dieCh := r.dieCh
 	r.dieCh = nil
-	// The next establishment starts AFTER the dialer whose
-	// connection just died (NP-1118-14 failover advance).
-	if len(r.dialers) > 0 {
+	if demote && len(r.dialers) > 0 {
 		r.nextTry = (r.upIdx + 1) % len(r.dialers)
 	}
 	r.mu.Unlock()
@@ -264,7 +367,7 @@ func (r *Resolver) Close() {
 	conn := r.conn
 	r.mu.Unlock()
 	if conn != nil {
-		r.killConn(conn)
+		r.killConn(conn, true)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -242,5 +243,168 @@ func TestFailoverAfterUpstreamEOF(t *testing.T) {
 	}
 	if got := r.Stats().Resolved; got != 2 {
 		t.Fatalf("resolved = %d, want 2", got)
+	}
+}
+
+// NP-1118-19: budget derivation table. base = 5s (the ctor
+// default in production); perAttempt = clamp(2·rtt+1s, base,
+// 12s); total = clamp(3·rtt+base, 8s, 20s).
+func TestBudgetsTable(t *testing.T) {
+	cases := []struct {
+		rttMs           int64
+		perAttempt, tot time.Duration
+	}{
+		{0, 5 * time.Second, 8 * time.Second},
+		{300, 5 * time.Second, 8 * time.Second},
+		{1000, 5 * time.Second, 8 * time.Second},
+		{2000, 5 * time.Second, 11 * time.Second},
+		{3000, 7 * time.Second, 14 * time.Second},
+		{4654, 10308 * time.Millisecond, 18962 * time.Millisecond},
+		{10000, 12 * time.Second, 20 * time.Second},
+	}
+	for _, c := range cases {
+		r := NewResolverMulti([]DialFunc{func() (net.Conn, error) { return nil, fmt.Errorf("x") }}, 5*time.Second)
+		r.SetRTTHint(func() (int64, bool) { return c.rttMs, true })
+		pa, tot := r.budgets()
+		if pa != c.perAttempt || tot != c.tot {
+			t.Fatalf("rtt %dms: budgets = (%v, %v), want (%v, %v)", c.rttMs, pa, tot, c.perAttempt, c.tot)
+		}
+	}
+}
+
+// NP-1118-19 high-latency grid: a 6-second answer on a path
+// whose measured RTT is 3s succeeds under the adaptive budget —
+// and fails under the pre-NP-1118-19 fixed budget (no hint),
+// proving the grid discriminates.
+func TestAdaptiveBudgetSlowUpstream(t *testing.T) {
+	slow := startUpstream(t, 6*time.Second, false)
+	defer slow.ln.Close()
+	r := NewResolverMulti([]DialFunc{dialerTo(slow.ln.Addr().String(), nil)}, 5*time.Second)
+	r.SetRTTHint(func() (int64, bool) { return 3000, true })
+	defer r.Close()
+	resp := r.Exchange(buildQuery(0x4444, "slow.example"))
+	if len(resp) < 12 || resp[3]&0x0F == 2 {
+		t.Fatalf("slow-but-alive upstream SERVFAILed under adaptive budget: %v", resp)
+	}
+	r2 := NewResolverMulti([]DialFunc{dialerTo(slow.ln.Addr().String(), nil)}, 5*time.Second)
+	defer r2.Close()
+	resp = r2.Exchange(buildQuery(0x4445, "slow.example"))
+	if len(resp) < 12 || resp[3]&0x0F != 2 {
+		t.Fatalf("control (no hint) should SERVFAIL the 6s answer, got %v", resp)
+	}
+}
+
+// NP-1118-19: an attempt timeout must not demote the winner.
+// A answers in 2s (over the ~1.2s per-attempt wait at the small
+// test budgets), B instantly: the first exchange fails over to
+// B; once A is fast, the next exchange must try A FIRST again.
+func serveDelayed(c net.Conn, delayFn func() time.Duration) {
+	defer c.Close()
+	hdr := make([]byte, 2)
+	for {
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			return
+		}
+		n := int(binary.BigEndian.Uint16(hdr))
+		msg := make([]byte, n)
+		if _, err := io.ReadFull(c, msg); err != nil {
+			return
+		}
+		if d := delayFn(); d > 0 {
+			time.Sleep(d)
+		}
+		msg[2] |= 0x80 // QR
+		out := append([]byte{byte(n >> 8), byte(n)}, msg...)
+		if _, err := c.Write(out); err != nil {
+			return
+		}
+	}
+}
+
+func TestTimeoutDoesNotDemote(t *testing.T) {
+	var aDelay atomic.Int64
+	aDelay.Store(int64(2 * time.Second))
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lnA.Close()
+	go func() {
+		for {
+			c, err := lnA.Accept()
+			if err != nil {
+				return
+			}
+			go serveDelayed(c, func() time.Duration { return time.Duration(aDelay.Load()) })
+		}
+	}()
+	lnB, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bMu sync.Mutex
+	var bConns []net.Conn
+	go func() {
+		for {
+			c, err := lnB.Accept()
+			if err != nil {
+				return
+			}
+			bMu.Lock()
+			bConns = append(bConns, c)
+			bMu.Unlock()
+			go serveDelayed(c, func() time.Duration { return 0 })
+		}
+	}()
+	defer lnB.Close()
+	var order []string
+	var mu sync.Mutex
+	mk := func(name, addr string) DialFunc {
+		return func() (net.Conn, error) {
+			mu.Lock()
+			order = append(order, name)
+			mu.Unlock()
+			return net.Dial("tcp", addr)
+		}
+	}
+	r := NewResolverMulti([]DialFunc{mk("A", lnA.Addr().String()), mk("B", lnB.Addr().String())}, 300*time.Millisecond)
+	r.SetRTTHint(func() (int64, bool) { return 100, true })
+	defer r.Close()
+	resp := r.Exchange(buildQuery(0x5555, "demote.example"))
+	if len(resp) < 12 || resp[3]&0x0F == 2 {
+		t.Fatalf("failover exchange failed: %v", resp)
+	}
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) < 2 || got[0] != "A" || got[1] != "B" {
+		t.Fatalf("dial order = %v, want [A B ...]", got)
+	}
+	// The precise claim: A's timeout left the cross-query winner
+	// pointing at A (a demote-on-timeout would have moved it to B).
+	r.mu.Lock()
+	nt := r.nextTry
+	r.mu.Unlock()
+	if nt != 0 {
+		t.Fatalf("nextTry = %d after A's timeout, want 0 (A keeps its ranking)", nt)
+	}
+	// Behavioral half: kill B's live connection; the forced
+	// re-establishment must dial A (fast now) and be answered.
+	bMu.Lock()
+	for _, c := range bConns {
+		c.Close()
+	}
+	bMu.Unlock()
+	lnB.Close()
+	aDelay.Store(0)
+	resp = r.Exchange(buildQuery(0x5556, "demote.example"))
+	if len(resp) < 12 || resp[3]&0x0F == 2 {
+		t.Fatalf("second exchange failed: %v", resp)
+	}
+	mu.Lock()
+	got = append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) != 3 || got[2] != "A" {
+		t.Fatalf("dial order after recovery = %v, want third dial to be A", got)
 	}
 }

@@ -46,6 +46,7 @@ type Config struct {
 	// foreign-destination packets to the transport layer at all.
 	ResolverAddr string        // single DNS upstream override (legacy; prefer ResolverAddrs)
 	ResolverAddrs []string     // DNS upstreams in preference order, all reached through the tunnel (NP-1118-14)
+	RTTHint func() (int64, bool) // optional path-RTT hint (ms) for the resolver's adaptive budgets (NP-1118-19)
 	DNSTimeout   time.Duration // per-query DNS timeout (default 5s, notes v2 §4)
 }
 
@@ -210,6 +211,7 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 	// everything else — and all of IPv6 — is dropped and counted. The DNS
 	// resolver has no path around the tunnel (fail-closed by construction).
 	p.resolver = dns.NewResolverMulti(p.dnsDialers(), cfg.DNSTimeout)
+	p.resolver.SetRTTHint(cfg.RTTHint)
 	udpFwd := udp.NewForwarder(s, p.handleUDP)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 	p.wg.Add(1)

@@ -661,7 +661,17 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: fd endpoint: %w", err)
 	}
-	p, err := pump.NewPump(pump.Config{DialFlow: s.dialFlow}, ep)
+	p, err := pump.NewPump(pump.Config{
+		DialFlow: s.dialFlow,
+		RTTHint: func() (int64, bool) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.lastRTT > 0 {
+				return s.lastRTT.Milliseconds(), true
+			}
+			return 0, false
+		},
+	}, ep)
 	if err != nil {
 		return nil, fmt.Errorf("session: pump: %w", err)
 	}
