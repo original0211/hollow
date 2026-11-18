@@ -44,7 +44,8 @@ type Config struct {
 	HelperAddr6 string        // adapter's own IPv6 (default fd00::1, spec §1.3)
 	// assigned address before promiscuous acquisition will deliver
 	// foreign-destination packets to the transport layer at all.
-	ResolverAddr string        // DNS upstream reached through the tunnel (default 1.1.1.1:53)
+	ResolverAddr string        // single DNS upstream override (legacy; prefer ResolverAddrs)
+	ResolverAddrs []string     // DNS upstreams in preference order, all reached through the tunnel (NP-1118-14)
 	DNSTimeout   time.Duration // per-query DNS timeout (default 5s, notes v2 §4)
 }
 
@@ -67,8 +68,19 @@ func (c *Config) withDefaults() {
 	if c.HelperAddr6 == "" {
 		c.HelperAddr6 = "fd00::1"
 	}
-	if c.ResolverAddr == "" {
-		c.ResolverAddr = "1.1.1.1:53"
+	if len(c.ResolverAddrs) == 0 {
+		if c.ResolverAddr != "" {
+			c.ResolverAddrs = []string{c.ResolverAddr}
+		} else {
+			// Non-Cloudflare upstreams first (NP-1118-14): the exit
+			// kills connections to CF's own 1.1.1.1:53 (opens, then
+			// EOF), while 8.8.8.8 / 9.9.9.9 answer normally. 1.1.1.1
+			// stays as the last resort.
+			c.ResolverAddrs = []string{"8.8.8.8:53", "9.9.9.9:53", "1.1.1.1:53"}
+		}
+	}
+	if c.ResolverAddr == "" && len(c.ResolverAddrs) > 0 {
+		c.ResolverAddr = c.ResolverAddrs[0]
 	}
 	if c.DNSTimeout <= 0 {
 		c.DNSTimeout = 5 * time.Second
@@ -197,7 +209,7 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 	// (adapter IP, port 53) become DNS sessions tunnelled through SOCKS;
 	// everything else — and all of IPv6 — is dropped and counted. The DNS
 	// resolver has no path around the tunnel (fail-closed by construction).
-	p.resolver = dns.NewResolver(p.dnsDialer(), cfg.DNSTimeout)
+	p.resolver = dns.NewResolverMulti(p.dnsDialers(), cfg.DNSTimeout)
 	udpFwd := udp.NewForwarder(s, p.handleUDP)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 	p.wg.Add(1)
@@ -215,24 +227,31 @@ func headerSubnet6() tcpip.Subnet {
 	return sn
 }
 
-// dnsDialer adapts the resolver's upstream dial to SOCKS: the DNS
-// connection itself travels inside the Hollow tunnel.
-func (p *Pump) dnsDialer() dns.DialFunc {
-	return func() (net.Conn, error) {
-		host, portStr, err := net.SplitHostPort(p.cfg.ResolverAddr)
-		if err != nil {
-			return nil, err
-		}
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return nil, fmt.Errorf("resolver addr %q is not an IP", p.cfg.ResolverAddr)
-		}
-		var port int
-		if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
-			return nil, err
-		}
-		return socks5Connect(p.cfg.SocksAddr, ip, uint16(port), p.cfg.DialTimeout)
+// dnsDialers builds one dialer per configured upstream, in
+// preference order; the resolver fails over between them
+// (NP-1118-14). Each dial adapts to SOCKS: the DNS connection
+// itself travels inside the Hollow tunnel.
+func (p *Pump) dnsDialers() []dns.DialFunc {
+	out := make([]dns.DialFunc, 0, len(p.cfg.ResolverAddrs))
+	for _, addr := range p.cfg.ResolverAddrs {
+		addr := addr
+		out = append(out, func() (net.Conn, error) {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return nil, fmt.Errorf("resolver addr %q is not an IP", addr)
+			}
+			var port int
+			if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+				return nil, err
+			}
+			return socks5Connect(p.cfg.SocksAddr, ip, uint16(port), p.cfg.DialTimeout)
+		})
 	}
+	return out
 }
 
 // handleUDP is the UDP forwarder entry: DNS-to-resolver sessions are

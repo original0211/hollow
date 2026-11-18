@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"hollow/androidcore/dns"
 	"os"
 	"sync"
 	"testing"
@@ -269,5 +270,86 @@ func TestProductionLookupDeadSmoke(t *testing.T) {
 	defer mu.Unlock()
 	if len(nameDials) > 0 {
 		t.Fatalf("name-based dials slipped through: %v", nameDials)
+	}
+}
+
+// PERMANENT production DNS smoke (NP-1118-14 (d)): a full DNS
+// question-and-answer through a REAL carrier against the
+// production Worker, using the resolver's production upstream
+// list and failover. This is the factory-surface check whose
+// absence let v0.2.4 ship with a 100%-SERVFAIL tunnel resolver:
+// loopback fake upstreams can never see that the exit kills
+// connections to one real upstream. Keep this test.
+func TestProductionDNSSmoke(t *testing.T) {
+	if os.Getenv("HOLLOW_PROD_SMOKE") != "1" {
+		t.Skip("env-gated production smoke")
+	}
+	raw, err := os.ReadFile(os.Getenv("HOLLOW_SMOKE_CONFIG"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cc struct {
+		WorkerURL string `json:"workerUrl"`
+		PSKBase64 string `json:"pskBase64"`
+		KeyID     int    `json:"keyId"`
+		MetaPath  string `json:"metaPath"`
+		EdgesPath string `json:"edgesPath"`
+	}
+	if err := json.Unmarshal(raw, &cc); err != nil {
+		t.Fatal(err)
+	}
+	psk, err := base64.StdEncoding.DecodeString(cc.PSKBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := os.Getenv("HTTPS_PROXY")
+	if proxy == "" {
+		proxy = os.Getenv("https_proxy")
+	}
+	connect, err := connectDialer(proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(cc.WorkerURL)
+	s := &Session{
+		cfg: Config{
+			WSURL: cc.WorkerURL, PSK: psk, KeyID: cc.KeyID,
+			MetaPath: cc.MetaPath, HostBase: "https://" + u.Host, EdgesPath: cc.EdgesPath,
+			PoolSize: 2,
+		},
+		counters:     &byteCounters{},
+		stopCh:       make(chan struct{}),
+		tunFD:        -1,
+		state:        "connecting",
+		dialOverride: connect,
+	}
+	s.initLines()
+	startWatchdogs(s)
+	establishAll(t, s)
+	defer s.Stop()
+
+	// The pump's production upstream list, in order, dialed
+	// through the session exactly as the pump dials them.
+	upstreams := []string{"8.8.8.8:53", "9.9.9.9:53", "1.1.1.1:53"}
+	dialers := make([]dns.DialFunc, 0, len(upstreams))
+	for _, addr := range upstreams {
+		addr := addr
+		dialers = append(dialers, func() (net.Conn, error) {
+			host, portStr, _ := net.SplitHostPort(addr)
+			var port int
+			fmt.Sscanf(portStr, "%d", &port)
+			return s.dialFlow(net.ParseIP(host), uint16(port))
+		})
+	}
+	r := dns.NewResolverMulti(dialers, 5*time.Second)
+	resp := r.Exchange(buildDNSQueryA("example.com", 0x3333))
+	ips, perr := parseDNSARecords(resp, 0x3333)
+	if perr != nil || len(ips) == 0 {
+		t.Fatalf("production DNS exchange failed: ips=%v err=%v stats=%+v", ips, perr, r.Stats())
+	}
+	st := r.Stats()
+	t.Logf("production DNS: answer ips=%v stats=%+v", ips, st)
+	if st.Resolved != 1 {
+		t.Fatalf("resolved = %d, want 1", st.Resolved)
 	}
 }

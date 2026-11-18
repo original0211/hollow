@@ -46,12 +46,14 @@ type pending struct {
 
 // Resolver multiplexes DNS exchanges over one persistent connection.
 type Resolver struct {
-	dial    DialFunc
+	dialers []DialFunc // upstreams in preference order (NP-1118-14)
 	timeout time.Duration
 
 	mu      sync.Mutex
 	conn    net.Conn
 	dieCh   chan struct{} // closed when the current conn dies
+	upIdx   int           // dialer that produced the current conn
+	nextTry int           // dialer the next establishment starts from
 	pending map[uint16]*pending
 	nextID  uint16
 
@@ -63,11 +65,22 @@ type Resolver struct {
 
 // NewResolver builds a resolver. timeout is per-query (spec: 5s).
 func NewResolver(dial DialFunc, timeout time.Duration) *Resolver {
+	return NewResolverMulti([]DialFunc{dial}, timeout)
+}
+
+// NewResolverMulti builds a resolver over several upstreams in
+// preference order (NP-1118-14): a query is only SERVFAILed after
+// every upstream has failed it (dial/write/connection death) or
+// the per-query timeout elapses. The production motive: the exit
+// kills connections to 1.1.1.1:53 outright (stream opens, first
+// read EOFs), so a single-upstream resolver SERVFAILs everything;
+// 8.8.8.8 / 9.9.9.9 answer normally through the same exit.
+func NewResolverMulti(dialers []DialFunc, timeout time.Duration) *Resolver {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	return &Resolver{
-		dial:    dial,
+		dialers: dialers,
 		timeout: timeout,
 		pending: make(map[uint16]*pending),
 		nextID:  0x4000,
@@ -92,39 +105,51 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		atomic.AddUint64(&r.servfail, 1)
 		return servfailFor(query)
 	}
-	conn, dieCh, upID, p, err := r.register(query)
-	if err != nil {
-		atomic.AddUint64(&r.servfail, 1)
-		return servfailFor(query)
-	}
-	// Frame and send: 2-byte length prefix (RFC 7766).
-	up := make([]byte, len(query))
-	copy(up, query)
-	binary.BigEndian.PutUint16(up[0:2], upID)
-	frame := make([]byte, 2+len(up))
-	binary.BigEndian.PutUint16(frame[0:2], uint16(len(up)))
-	copy(frame[2:], up)
-	if err := writeAll(conn, frame); err != nil {
-		r.deregister(upID, p)
-		r.killConn(conn)
-		atomic.AddUint64(&r.servfail, 1)
-		return servfailFor(query)
-	}
+	// One attempt per upstream at most; the per-query timeout is a
+	// single budget across attempts. A transport failure (dial —
+	// handled inside register — write error, or connection death)
+	// retries on the next upstream; only a timeout SERVFAILs
+	// immediately, and it kills the connection so the next query
+	// does not burn its whole budget on a mute upstream.
 	timer := time.NewTimer(r.timeout)
 	defer timer.Stop()
-	select {
-	case resp := <-p.resp:
-		atomic.AddUint64(&r.resolved, 1)
-		return resp
-	case <-dieCh:
-		r.deregister(upID, p)
-		atomic.AddUint64(&r.servfail, 1)
-		return servfailFor(query)
-	case <-timer.C:
-		r.deregister(upID, p)
-		atomic.AddUint64(&r.servfail, 1)
-		return servfailFor(query)
+	for attempt := 0; ; attempt++ {
+		conn, dieCh, upID, p, err := r.register(query)
+		if err != nil {
+			break // every upstream failed at dial time
+		}
+		// Frame and send: 2-byte length prefix (RFC 7766).
+		up := make([]byte, len(query))
+		copy(up, query)
+		binary.BigEndian.PutUint16(up[0:2], upID)
+		frame := make([]byte, 2+len(up))
+		binary.BigEndian.PutUint16(frame[0:2], uint16(len(up)))
+		copy(frame[2:], up)
+		if err := writeAll(conn, frame); err != nil {
+			r.deregister(upID, p)
+			r.killConn(conn)
+			if attempt+1 < len(r.dialers) {
+				continue
+			}
+			break
+		}
+		select {
+		case resp := <-p.resp:
+			atomic.AddUint64(&r.resolved, 1)
+			return resp
+		case <-dieCh:
+			r.deregister(upID, p)
+			if attempt+1 < len(r.dialers) {
+				continue
+			}
+		case <-timer.C:
+			r.deregister(upID, p)
+			r.killConn(conn)
+		}
+		break
 	}
+	atomic.AddUint64(&r.servfail, 1)
+	return servfailFor(query)
 }
 
 // register ensures the upstream connection and parks the query.
@@ -132,7 +157,19 @@ func (r *Resolver) register(query []byte) (net.Conn, chan struct{}, uint16, *pen
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.conn == nil {
-		c, err := r.dial()
+		// Try every upstream once, starting from the preferred
+		// index (the last winner, or the one after the last death).
+		var c net.Conn
+		var err error
+		for k := 0; k < len(r.dialers); k++ {
+			idx := (r.nextTry + k) % len(r.dialers)
+			c, err = r.dialers[idx]()
+			if err == nil {
+				r.upIdx = idx
+				r.nextTry = idx // stick with the winner until it dies
+				break
+			}
+		}
 		if err != nil {
 			return nil, nil, 0, nil, fmt.Errorf("upstream dial: %w", err)
 		}
@@ -209,6 +246,11 @@ func (r *Resolver) killConn(conn net.Conn) {
 	r.conn = nil
 	dieCh := r.dieCh
 	r.dieCh = nil
+	// The next establishment starts AFTER the dialer whose
+	// connection just died (NP-1118-14 failover advance).
+	if len(r.dialers) > 0 {
+		r.nextTry = (r.upIdx + 1) % len(r.dialers)
+	}
 	r.mu.Unlock()
 	conn.Close()
 	if dieCh != nil {

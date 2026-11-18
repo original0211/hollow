@@ -202,3 +202,45 @@ func TestUpstreamDownThenRecovery(t *testing.T) {
 		t.Fatal("expected a real answer after recovery")
 	}
 }
+
+// NP-1118-14: the first upstream accepts the connection and then
+// EOFs on the first exchange (the production 1.1.1.1 failure
+// shape). The query must fail over to the second upstream and be
+// answered — not SERVFAILed — and later queries must keep working.
+func TestFailoverAfterUpstreamEOF(t *testing.T) {
+	good := startUpstream(t, 0, false)
+	defer good.ln.Close()
+	var deadDials uint64
+	dead := func() (net.Conn, error) {
+		atomic.AddUint64(&deadDials, 1)
+		c1, c2 := net.Pipe()
+		go func() {
+			buf := make([]byte, 4096)
+			_, _ = c2.Read(buf) // swallow the framed query
+			c2.Close()          // then die mid-exchange
+		}()
+		return c1, nil
+	}
+	var goodDials uint64
+	r := NewResolverMulti([]DialFunc{dead, dialerTo(good.ln.Addr().String(), &goodDials)}, 3*time.Second)
+	q := buildQuery(0x2222, "failover.example")
+	resp := r.Exchange(q)
+	if len(resp) < 12 || resp[2]&0x0F == 2 {
+		t.Fatalf("expected a real answer after failover, got rcode/err: %v", resp)
+	}
+	if binary.BigEndian.Uint16(resp[0:2]) != 0x2222 {
+		t.Fatalf("response id = %#x, want the original 0x2222", binary.BigEndian.Uint16(resp[0:2]))
+	}
+	st := r.Stats()
+	if st.Resolved != 1 || st.Servfail != 0 {
+		t.Fatalf("stats = %+v, want 1 resolved / 0 servfail", st)
+	}
+	// A follow-up query rides the surviving upstream.
+	resp = r.Exchange(buildQuery(0x2223, "failover.example"))
+	if len(resp) < 12 || resp[2]&0x0F == 2 {
+		t.Fatalf("follow-up query failed: %v", resp)
+	}
+	if got := r.Stats().Resolved; got != 2 {
+		t.Fatalf("resolved = %d, want 2", got)
+	}
+}

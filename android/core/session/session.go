@@ -432,6 +432,7 @@ type Session struct {
 
 	// Entry dispersion (NP-1118-09, edges.go), guarded by mu.
 	bootstrapIPs   []string // entry hostname's resolved set (NP-1118-11), guarded by mu
+	bootstrapPinned map[int]bool // slots whose current pin came from the bootstrap tier (NP-1118-14)
 	edgeCandidates []EdgeCandidate
 	edgeFailCounts map[string]int
 	edgeDisfavored map[string]bool
@@ -758,21 +759,14 @@ func (s *Session) FetchMeta(ctx context.Context) (map[string]any, error) {
 	if s.cfg.HostBase == "" || s.cfg.MetaPath == "" {
 		return nil, errors.New("session: meta not configured")
 	}
-	dial := s.dialContext()
-	if best := s.bestEdgeIP(); best != "" {
-		// /meta rides the best-ranked entry (NP-1118-09 (d)): the
-		// TCP target is the pinned IP; TLS ServerName and Host stay
-		// on the URL's hostname (the transport derives both from
-		// the request URL, the wrapper only swaps the dial host).
-		inner := dial
-		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			_, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			return inner(ctx, network, net.JoinHostPort(best, port))
-		}
-	}
+	// /meta rides the best available entry pin (NP-1118-09 (d),
+	// NP-1118-14 (b)): the best-ranked edge, or the bootstrap set
+	// when nothing is ranked yet. The TCP target is the pinned IP;
+	// TLS ServerName and Host stay on the URL's hostname. (In
+	// v0.2.3/v0.2.4 this consulted only the ranked list, so with an
+	// empty ranking it dialed by name and died in the connected-
+	// state resolver — the split-brain NP-1118-14 closes.)
+	dial := pinDial(s.dialContext(), s.bestDialIP())
 	tr := &http.Transport{DialContext: dial}
 	hc := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.HostBase+s.cfg.MetaPath, nil)

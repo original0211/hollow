@@ -221,17 +221,40 @@ func (s *Session) pickSlotEdge(slot int) string {
 	if len(list) == 0 {
 		// No ranked candidates yet: the bootstrap set (the entry
 		// hostname's own resolved addresses, NP-1118-11) pins the
-		// slot, wrapping around the set.
+		// slot. Distribution mirrors the ranked path (NP-1118-14
+		// (c)): the slot's wrap position first, but if another
+		// slot already holds it and a set member is unheld, take
+		// the first unheld member — slots only share an address
+		// when the set is smaller than the pool.
 		if len(s.bootstrapIPs) > 0 {
 			ip := s.bootstrapIPs[slot%len(s.bootstrapIPs)]
+			held := map[string]bool{}
+			for other, e := range s.slotEdges {
+				if other != slot {
+					held[e] = true
+				}
+			}
+			if held[ip] {
+				for _, cand := range s.bootstrapIPs {
+					if !held[cand] {
+						ip = cand
+						break
+					}
+				}
+			}
 			if s.slotEdges == nil {
 				s.slotEdges = map[int]string{}
 			}
+			if s.bootstrapPinned == nil {
+				s.bootstrapPinned = map[int]bool{}
+			}
 			s.slotEdges[slot] = ip
+			s.bootstrapPinned[slot] = true
 			return ip
 		}
 		return ""
 	}
+	delete(s.bootstrapPinned, slot)
 	// A slot past the end of the list has no primary: it dials by
 	// domain, never by substitute.
 	if slot >= len(list) {

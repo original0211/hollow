@@ -198,14 +198,35 @@ func (s *Session) refreshBootstrap(ctx context.Context) {
 	if err != nil || len(ips) == 0 {
 		return
 	}
-	s.mu.Lock()
-	changed := strings.Join(ips, ",") != strings.Join(s.bootstrapIPs, ",")
-	s.bootstrapIPs = ips
-	cb := s.cfg.OnBootstrapIPs
-	s.mu.Unlock()
-	if changed && cb != nil {
-		go cb(append([]string(nil), ips...))
+	if s.installBootstrapIPs(ips) {
+		if cb := s.cfg.OnBootstrapIPs; cb != nil {
+			go cb(append([]string(nil), ips...))
+		}
 	}
+}
+
+// installBootstrapIPs swaps the bootstrap set, reporting whether
+// it changed. On a change, pin records that came from the
+// bootstrap tier are dropped (live carriers are untouched; the
+// pin applies at the next establishment anyway) so slots
+// re-distribute over the full new set instead of staying
+// collapsed onto whichever subset existed when each slot first
+// picked — the v0.2.4 field shape was #1/#2/#4 on one address
+// (NP-1118-14 (c)).
+func (s *Session) installBootstrapIPs(ips []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.Join(ips, ",") == strings.Join(s.bootstrapIPs, ",") {
+		return false
+	}
+	s.bootstrapIPs = append([]string(nil), ips...)
+	for slot, fromBootstrap := range s.bootstrapPinned {
+		if fromBootstrap {
+			delete(s.slotEdges, slot)
+			delete(s.bootstrapPinned, slot)
+		}
+	}
+	return true
 }
 
 // bootstrapIPFor returns the bootstrap pin for a slot: the set is

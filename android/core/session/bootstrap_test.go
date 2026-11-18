@@ -10,6 +10,8 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -155,5 +157,66 @@ func TestEstablishWithLookupDead(t *testing.T) {
 		if ip != "127.0.0.1" {
 			t.Fatalf("slot %d edge = %q, want the bootstrap pin", i, ip)
 		}
+	}
+}
+
+// NP-1118-14 (c): bootstrap pins distribute over the set, and a
+// set change redistributes instead of leaving slots collapsed
+// onto the subset that existed at their first pick.
+func TestBootstrapDistributionAndRedistribution(t *testing.T) {
+	s := newTestPoolSession("ws://127.0.0.1:1", testPSK(), 4)
+	s.installBootstrapIPs([]string{"10.9.0.1"})
+	for slot := 0; slot < 4; slot++ {
+		if got := s.pickSlotEdge(slot); got != "10.9.0.1" {
+			t.Fatalf("single-member set: slot %d = %q, want the only member", slot, got)
+		}
+	}
+	// The set grows: bootstrap pin records are dropped...
+	if !s.installBootstrapIPs([]string{"10.9.0.1", "10.9.0.2"}) {
+		t.Fatal("install should report the change")
+	}
+	st := s.State()
+	for i, e := range st.SlotEdges {
+		if e != "" {
+			t.Fatalf("slot %d pin record = %q after set change, want cleared", i, e)
+		}
+	}
+	// ...and fresh picks distribute A,B,A,B (sharing only because
+	// the pool is larger than the set).
+	want := []string{"10.9.0.1", "10.9.0.2", "10.9.0.1", "10.9.0.2"}
+	for slot, w := range want {
+		if got := s.pickSlotEdge(slot); got != w {
+			t.Fatalf("slot %d = %q, want %q", slot, got, w)
+		}
+	}
+	// Same set again: no change, pins stay.
+	if s.installBootstrapIPs([]string{"10.9.0.1", "10.9.0.2"}) {
+		t.Fatal("identical set reported as changed")
+	}
+}
+
+// NP-1118-14 (b) regression: /meta with NO ranked candidates but
+// a bootstrap set must dial the pinned IP — the hostname does not
+// resolve at all, so any by-name dial fails the test.
+func TestFetchMetaBootstrapPin(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"colo":"TST","country":"TS"}`))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	u, _ := url.Parse(ts.URL)
+	s := newTestPoolSession("ws://127.0.0.1:1", testPSK(), 1)
+	s.cfg.HostBase = "http://unresolvable.invalid:" + u.Port()
+	s.cfg.MetaPath = "/meta"
+	s.mu.Lock()
+	s.bootstrapIPs = []string{"127.0.0.1"}
+	s.mu.Unlock()
+	m, err := s.FetchMeta(context.Background())
+	if err != nil {
+		t.Fatalf("FetchMeta via bootstrap pin: %v", err)
+	}
+	if m["colo"] != "TST" {
+		t.Fatalf("meta = %v", m)
 	}
 }
