@@ -41,6 +41,7 @@ type configJSON struct {
 	MetaPath string `json:"metaPath"`
 	HostBase string `json:"hostBase"`
 	PoolSize int    `json:"poolSize"`
+	EdgesPath string `json:"edgesPath"`
 }
 
 var (
@@ -85,6 +86,7 @@ func StartVPN(cfgJSONText string, tunFD int, protector Protector) error {
 		MetaPath: cj.MetaPath,
 		HostBase: cj.HostBase,
 		PoolSize: cj.PoolSize,
+		EdgesPath: cj.EdgesPath,
 	}, tunFD, protector)
 	if err != nil {
 		lastStartError = err.Error()
@@ -201,8 +203,10 @@ func VPNStateJSON() string {
 		TrafficUp    int64      `json:"trafficUp"`
 		TrafficDown  int64      `json:"trafficDown"`
 		CarrierRTTMs int64      `json:"carrierRttMs"`
-		LiveCarriers int        `json:"liveCarriers"`
-		PoolSize     int        `json:"poolSize"`
-	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize})
+		LiveCarriers int                   `json:"liveCarriers"`
+		PoolSize     int                   `json:"poolSize"`
+		SlotEdges    []string              `json:"slotEdges"`
+		EdgeCandidates []session.EdgeCandidate `json:"edgeCandidates"`
+	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize, snap.SlotEdges, snap.EdgeCandidates})
 	return string(out)
 }

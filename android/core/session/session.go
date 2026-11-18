@@ -34,6 +34,7 @@ type Config struct {
 	KeyID    int    `json:"keyId"`    // default 1
 	MetaPath string `json:"metaPath"` // random-segment /meta path (may be empty)
 	HostBase string `json:"hostBase"` // https base for /meta (may be empty)
+	EdgesPath string `json:"edgesPath"` // random-segment /edges.json path (may be empty)
 	PoolSize int    `json:"poolSize"` // carriers in the pool; 0 = default, clamped 1-8
 }
 
@@ -149,8 +150,10 @@ func (l *lineage) rotate(ctx context.Context, drainOld bool) error {
 		return errors.New("session: lineage stopped (auth fatal)")
 	}
 	dialStart := time.Now()
-	tport, err := dialCarrier(ctx, l.pool.cfg.WSURL, l.pool.protector, l.pool.counters)
+	pin := l.pool.pickSlotEdge(l.idx)
+	tport, err := dialCarrier(ctx, l.pool.cfg.WSURL, l.pool.dialContext(), l.pool.counters, pin)
 	if err != nil {
+		l.pool.noteEdgeFailure(pin, err)
 		return fmt.Errorf("session: carrier dial: %w", err)
 	}
 	client := core.NewClient(tport, core.ClientOptions{PSK: l.pool.cfg.PSK, KeyID: byte(l.pool.cfg.KeyID)})
@@ -172,15 +175,18 @@ func (l *lineage) rotate(ctx context.Context, drainOld bool) error {
 	case <-done:
 		if err := client.Err(); err != nil {
 			tport.Close()
+			l.pool.noteEdgeFailure(pin, err)
 			return fmt.Errorf("session: handshake: %w", err)
 		}
 	case <-time.After(20 * time.Second):
 		tport.Close()
+		l.pool.noteEdgeFailure(pin, errors.New("session: handshake timeout"))
 		return errors.New("session: handshake timeout")
 	case <-ctx.Done():
 		tport.Close()
 		return ctx.Err()
 	}
+	l.pool.noteEdgeSuccess(pin)
 	l.mu.Lock()
 	old := l.client
 	l.client = client
@@ -341,7 +347,11 @@ func (l *lineage) watchdog() {
 			return
 		}
 		for {
-			jittered := time.Duration(float64(backoff) * (0.75 + 0.5*mathrand.Float64()))
+			eff := backoff
+			if cap := l.pool.redialCap(); eff > cap {
+				eff = cap
+			}
+			jittered := time.Duration(float64(eff) * (0.75 + 0.5*mathrand.Float64()))
 			select {
 			case <-l.pool.stopCh:
 				return
@@ -355,8 +365,8 @@ func (l *lineage) watchdog() {
 				return
 			}
 			backoff *= 2
-			if backoff > 60*time.Second {
-				backoff = 60 * time.Second
+			if cap := l.pool.redialCap(); backoff > cap {
+				backoff = cap
 			}
 		}
 	}
@@ -396,6 +406,11 @@ func (l *lineage) stop() {
 type Session struct {
 	cfg       Config
 	protector Protector
+	// dialOverride, when set, replaces the protected dialer for
+	// every egress dial (carriers, probes, /meta, /edges.json).
+	// Test-only seam (the sandbox production smoke routes through
+	// the egress proxy); production paths never set it.
+	dialOverride func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu       sync.Mutex
 	lines    []*lineage
@@ -409,6 +424,14 @@ type Session struct {
 	rr       atomic.Uint64 // round-robin cursor for placement ties
 
 	rotateEvery time.Duration // timed rotation interval (0 = 15 min)
+
+	// Entry dispersion (NP-1118-09, edges.go), guarded by mu.
+	edgeCandidates []EdgeCandidate
+	edgeFailCounts map[string]int
+	edgeDisfavored map[string]bool
+	slotEdges      map[int]string
+	measuring      bool
+	lastMeasure    time.Time
 
 	// UI-facing state machine (M3-4), guarded by mu: disconnected /
 	// connecting / connected / error, plus the counters the status
@@ -449,6 +472,14 @@ func (s *Session) initLines() {
 	}
 }
 
+// dialContext resolves the egress dial function for this session.
+func (s *Session) dialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	if s.dialOverride != nil {
+		return s.dialOverride
+	}
+	return protectedDialContext(s.protector)
+}
+
 func (s *Session) lineages() []*lineage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -481,6 +512,13 @@ func (s *Session) refreshState() {
 		s.state, s.detail = "connected", ""
 	} else if s.state == "connected" {
 		s.state, s.detail = "connecting", "承载中断，正在重连"
+	}
+	if live == 0 && s.sinceMs != 0 && s.fatalErr == nil && !s.measuring &&
+		time.Since(s.lastMeasure) > 5*time.Minute {
+		// Full outage after having been up: fresh entry evidence is
+		// worth the most right now. refreshState holds s.mu, so the
+		// cycle starts in its own goroutine (its guard re-locks).
+		go s.refreshEdges()
 	}
 }
 
@@ -551,6 +589,11 @@ type StateSnapshot struct {
 	CarrierRTTMs int64
 	LiveCarriers int
 	PoolSize     int
+	// Entry dispersion (NP-1118-09): per-lineage pinned entry IP
+	// ("" = by domain), index-aligned, and the ranked candidate
+	// list — same field names as the JS bridge snapshot.
+	SlotEdges      []string
+	EdgeCandidates []EdgeCandidate
 }
 
 // State reads the presentation snapshot.
@@ -570,6 +613,11 @@ func (s *Session) State() StateSnapshot {
 	s.mu.Lock()
 	snap.State, snap.Detail, snap.SinceMs, snap.StreamsOK = s.state, s.detail, s.sinceMs, s.streamsOK
 	snap.CarrierRTTMs = s.lastRTT.Milliseconds()
+	snap.SlotEdges = make([]string, len(lines))
+	for i := range lines {
+		snap.SlotEdges[i] = s.slotEdges[i]
+	}
+	snap.EdgeCandidates = append([]EdgeCandidate(nil), s.edgeCandidates...)
 	s.mu.Unlock()
 	if s.counters != nil {
 		snap.TrafficUp = s.counters.up.Load()
@@ -629,6 +677,10 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 		return nil, firstErr
 	}
 	s.refreshState()
+	// Entry dispersion evidence gathers in the background; the pool
+	// is already serving by domain and pins apply at each lineage's
+	// next establishment (NP-1118-09).
+	go s.refreshEdges()
 	return s, nil
 }
 
@@ -692,7 +744,22 @@ func (s *Session) FetchMeta(ctx context.Context) (map[string]any, error) {
 	if s.cfg.HostBase == "" || s.cfg.MetaPath == "" {
 		return nil, errors.New("session: meta not configured")
 	}
-	tr := &http.Transport{DialContext: protectedDialContext(s.protector)}
+	dial := s.dialContext()
+	if best := s.bestEdgeIP(); best != "" {
+		// /meta rides the best-ranked entry (NP-1118-09 (d)): the
+		// TCP target is the pinned IP; TLS ServerName and Host stay
+		// on the URL's hostname (the transport derives both from
+		// the request URL, the wrapper only swaps the dial host).
+		inner := dial
+		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return inner(ctx, network, net.JoinHostPort(best, port))
+		}
+	}
+	tr := &http.Transport{DialContext: dial}
 	hc := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.HostBase+s.cfg.MetaPath, nil)
 	if err != nil {

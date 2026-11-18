@@ -84,9 +84,25 @@ type wsTransport struct {
 	counters *byteCounters // may be nil (tests)
 }
 
-func dialCarrier(ctx context.Context, wsURL string, p Protector, counters *byteCounters) (*wsTransport, error) {
+// dialCarrier dials the WS carrier over the given dial function
+// (the session's protected dialer in production). With edgeIP set
+// (NP-1118-09), the TCP target is that IP (at the URL's port)
+// while the TLS ServerName and the WS Host header stay on the
+// URL's hostname — gorilla derives both from the URL, the wrapper
+// below only replaces the dialed address's host part.
+func dialCarrier(ctx context.Context, wsURL string, netDial func(ctx context.Context, network, addr string) (net.Conn, error), counters *byteCounters, edgeIP string) (*wsTransport, error) {
+	if edgeIP != "" {
+		inner := netDial
+		netDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return inner(ctx, network, net.JoinHostPort(edgeIP, port))
+		}
+	}
 	dialer := websocket.Dialer{
-		NetDialContext:   protectedDialContext(p),
+		NetDialContext:   netDial,
 		HandshakeTimeout: 15 * time.Second,
 	}
 	header := http.Header{}

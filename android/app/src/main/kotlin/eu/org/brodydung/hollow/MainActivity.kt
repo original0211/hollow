@@ -420,6 +420,24 @@ class MainActivity : Activity() {
                     "UDP 丢弃 ${stats.optLong("droppedUdp")} · IPv6 丢弃 ${stats.optLong("droppedV6")}"
             )
         }
+        // Entry dispersion (NP-1118-09): per-carrier pinned entry IPs
+        // and the ranked candidate list, when a measurement exists.
+        val slotEdges = st.optJSONArray("slotEdges")
+        val candidates = st.optJSONArray("edgeCandidates")
+        if (slotEdges != null && slotEdges.length() > 0) {
+            val pins = (0 until slotEdges.length()).joinToString(" · ") { i ->
+                val ip = slotEdges.optString(i)
+                "#${i + 1} ${if (ip.isEmpty()) "域名" else ip}"
+            }
+            sb.append("\n入口钉位：$pins")
+        }
+        if (candidates != null && candidates.length() > 0) {
+            val ranked = (0 until candidates.length()).joinToString(" · ") { i ->
+                val c = candidates.optJSONObject(i)
+                "${c?.optString("ip")} ${c?.optLong("rttMs")}ms"
+            }
+            sb.append("\n候选入口（按 RTT)：$ranked")
+        }
         advancedText.text = sb.toString()
     }
 
