@@ -124,6 +124,35 @@ func testServer(t *testing.T, psk []byte) *httptest.Server {
 	}))
 }
 
+// newTestPoolSession builds a Session with an initialized lineage
+// set (no pump) for in-package tests.
+func newTestPoolSession(wsURL string, psk []byte, poolSize int) *Session {
+	s := &Session{
+		cfg:      Config{WSURL: wsURL, PSK: psk, KeyID: 1, PoolSize: poolSize},
+		stopCh:   make(chan struct{}),
+		tunFD:    -1,
+		state:    "connecting",
+		counters: &byteCounters{},
+	}
+	s.initLines()
+	return s
+}
+
+func startWatchdogs(s *Session) {
+	for _, l := range s.lineages() {
+		go l.watchdog()
+	}
+}
+
+func establishAll(t *testing.T, s *Session) {
+	t.Helper()
+	for _, l := range s.lineages() {
+		if err := l.rotateCarrier(context.Background()); err != nil {
+			t.Fatalf("rotateCarrier: %v", err)
+		}
+	}
+}
+
 func TestSessionLiveLoopback(t *testing.T) {
 	psk := make([]byte, 32)
 	for i := range psk {
@@ -133,13 +162,8 @@ func TestSessionLiveLoopback(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	s := &Session{
-		cfg:     Config{WSURL: wsURL, PSK: psk, KeyID: 1},
-		stopCh:  make(chan struct{}),
-		deathCh: make(chan struct{}, 1),
-		tunFD:   -1,
-	}
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	s := newTestPoolSession(wsURL, psk, 1)
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
 	defer s.Stop()
@@ -175,14 +199,8 @@ func TestSessionStateMachine(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	s := &Session{
-		cfg:     Config{WSURL: wsURL, PSK: psk, KeyID: 1},
-		stopCh:  make(chan struct{}),
-		deathCh: make(chan struct{}, 1),
-		tunFD:   -1,
-		state:   "connecting",
-	}
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	s := newTestPoolSession(wsURL, psk, 1)
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
 	st := s.State()
@@ -245,18 +263,12 @@ func TestSessionCarrierDeathRecovery(t *testing.T) {
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	s := &Session{
-		cfg:     Config{WSURL: wsURL, PSK: psk, KeyID: 1},
-		stopCh:  make(chan struct{}),
-		deathCh: make(chan struct{}, 1),
-		tunFD:   -1,
-		state:   "connecting",
-	}
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	s := newTestPoolSession(wsURL, psk, 1)
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
 	defer s.Stop()
-	go s.watchdog()
+	startWatchdogs(s)
 
 	if st := s.State(); st.State != "connected" || st.Carriers != 1 {
 		t.Fatalf("pre-kill state: %+v", st)

@@ -40,6 +40,7 @@ type configJSON struct {
 	KeyID    int    `json:"keyId"`
 	MetaPath string `json:"metaPath"`
 	HostBase string `json:"hostBase"`
+	PoolSize int    `json:"poolSize"`
 }
 
 var (
@@ -83,6 +84,7 @@ func StartVPN(cfgJSONText string, tunFD int, protector Protector) error {
 		KeyID:    cj.KeyID,
 		MetaPath: cj.MetaPath,
 		HostBase: cj.HostBase,
+		PoolSize: cj.PoolSize,
 	}, tunFD, protector)
 	if err != nil {
 		lastStartError = err.Error()

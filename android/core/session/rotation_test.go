@@ -153,6 +153,21 @@ func newCapServer(t *testing.T, psk []byte, capPerConn int64, rejectCode byte, r
 	return cs
 }
 
+// killOneConn closes a single live server-side carrier connection
+// (pool death-isolation evidence).
+func (cs *capServer) killOneConn() bool {
+	done := false
+	cs.opensPerConn.Range(func(k, _ any) bool {
+		if done {
+			return false
+		}
+		_ = k.(*websocket.Conn).Close()
+		done = true
+		return false
+	})
+	return done
+}
+
 func testPSK() []byte {
 	psk := make([]byte, 32)
 	for i := range psk {
@@ -162,16 +177,7 @@ func testPSK() []byte {
 }
 
 func newTestSession(wsURL string, psk []byte) *Session {
-	return &Session{
-		cfg:      Config{WSURL: wsURL, PSK: psk, KeyID: 1},
-		stopCh:   make(chan struct{}),
-		deathCh:  make(chan struct{}, 1),
-		rotateCh: make(chan struct{}, 1),
-		tunFD:    -1,
-		state:    "connecting",
-		counters: &byteCounters{},
-		drains:   map[*core.HollowClient]struct{}{},
-	}
+	return newTestPoolSession(wsURL, psk, 1)
 }
 
 func dialEcho(t *testing.T, s *Session, i int) {
@@ -187,7 +193,8 @@ func dialEcho(t *testing.T, s *Session, i int) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got := make([]byte, len(msg))
 	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("read %d: %v", i, err)
+		st := s.State()
+		t.Fatalf("read %d: %v (pool state=%s live=%d/%d carriers=%d streamsOK=%d)", i, err, st.State, st.LiveCarriers, st.PoolSize, st.Carriers, st.StreamsOK)
 	}
 	conn.Close()
 }
@@ -199,10 +206,10 @@ func TestBudgetRotation150Streams(t *testing.T) {
 	cs := newCapServer(t, psk, 50, core.ErrOutboundFailed, -1)
 	wsURL := "ws" + strings.TrimPrefix(cs.srv.URL, "http")
 	s := newTestSession(wsURL, psk)
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
-	go s.watchdog()
+	startWatchdogs(s)
 	defer s.Stop()
 	// The proactive rotation is asynchronous (as in the JS design):
 	// opens already in flight when the swap lands may still be SENT
@@ -233,7 +240,7 @@ func TestConcurrencyRetry(t *testing.T) {
 	cs := newCapServer(t, psk, 0, 0, 3)
 	wsURL := "ws" + strings.TrimPrefix(cs.srv.URL, "http")
 	s := newTestSession(wsURL, psk)
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
 	defer s.Stop()
@@ -253,7 +260,7 @@ func TestReactiveRotationOn06(t *testing.T) {
 	cs := newCapServer(t, psk, 40, core.ErrOutboundFailed, -1)
 	wsURL := "ws" + strings.TrimPrefix(cs.srv.URL, "http")
 	s := newTestSession(wsURL, psk)
-	if err := s.rotateCarrier(context.Background()); err != nil {
+	if err := s.lineages()[0].rotateCarrier(context.Background()); err != nil {
 		t.Fatalf("rotateCarrier: %v", err)
 	}
 	defer s.Stop()
