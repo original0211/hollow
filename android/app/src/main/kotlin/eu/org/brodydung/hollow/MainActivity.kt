@@ -294,6 +294,10 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         if (!prefs.getBoolean(KEY_AUTO_CONNECT, true)) return
         if (!prefs.getBoolean(KEY_USER_ENABLED, false)) return
+        // After a takeover, retaking the single VPN slot is a
+        // human decision — auto-connect must not start a slot
+        // fight with the user's other VPN app (NP-1118-16).
+        if (prefs.getBoolean(HollowVpnService.KEY_TAKEN_OVER, false)) return
         if (!lastConfigured || lastState != "disconnected") return
         // Consent already granted -> start directly; not granted ->
         // the system consent flow decides (never bypassed).
@@ -331,21 +335,35 @@ class MainActivity : Activity() {
         val configured = st.optBoolean("configured")
         lastState = state
         lastConfigured = configured
-        maybeSampleSystemDns(state)
         val firstRun = !configured
 
-        stateView.text = when (state) {
-            "connected" -> "● 已连接"
-            "connecting" -> "● 连接中…"
-            "error" -> "● 连接失败"
+        // Takeover cross-check (NP-1118-16): if the core claims
+        // "connected" but the system's default network is not a
+        // VPN at all, the slot is not ours — never present a
+        // carrier state as a working VPN.
+        val slotLost = state == "connected" && !defaultNetworkIsVpn()
+        stateView.text = when {
+            state == "revoked" || slotLost -> "● VPN 已被其他应用接管"
+            state == "connected" -> "● 已连接"
+            state == "connecting" -> "● 连接中…"
+            state == "error" -> "● 连接失败"
             else -> "● 未连接"
+        }
+        if (slotLost && !slotLostLogged) {
+            slotLostLogged = true
+            log.append("\n核心自报已连接，但系统默认网络不是 VPN——槽位已不在 Hollow，按被接管呈现")
+        } else if (!slotLost) {
+            slotLostLogged = false
         }
         val rawDetail = st.optString("detail")
         detailView.text = when {
             firstRun && state == "disconnected" -> "还没有配置——导入一份配置即可开始。"
+            state == "revoked" || slotLost -> "系统 VPN 槽位现由其他应用占用。点「连接」可由 Hollow 重新接管。"
             state == "connecting" && rawDetail.isNotEmpty() -> rawDetail
             else -> ""
         }
+
+        maybeSampleSystemDns(if (slotLost) "revoked" else state)
 
         // Rates from cumulative wire counters (display only).
         val up = st.optLong("trafficUp")
@@ -434,6 +452,20 @@ class MainActivity : Activity() {
                 .getBoolean(KEY_AUTO_CONNECT, true)
         }
         pairingSummary.text = "目标：${st.optString("wsUrl")} · keyId ${st.optInt("keyId")}"
+    }
+
+    private var slotLostLogged = false
+
+    private fun defaultNetworkIsVpn(): Boolean {
+        return try {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            // No capability info: give the core the benefit of the
+            // doubt (only a positive non-VPN reading overrides).
+            caps == null || caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
+        } catch (e: Exception) {
+            true
+        }
     }
 
     // --- System-DNS sampling & hint card (NP-1118-16) ---

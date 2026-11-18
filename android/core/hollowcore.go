@@ -96,6 +96,7 @@ func StartVPN(cfgJSONText string, tunFD int, protector Protector) error {
 		return err
 	}
 	lastStartError = ""
+	vpnRevoked = false
 	current = s
 	return nil
 }
@@ -173,6 +174,23 @@ func StoredPairingJSON() string {
 // not be). Cleared on the next successful start.
 var lastStartError string
 
+// vpnRevoked records that the system tore our VPN down from the
+// outside (NP-1118-16): Android has ONE VPN slot, so another app
+// establishing its VPN (or the user switching VPN off) revokes
+// ours. The session state alone cannot express this — carriers
+// would happily stay "connected" with a dead TUN — so the
+// service reports it explicitly and the state surface shows a
+// dedicated "revoked" state instead of a lying "connected" or a
+// bland "disconnected". Cleared by the next successful StartVPN.
+var vpnRevoked bool
+
+// NoteVpnRevoked is called by the VpnService's onRevoke.
+func NoteVpnRevoked() {
+	mu.Lock()
+	vpnRevoked = true
+	mu.Unlock()
+}
+
 // VPNStateJSON is the status surface's single read: session state
 // machine + pump counters + pairing identity (display fields only —
 // the PSK is never part of it).
@@ -180,12 +198,15 @@ func VPNStateJSON() string {
 	mu.Lock()
 	cur := current
 	errText := lastStartError
+	revoked := vpnRevoked
 	mu.Unlock()
 	snap := session.StateSnapshot{State: "disconnected"}
 	var stats pump.Stats
 	if cur != nil {
 		snap = cur.State()
 		stats = cur.Stats()
+	} else if revoked {
+		snap.State, snap.Detail = "revoked", "VPN 已被其他应用接管"
 	} else if errText != "" {
 		snap.State, snap.Detail = "error", errText
 	}

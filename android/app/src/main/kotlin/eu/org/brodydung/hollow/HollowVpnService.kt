@@ -127,6 +127,9 @@ class HollowVpnService : VpnService() {
                 stopSelf()
             }
             ACTION_START -> {
+                try {
+                    prefs().edit().putBoolean(KEY_TAKEN_OVER, false).commit()
+                } catch (_: Exception) {}
                 // Fail-closed: without a durably recorded start, no
                 // session (NP-1114-37 failure semantics).
                 val recorded = prefs().edit().putBoolean(KEY_USER_ENABLED, true).commit()
@@ -210,9 +213,19 @@ class HollowVpnService : VpnService() {
     private fun prefs() = getSharedPreferences(PREFS, MODE_PRIVATE)
 
     override fun onRevoke() {
-        // The user revoked the VPN in system Settings: tear the whole
-        // session down (pump stopped, core closed). The state bit is
-        // KEPT per the restart policy above.
+        // The VPN slot was taken from us (another app established
+        // its VPN, or the user switched VPN off in Settings): tear
+        // the whole session down (pump stopped, core closed) and
+        // RECORD the takeover, so the shell can say "VPN 已被其他
+        // 应用接管" instead of presenting the core's carrier state
+        // (NP-1118-16). The user_enabled bit is KEPT per the
+        // restart policy above; the taken-over flag separately
+        // stops the shell's auto-connect from stealing the slot
+        // straight back — retaking it is a human decision.
+        try {
+            prefs().edit().putBoolean(KEY_TAKEN_OVER, true).commit()
+        } catch (_: Exception) {}
+        try { Hollowcore.noteVpnRevoked() } catch (_: Exception) {}
         stopSession()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -267,6 +280,7 @@ class HollowVpnService : VpnService() {
         private const val CHANNEL_ID = "hollow-vpn"
         private const val NOTIFICATION_ID = 1
         private const val PREFS = "hollow-vpn"
+        const val KEY_TAKEN_OVER = "vpn_taken_over"
         private const val KEY_USER_ENABLED = "user_enabled"
     }
 }
