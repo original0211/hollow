@@ -166,8 +166,19 @@ class HollowVpnService : VpnService() {
         val pfd = try {
             Builder()
                 .setSession("Hollow")
-                .addAddress("10.99.0.1", 24)
-                .addAddress("fd00::1", 64) // v6 must enter the TUN to be dropped, never bypass (plan §2)
+                // NP-1118-17 role split: the DEVICE's interface
+                // address is .2; .1 is the virtual gateway that
+                // lives only inside the tunnel (the pump's NIC)
+                // and is declared as the DNS server. Declaring a
+                // DNS server that is also one of the device's own
+                // interface addresses (the pre-fix .1/.1 pairing)
+                // makes the kernel deliver netd's queries locally
+                // — they never reach the TUN fd, the pump never
+                // sees them, and system resolution dies at the
+                // configuration level (Chrome BAD_CONFIG) while
+                // direct app queries to remote resolvers work.
+                .addAddress("10.99.0.2", 24)
+                .addAddress("fd00::1", 64) // v6 must enter the TUN to be dropped, never bypass (plan §2). fd00::1 is interface-only: no v6 DNS server is declared, so the NP-1118-17 role collision does not arise here; if one is ever declared it must NOT be this address.
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer("10.99.0.1")

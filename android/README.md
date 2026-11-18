@@ -55,9 +55,16 @@ APK silently).
   → system dialog) and starts the service, which promotes itself to
   the foreground with the `specialUse` type (see
   `files/m3/fgs-verification-record.md`).
-- Since M3-2 the service establishes the TUN (10.99.0.1/24 +
-  fd00::1/64, routes 0.0.0.0/0 and ::/0 — v6 enters the TUN and is
-  dropped there, never bypassed — DNS 10.99.0.1, MTU 1280) and hands
+- Since M3-2 the service establishes the TUN (device address
+  10.99.0.2/24 + fd00::1/64, routes 0.0.0.0/0 and ::/0 — v6 enters
+  the TUN and is dropped there, never bypassed — DNS 10.99.0.1,
+  MTU 1280) and hands. Address roles (NP-1118-17 correction): .2
+  is the device's own interface address; .1 is the virtual
+  gateway inside the tunnel (the pump's NIC) and the declared
+  DNS server. The M3-2 original paired .1 with .1 — a DNS server
+  that is also the device's own address is delivered by the
+  kernel's local table and never reaches the TUN fd, which
+  silently killed all netd resolution.
   the fd to the Go session (`Hollowcore.startVPN`): pump + DNS +
   protocol core run in-process; every egress socket is protect()ed
   through the service bridge.

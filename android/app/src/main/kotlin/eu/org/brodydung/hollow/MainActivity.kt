@@ -10,8 +10,6 @@ import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
-import java.net.InetAddress
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -83,17 +81,6 @@ class MainActivity : Activity() {
     private var landingRetryDelaySec = 5
     @Volatile private var landingInFlight = false
 
-    // System-DNS hint card (NP-1118-16): the pump path and the
-    // netd path are disjoint — when the tunnel's own resolver is
-    // provably healthy while system resolution (netd, the path
-    // Chrome uses) fails sampling repeatedly, the standing cause
-    // is Private DNS (strict DoT/DoH3) failing closed over the
-    // tunnel. The card says so and deep-links to network settings.
-    private lateinit var dnsHintCard: LinearLayout
-    @Volatile private var sysDnsSampling = false
-    private var sysDnsFailRounds = 0
-    private var sysDnsLastSampleAt = 0L
-    private var sysDnsCardShown = false
     private var autoConnectTried = false
     private var lastState = "disconnected"
     private var lastConfigured = false
@@ -127,16 +114,6 @@ class MainActivity : Activity() {
             })
             addView(errorDetail)
             addView(btn("立即重试") { retryConnection() })
-        }
-
-        dnsHintCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            addView(TextView(this@MainActivity).apply { text = "\n浏览器打不开网页？"; textSize = 17f })
-            addView(TextView(this@MainActivity).apply {
-                text = "系统私人 DNS 拦截了浏览器解析——到 设置→网络和互联网→私人 DNS 改为『关闭』后重试"
-            })
-            addView(btn("打开网络设置") { openNetworkSettings() })
         }
 
         // (j) First run: one import action, nothing else.
@@ -232,7 +209,6 @@ class MainActivity : Activity() {
             addView(mainButton)
             addView(retryButton)
             addView(errorCard)
-            addView(dnsHintCard)
             addView(firstRunSection)
             addView(settingsSection)
             addView(ioSection)
@@ -363,8 +339,6 @@ class MainActivity : Activity() {
             else -> ""
         }
 
-        maybeSampleSystemDns(if (slotLost) "revoked" else state)
-
         // Rates from cumulative wire counters (display only).
         val up = st.optLong("trafficUp")
         val down = st.optLong("trafficDown")
@@ -465,92 +439,6 @@ class MainActivity : Activity() {
             caps == null || caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
         } catch (e: Exception) {
             true
-        }
-    }
-
-    // --- System-DNS sampling & hint card (NP-1118-16) ---
-
-    private fun maybeSampleSystemDns(state: String) {
-        if (state != "connected") {
-            sysDnsFailRounds = 0
-            if (sysDnsCardShown) {
-                sysDnsCardShown = false
-                dnsHintCard.visibility = View.GONE
-            }
-            return
-        }
-        val now = System.currentTimeMillis()
-        if (sysDnsSampling || now - sysDnsLastSampleAt < 10_000) return
-        sysDnsSampling = true
-        sysDnsLastSampleAt = now
-        Thread {
-            // Several well-known names; the round succeeds if ANY
-            // resolves. This process's lookups go through netd on
-            // the VPN network — the same path Chrome uses — while
-            // the pump resolver is a separate, tunnel-internal path.
-            val names = listOf("www.google.com", "gmail.com", "www.cloudflare.com")
-            var ok = false
-            for (name in names) {
-                try {
-                    if (InetAddress.getByName(name) != null) {
-                        ok = true
-                        break
-                    }
-                } catch (e: Exception) {
-                    // try the next name
-                }
-            }
-            runOnUiThread {
-                sysDnsSampling = false
-                onSysDnsSample(ok)
-            }
-        }.start()
-    }
-
-    private fun onSysDnsSample(ok: Boolean) {
-        if (ok) {
-            sysDnsFailRounds = 0
-            if (sysDnsCardShown) {
-                sysDnsCardShown = false
-                dnsHintCard.visibility = View.GONE
-                log.append("\n系统解析抽样恢复，私人 DNS 提示卡已撤下")
-            }
-            return
-        }
-        sysDnsFailRounds++
-        if (sysDnsFailRounds < 2 || sysDnsCardShown) return
-        // Require the tunnel side to be provably healthy at the
-        // same moment: carriers live and the pump resolver has
-        // resolved successfully. Otherwise the failure is ours,
-        // not the system resolver's, and the card must not blame
-        // Private DNS.
-        val st = try {
-            JSONObject(Hollowcore.vpnStateJSON())
-        } catch (e: Exception) {
-            return
-        }
-        if (st.optString("state") != "connected") return
-        val stats = st.optJSONObject("stats")
-        val pumpResolved = stats?.optLong("dnsResolved") ?: 0
-        if (st.optInt("liveCarriers") < 1 || pumpResolved < 1) return
-        sysDnsCardShown = true
-        dnsHintCard.visibility = View.VISIBLE
-        log.append("\n系统解析抽样连续 $sysDnsFailRounds 轮失败而泵解析健康（已解析 $pumpResolved）——疑似私人 DNS 拦截，已出提示卡")
-    }
-
-    private fun openNetworkSettings() {
-        val intents = listOf(
-            Intent(Settings.ACTION_WIRELESS_SETTINGS),
-            Intent(Settings.ACTION_SETTINGS)
-        )
-        for (intent in intents) {
-            try {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-                return
-            } catch (e: Exception) {
-                // try the next one
-            }
         }
     }
 
