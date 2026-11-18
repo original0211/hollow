@@ -200,9 +200,15 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 		}
 		return fwd.HandlePacket(id, pkt)
 	})
-	// UDP disposition (notes v2 §4/§5): packets to the resolver address
-	// (adapter IP, port 53) become DNS sessions tunnelled through the core;
-	// everything else — and all of IPv6 — is dropped and counted. The DNS
+	// UDP disposition (notes v2 §4/§5, widened by NP-1118-07): packets
+	// addressed to ANY DNS server (any destination address, port 53)
+	// become DNS sessions tunnelled through the core — the addressed
+	// server is never contacted; the tunnel resolver answers and the
+	// forwarder endpoint spoofs the reply source back to the addressed
+	// destination. Rationale: a system resolver that ignores the VPN's
+	// declared DNS server (or is configured with a LAN resolver) must
+	// still land in the tunnel, not in the drop bucket. Everything
+	// else — and all of IPv6 — is dropped and counted. The DNS
 	// resolver has no path around the tunnel (fail-closed by construction).
 	p.resolver = dns.NewResolver(p.dnsDialer(), cfg.DNSTimeout)
 	udpFwd := udp.NewForwarder(s, p.handleUDP)
@@ -246,16 +252,17 @@ func (p *Pump) dnsDialer() dns.DialFunc {
 	}
 }
 
-// handleUDP is the UDP forwarder entry: DNS-to-resolver sessions are
-// created; every other datagram is dropped + counted (no endpoint is
-// created for it, which IS the drop).
+// handleUDP is the UDP forwarder entry: DNS sessions (any
+// destination address, port 53 — NP-1118-07) are created; every
+// other datagram is dropped + counted (no endpoint is created for
+// it, which IS the drop).
 func (p *Pump) handleUDP(req *udp.ForwarderRequest) bool {
 	id := req.ID()
 	if len(id.LocalAddress.AsSlice()) == 16 {
 		atomic.AddUint64(&p.droppedV6, 1)
 		return true
 	}
-	if id.LocalPort != 53 || id.LocalAddress != tcpip.AddrFrom4Slice(net.ParseIP(p.cfg.HelperAddr).To4()) {
+	if id.LocalPort != 53 {
 		atomic.AddUint64(&p.droppedUDP, 1)
 		return true
 	}

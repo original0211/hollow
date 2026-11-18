@@ -113,6 +113,32 @@ func TestDNSThroughTunnel(t *testing.T) {
 		t.Fatalf("pump DNS stats = %+v", st)
 	}
 
+	// NP-1118-07 F1: a query addressed to a FOREIGN resolver address
+	// (e.g. a LAN DNS the system resolver insists on using) is also
+	// intercepted and answered through the tunnel — the addressed
+	// server is never contacted, and the reply arrives from the
+	// addressed destination (the forwarder endpoint spoofs it).
+	foreignAddr := &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 53}
+	query2 := buildDNSQuery(0x4321, "example.org")
+	if _, err := conn.WriteTo(query2, foreignAddr); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, from, err := conn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("no DNS reply for foreign resolver address: %v", err)
+	}
+	resp = buf[:n]
+	if binary.BigEndian.Uint16(resp[0:2]) != 0x4321 || resp[2]&0x80 == 0 {
+		t.Fatalf("bad foreign reply: id=%x flags=%08b", binary.BigEndian.Uint16(resp[0:2]), resp[2])
+	}
+	if udpFrom, ok := from.(*net.UDPAddr); !ok || !udpFrom.IP.Equal(foreignAddr.IP) || udpFrom.Port != 53 {
+		t.Fatalf("foreign reply source = %v, want %v (spoofed to the addressed server)", from, foreignAddr)
+	}
+	if st := p.Stats(); st.DNSResolved != 2 {
+		t.Fatalf("pump DNS stats after foreign query = %+v, want DNSResolved 2", st)
+	}
+
 	// Non-resolver UDP traffic: dropped + counted, no reply.
 	other := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 1234}
 	if _, err := conn.WriteTo([]byte("hello"), other); err != nil {

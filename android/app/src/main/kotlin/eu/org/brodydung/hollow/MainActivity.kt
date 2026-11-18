@@ -68,8 +68,13 @@ class MainActivity : Activity() {
     private var rateDown = 0L
     // Landing identification, cached per connection (sinceMs).
     private var landingForSince = 0L
-    private var landingAttemptForSince = 0L
     private var landingText = ""
+    // /meta retry state (NP-1118-07 F2): within one connection the
+    // landing fetch retries with backoff instead of latching shut
+    // after a single transient failure; every failure is logged.
+    private var landingNextRetryAtMs = 0L
+    private var landingRetryDelaySec = 5
+    @Volatile private var landingInFlight = false
     private var autoConnectTried = false
     private var lastState = "disconnected"
     private var lastConfigured = false
@@ -324,14 +329,25 @@ class MainActivity : Activity() {
 
         if (state == "connected") {
             val since = st.optLong("sinceMs")
-            if (since > 0 && since != landingAttemptForSince) {
-                landingAttemptForSince = since
+            if (since > 0 && landingForSince != since && !landingInFlight &&
+                System.currentTimeMillis() >= landingNextRetryAtMs
+            ) {
+                landingInFlight = true
                 Thread {
                     try {
                         val m = JSONObject(Hollowcore.fetchMetaJSON())
                         landingText = "${m.optString("colo")} / ${m.optString("country")}"
                         landingForSince = since
-                    } catch (_: Exception) {
+                        landingRetryDelaySec = 5
+                    } catch (e: Exception) {
+                        val delay = landingRetryDelaySec
+                        landingNextRetryAtMs = System.currentTimeMillis() + delay * 1000L
+                        landingRetryDelaySec = minOf(delay * 3, 60)
+                        runOnUiThread {
+                            log.append("\n落地信息（/meta）拉取失败：${e.message ?: "未知错误"}；${delay} 秒后重试")
+                        }
+                    } finally {
+                        landingInFlight = false
                     }
                 }.start()
             }
@@ -348,7 +364,10 @@ class MainActivity : Activity() {
                 "本次流量 ↓ ${fmtBytes(down)} · ↑ ${fmtBytes(up)} · 已连接 ${fmtDuration(secs)}"
         } else {
             readingsView.text = ""
-            if (state == "disconnected") { landingText = ""; landingForSince = 0; landingAttemptForSince = 0 }
+            if (state == "disconnected") {
+                landingText = ""; landingForSince = 0
+                landingNextRetryAtMs = 0; landingRetryDelaySec = 5
+            }
         }
         // The two fixed notices, verbatim (plan §6).
         noticesView.text = if (state == "connected") "IPv6 已阻断 · UDP 流量不经过 Hollow 加密通道" else ""
