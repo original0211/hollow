@@ -45,9 +45,13 @@ class HollowVpnService : VpnService() {
 
     private var sessionRunning = false
     private var notifThread: Thread? = null
+    private var lastUp = -1L
+    private var lastDown = -1L
+    private var lastSampleAt = 0L
 
-    /** Notification text from the facade state (M3-4): state label,
-     *  elapsed time, and the two counters a glance should carry. */
+    /** Notification text from the facade state (NP-1118-03): the
+     *  persistent notification carries the connection state and the
+     *  live rates (from the core's wire counters), not a placeholder. */
     private fun notifText(): String {
         return try {
             val st = org.json.JSONObject(Hollowcore.vpnStateJSON())
@@ -57,13 +61,29 @@ class HollowVpnService : VpnService() {
                 "error" -> "连接失败"
                 else -> "未连接"
             }
-            val stats = st.optJSONObject("stats")
-            val dns = stats?.optLong("dnsQueries") ?: 0
-            val drops = (stats?.optLong("droppedUdp") ?: 0) + (stats?.optLong("droppedV6") ?: 0)
-            "Hollow $label · DNS 查询 $dns · 丢弃 $drops"
+            if (st.optString("state") != "connected") return "Hollow $label"
+            val up = st.optLong("trafficUp")
+            val down = st.optLong("trafficDown")
+            val now = System.currentTimeMillis()
+            var rateUp = 0L
+            var rateDown = 0L
+            if (lastSampleAt > 0 && now > lastSampleAt) {
+                val dt = (now - lastSampleAt) / 1000.0
+                rateUp = ((up - lastUp) / dt).toLong()
+                rateDown = ((down - lastDown) / dt).toLong()
+            }
+            lastUp = up; lastDown = down; lastSampleAt = now
+            "Hollow $label · ↓ ${fmtBytes(rateDown)}/s · ↑ ${fmtBytes(rateUp)}/s · 本次 ↓ ${fmtBytes(down)} · ↑ ${fmtBytes(up)}"
         } catch (e: Exception) {
             "Hollow 隧道运行中"
         }
+    }
+
+    private fun fmtBytes(n: Long): String = when {
+        n < 1024 -> "$n B"
+        n < 1024 * 1024 -> String.format("%.1f KB", n / 1024.0)
+        n < 1024 * 1024 * 1024 -> String.format("%.1f MB", n / 1024.0 / 1024.0)
+        else -> String.format("%.2f GB", n / 1024.0 / 1024.0 / 1024.0)
     }
 
     private fun startNotifTicker() {

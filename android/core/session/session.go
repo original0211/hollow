@@ -46,6 +46,14 @@ type Session struct {
 	deathCh chan struct{} // carrier deaths (buffered 1)
 	tunFD   int           // owned once Start succeeds; closed by Stop
 
+	// NP-1117-16 parity (NP-1118-03): budget / timed rotation.
+	rotateCh chan struct{}  // rotation requests (buffered 1)
+	rotateMu sync.Mutex     // serializes carrier rotations
+	drains   map[*core.HollowClient]struct{} // swapped-out clients draining
+	counters *byteCounters  // wire traffic (display only)
+	lastRTT  time.Duration  // handshake RTT of the current carrier
+	rotateEvery time.Duration // timed rotation interval (0 = 15 min)
+
 	// UI-facing state machine (M3-4), guarded by mu: disconnected /
 	// connecting / connected / error, plus the counters the status
 	// surface presents. The error state surfaces via Start's return
@@ -64,13 +72,28 @@ type StateSnapshot struct {
 	SinceMs   int64
 	Carriers  int
 	StreamsOK int
+	// NP-1118-03 readings: wire bytes at the transport boundary,
+	// the current carrier's handshake RTT, live/total carriers.
+	TrafficUp   int64
+	TrafficDown int64
+	CarrierRTTMs int64
+	LiveCarriers int
+	PoolSize     int
 }
 
 // State reads the presentation snapshot.
 func (s *Session) State() StateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return StateSnapshot{s.state, s.detail, s.sinceMs, s.carriers, s.streamsOK}
+	snap := StateSnapshot{State: s.state, Detail: s.detail, SinceMs: s.sinceMs, Carriers: s.carriers, StreamsOK: s.streamsOK, CarrierRTTMs: s.lastRTT.Milliseconds(), PoolSize: 1}
+	if s.counters != nil {
+		snap.TrafficUp = s.counters.up.Load()
+		snap.TrafficDown = s.counters.down.Load()
+	}
+	if s.client != nil {
+		snap.LiveCarriers = 1
+	}
+	return snap
 }
 
 var (
@@ -89,7 +112,7 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 	if cfg.KeyID == 0 {
 		cfg.KeyID = 1
 	}
-	s := &Session{cfg: cfg, protector: protector, stopCh: make(chan struct{}), deathCh: make(chan struct{}, 1), tunFD: tunFD, state: "connecting"}
+	s := &Session{cfg: cfg, protector: protector, stopCh: make(chan struct{}), deathCh: make(chan struct{}, 1), tunFD: tunFD, state: "connecting", rotateCh: make(chan struct{}, 1), counters: &byteCounters{}, drains: map[*core.HollowClient]struct{}{}}
 
 	ep, err := fdbased.New(&fdbased.Options{FDs: []int{tunFD}, MTU: 1280})
 	if err != nil {
@@ -111,12 +134,45 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 
 // rotateCarrier dials a fresh carrier and handshakes it in, replacing
 // any previous client (§8.4: the data plane persists across rotations).
+// The replaced client is closed immediately (death path: it is dead
+// or dying anyway).
 func (s *Session) rotateCarrier(ctx context.Context) error {
-	tport, err := dialCarrier(ctx, s.cfg.WSURL, s.protector)
+	return s.rotate(ctx, false)
+}
+
+// rotateCarrierDrain is the NP-1117-16 build-then-swap rotation: the
+// replacement is built and handshaken FIRST, the pointer swaps
+// atomically, and the replaced client DRAINS — it closes when its
+// stream table empties or after the 10-minute grace, whichever first.
+func (s *Session) rotateCarrierDrain(ctx context.Context) error {
+	return s.rotate(ctx, true)
+}
+
+// signalRotate requests a budget/timed rotation (non-blocking; safe
+// on a nil channel and from the core event loop).
+func (s *Session) signalRotate() {
+	select {
+	case s.rotateCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) rotate(ctx context.Context, drainOld bool) error {
+	s.rotateMu.Lock()
+	defer s.rotateMu.Unlock()
+	s.mu.Lock()
+	if s.counters == nil {
+		s.counters = &byteCounters{}
+	}
+	counters := s.counters
+	s.mu.Unlock()
+	dialStart := time.Now()
+	tport, err := dialCarrier(ctx, s.cfg.WSURL, s.protector, counters)
 	if err != nil {
 		return fmt.Errorf("session: carrier dial: %w", err)
 	}
 	client := core.NewClient(tport, core.ClientOptions{PSK: s.cfg.PSK, KeyID: byte(s.cfg.KeyID)})
+	client.OnOpenThreshold = s.signalRotate
 	tport.attach(client)
 	client.OnCarrierDead = func(reason string) {
 		s.mu.Lock()
@@ -153,25 +209,79 @@ func (s *Session) rotateCarrier(ctx context.Context) error {
 	old := s.client
 	s.client = client
 	s.carriers++
+	s.lastRTT = time.Since(dialStart)
 	if s.sinceMs == 0 {
 		s.sinceMs = time.Now().UnixMilli()
 	}
 	s.state, s.detail = "connected", ""
 	s.mu.Unlock()
 	if old != nil {
-		old.Close()
+		if drainOld {
+			s.trackDrain(old)
+		} else {
+			old.Close()
+		}
 	}
 	return nil
 }
 
+// trackDrain keeps a swapped-out client alive until its streams end
+// or the 10-minute grace expires (NP-1117-16 drain semantics).
+func (s *Session) trackDrain(c *core.HollowClient) {
+	s.mu.Lock()
+	if s.drains == nil {
+		s.drains = map[*core.HollowClient]struct{}{}
+	}
+	s.drains[c] = struct{}{}
+	s.mu.Unlock()
+	go func() {
+		deadline := time.Now().Add(10 * time.Minute)
+		for {
+			if c.ActiveStreams() == 0 || time.Now().After(deadline) {
+				c.Close()
+				s.mu.Lock()
+				delete(s.drains, c)
+				s.mu.Unlock()
+				return
+			}
+			select {
+			case <-s.stopCh:
+				return // Stop closes drains itself
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}()
+}
+
 // watchdog re-dials dead carriers with the §8.4 backoff (1s doubling,
-// capped 60s, ±25% jitter) until Stop.
+// capped 60s, ±25% jitter) until Stop. It also serves the NP-1117-16
+// rotation triggers: the per-client OPEN budget (rotateCh, signalled
+// by core at 40 opens) and the 15-minute timer — both take the
+// build-then-swap drain path, and a failed rotation retries on a
+// slow timer instead of disturbing the live carrier.
 func (s *Session) watchdog() {
+	if s.rotateCh == nil {
+		s.rotateCh = make(chan struct{}, 1)
+	}
+	rotateEvery := s.rotateEvery
+	if rotateEvery <= 0 {
+		rotateEvery = 15 * time.Minute
+	}
+	ticker := time.NewTicker(rotateEvery)
+	defer ticker.Stop()
 	backoff := time.Second
 	for {
 		select {
 		case <-s.stopCh:
 			return
+		case <-s.rotateCh:
+			if err := s.rotateCarrierDrain(context.Background()); err != nil {
+				time.AfterFunc(5*time.Second, s.signalRotate)
+			}
+			continue
+		case <-ticker.C:
+			s.signalRotate()
+			continue
 		case <-s.deathCh:
 		}
 		for {
@@ -194,18 +304,80 @@ func (s *Session) watchdog() {
 }
 
 // dialFlow is the pump's FlowDialer: open a core stream to ip:port on
-// the current carrier (10s open budget).
+// the current carrier (10s total open budget). Retry semantics mirror
+// the Windows client (NP-1117-14 + NP-1117-16): an OPEN_REJECT with
+// 0x01 (concurrency) retries on the SAME carrier with a fresh stream
+// (250ms backoff doubling to 2s, ±25% jitter, retry_after as floor);
+// a 0x06 on a carrier at/over its rotation threshold rotates the
+// carrier (build-then-swap, old drains) and retries ONCE on the new
+// carrier — at most one migration per dial.
 func (s *Session) dialFlow(ip net.IP, port uint16) (net.Conn, error) {
-	s.mu.Lock()
-	client := s.client
-	s.mu.Unlock()
-	if client == nil {
-		return nil, errNoCarrier
+	deadline := time.Now().Add(10 * time.Second)
+	migrated := false
+	backoff := 250 * time.Millisecond
+	for {
+		s.mu.Lock()
+		client := s.client
+		s.mu.Unlock()
+		if client == nil {
+			return nil, errNoCarrier
+		}
+		stream, err := client.OpenStream(ip.String(), int(port), core.SchemeUnknown, 0)
+		if err != nil {
+			return nil, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			stream.Reset(core.ErrStreamTimeout)
+			return nil, errors.New("session: stream open timeout")
+		}
+		openErr := waitStreamOpen(stream, remaining)
+		if openErr == nil {
+			s.mu.Lock()
+			s.streamsOK++
+			s.mu.Unlock()
+			return newStreamConn(stream, &net.TCPAddr{IP: ip, Port: int(port)}), nil
+		}
+		var rej *core.OpenRejectError
+		if errors.As(openErr, &rej) {
+			if rej.Code == core.ErrConcurrencyLimit && time.Now().Before(deadline) {
+				wait := time.Duration(float64(backoff) * (0.75 + 0.5*mathrand.Float64()))
+				if ra := time.Duration(rej.RetryAfterMs) * time.Millisecond; ra > wait {
+					wait = ra
+				}
+				if wait > time.Until(deadline) {
+					wait = time.Until(deadline)
+				}
+				select {
+				case <-s.stopCh:
+					return nil, errStopped
+				case <-time.After(wait):
+				}
+				backoff *= 2
+				if backoff > 2*time.Second {
+					backoff = 2 * time.Second
+				}
+				continue
+			}
+			if rej.Code == core.ErrOutboundFailed && !migrated &&
+				(client.OpensSent() >= core.SessionRotateThreshold || client.BudgetExhausted()) {
+				migrated = true
+				rctx, cancel := context.WithDeadline(context.Background(), deadline)
+				rerr := s.rotateCarrierDrain(rctx)
+				cancel()
+				if rerr == nil {
+					continue
+				}
+				return nil, openErr
+			}
+		}
+		return nil, openErr
 	}
-	stream, err := client.OpenStream(ip.String(), int(port), core.SchemeUnknown, 0)
-	if err != nil {
-		return nil, err
-	}
+}
+
+// waitStreamOpen waits for a stream's open resolution with a timeout;
+// on timeout the stream is reset (the pre-NP-1118-03 behavior).
+func waitStreamOpen(stream *core.ClientStream, timeout time.Duration) error {
 	type res struct {
 		gate byte
 		err  error
@@ -217,17 +389,11 @@ func (s *Session) dialFlow(ip net.IP, port uint16) (net.Conn, error) {
 	}()
 	select {
 	case r := <-ch:
-		if r.err != nil {
-			return nil, r.err
-		}
-	case <-time.After(10 * time.Second):
+		return r.err
+	case <-time.After(timeout):
 		stream.Reset(core.ErrStreamTimeout)
-		return nil, errors.New("session: stream open timeout")
+		return errors.New("session: stream open timeout")
 	}
-	s.mu.Lock()
-	s.streamsOK++
-	s.mu.Unlock()
-	return newStreamConn(stream, &net.TCPAddr{IP: ip, Port: int(port)}), nil
 }
 
 // FetchMeta performs the /meta landing identification fetch over the
@@ -284,6 +450,16 @@ func (s *Session) Stop() {
 	close(s.stopCh)
 	if client != nil {
 		client.Close()
+	}
+	s.mu.Lock()
+	drains := make([]*core.HollowClient, 0, len(s.drains))
+	for c := range s.drains {
+		drains = append(drains, c)
+	}
+	s.drains = map[*core.HollowClient]struct{}{}
+	s.mu.Unlock()
+	for _, c := range drains {
+		c.Close()
 	}
 	if s.pump != nil {
 		s.pump.Close()

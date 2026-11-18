@@ -9,6 +9,7 @@
 package core
 
 import (
+	"fmt"
 	"errors"
 	"math/rand"
 	"sync/atomic"
@@ -27,6 +28,18 @@ type QueuedInfo struct {
 	Position  int
 	EstWaitMs int
 	MaxWaitMs int
+}
+
+// OpenRejectError is the typed form of an OPEN_REJECT: WaitOpen
+// returns it so callers can branch on the code (the session layer's
+// retry / rotation policy keys off 0x01 vs 0x06, NP-1118-03).
+type OpenRejectError struct {
+	Code         byte
+	RetryAfterMs int
+}
+
+func (e *OpenRejectError) Error() string {
+	return fmt.Sprintf("open rejected (code 0x%02x)", e.Code)
 }
 
 type ClientStream struct {
@@ -165,6 +178,15 @@ type HollowClient struct {
 
 	OnCarrierDead func(reason string)
 
+	// NP-1117-16 parity (NP-1118-03): every OPEN frame this client
+	// sends is counted; when the count reaches exactly
+	// SessionRotateThreshold, OnOpenThreshold fires (once). The
+	// callback runs on the event loop and MUST be non-blocking
+	// (signal a channel; the session layer rotates asynchronously).
+	opensSent     atomic.Int64
+	activeStreams atomic.Int64
+	OnOpenThreshold func()
+
 	inbox chan func()
 }
 
@@ -273,6 +295,23 @@ func (c *HollowClient) Err() error {
 	return nil
 }
 
+// Session budget constants (NP-1117-16 semantics, spec-anchored in
+// the M4 long-run diagnosis): a Worker invocation admits ~50
+// subrequests, so a carrier is retired BEFORE the ceiling.
+const (
+	SessionRotateThreshold = 40
+	SessionOpenHardCap     = 50
+)
+
+// OpensSent reports how many OPEN frames this client has sent.
+func (c *HollowClient) OpensSent() int64 { return c.opensSent.Load() }
+
+// ActiveStreams reports how many streams are currently registered.
+func (c *HollowClient) ActiveStreams() int64 { return c.activeStreams.Load() }
+
+// BudgetExhausted reports whether this client has hit the hard cap.
+func (c *HollowClient) BudgetExhausted() bool { return c.opensSent.Load() >= SessionOpenHardCap }
+
 // OpenStream registers a stream and sends OPEN (§6.3).
 func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy byte) (*ClientStream, error) {
 	s := &ClientStream{
@@ -302,6 +341,10 @@ func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy 
 			return
 		}
 		c.sendFrame(BuildFrame(FTOpen, s.ID, payload), true)
+		c.activeStreams.Add(1)
+		if n := c.opensSent.Add(1); n == SessionRotateThreshold && c.OnOpenThreshold != nil {
+			c.OnOpenThreshold()
+		}
 		// §6.5 v0.2.1: top up the server's per-stream window for
 		// the return direction (rides right behind OPEN).
 		c.topUp(s.ID, c.streamWindowGrant-StreamWindowInit)
@@ -590,7 +633,7 @@ func (c *HollowClient) dispatch(f Frame) {
 		s.State = "rejected"
 		code := f.Payload[0]
 		retryAfterMs := readU16(f.Payload, 1)
-		s.openErr = errors.New("open rejected")
+		s.openErr = &OpenRejectError{Code: code, RetryAfterMs: retryAfterMs}
 		if s.OnReject != nil {
 			s.OnReject(code, retryAfterMs)
 		}
@@ -694,6 +737,9 @@ func (c *HollowClient) maybeFreeStream(s *ClientStream) {
 func (c *HollowClient) forgetStream(s *ClientStream) {
 	if c.sender != nil {
 		c.sender.Flush()
+	}
+	if _, ok := c.streams[s.ID]; ok {
+		c.activeStreams.Add(-1)
 	}
 	delete(c.streams, s.ID)
 }

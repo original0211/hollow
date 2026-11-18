@@ -24,6 +24,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- (j) hollow:// pairing links open the import funnel. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="hollow" />
+            </intent-filter>
         </activity>
 
         <!-- VpnService. foregroundServiceType=specialUse with the

@@ -17,6 +17,7 @@ package session
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"net/http"
 	"sync"
 	"syscall"
@@ -65,16 +66,25 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
-// wsTransport implements core.Transport over one gorilla connection.
-type wsTransport struct {
-	conn    *websocket.Conn
-	client  *core.HollowClient
-	writeMu sync.Mutex
-	done    chan struct{}
-	once    sync.Once
+// byteCounters accumulates wire bytes at the transport boundary
+// (NP-1118-03, the Windows core-bridge traffic counters' Go twin):
+// display-only, shared across rotations by pointer.
+type byteCounters struct {
+	up   atomic.Int64
+	down atomic.Int64
 }
 
-func dialCarrier(ctx context.Context, wsURL string, p Protector) (*wsTransport, error) {
+// wsTransport implements core.Transport over one gorilla connection.
+type wsTransport struct {
+	conn     *websocket.Conn
+	client   *core.HollowClient
+	writeMu  sync.Mutex
+	done     chan struct{}
+	once     sync.Once
+	counters *byteCounters // may be nil (tests)
+}
+
+func dialCarrier(ctx context.Context, wsURL string, p Protector, counters *byteCounters) (*wsTransport, error) {
 	dialer := websocket.Dialer{
 		NetDialContext:   protectedDialContext(p),
 		HandshakeTimeout: 15 * time.Second,
@@ -85,7 +95,7 @@ func dialCarrier(ctx context.Context, wsURL string, p Protector) (*wsTransport, 
 	if err != nil {
 		return nil, err
 	}
-	return &wsTransport{conn: conn, done: make(chan struct{})}, nil
+	return &wsTransport{conn: conn, done: make(chan struct{}), counters: counters}, nil
 }
 
 // attach binds the core client and starts the read loop + WS ping ticker
@@ -102,6 +112,9 @@ func (t *wsTransport) readLoop() {
 		if err != nil {
 			t.shutdown()
 			return
+		}
+		if t.counters != nil {
+			t.counters.down.Add(int64(len(msg)))
 		}
 		t.client.HandleMessage(msg)
 	}
@@ -136,6 +149,9 @@ func (t *wsTransport) Send(b []byte) {
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
 	_ = t.conn.WriteMessage(websocket.BinaryMessage, b)
+	if t.counters != nil {
+		t.counters.up.Add(int64(len(b)))
+	}
 }
 
 func (t *wsTransport) Close() { t.shutdown() }

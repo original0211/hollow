@@ -12,6 +12,7 @@ import (
 	"errors"
 	"sync"
 
+	"hollow/androidcore/core"
 	"hollow/androidcore/pump"
 	"hollow/androidcore/session"
 )
@@ -134,6 +135,30 @@ func FetchMetaJSON() (string, error) {
 	return string(b), nil
 }
 
+// StoredPairingJSON returns the stored pairing's DISPLAY fields for
+// the settings surface (NP-1118-03): address, keyId, endpoint paths
+// and the pairing verifier V — the same V the Windows client shows.
+// The PSK itself never leaves the store; V is a one-way derivation.
+func StoredPairingJSON() string {
+	sc, err := readStored()
+	if err != nil || sc == nil {
+		return "{}"
+	}
+	out := struct {
+		WSURL     string `json:"wsUrl"`
+		KeyID     int    `json:"keyId"`
+		MetaPath  string `json:"metaPath"`
+		EdgesPath string `json:"edgesPath"`
+		HasPSK    bool   `json:"hasPsk"`
+		Verifier  string `json:"pskVerifier,omitempty"`
+	}{sc.WSURL, sc.KeyID, sc.MetaPath, sc.EdgesPath, sc.PSKEnc != "", ""}
+	if psk, err := unsealStoredPSK(sc); err == nil && psk != nil {
+		out.Verifier = hex.EncodeToString(core.DeriveVerifier(psk))
+	}
+	b, _ := json.Marshal(out)
+	return string(b)
+}
+
 // ---- M3-4 presentation state ----
 
 // lastStartError holds the most recent StartVPN failure for the UI's
@@ -162,15 +187,20 @@ func VPNStateJSON() string {
 		configured, wsURL, keyID = sc.PSKEnc != "", sc.WSURL, sc.KeyID
 	}
 	out, _ := json.Marshal(struct {
-		State      string     `json:"state"`
-		Detail     string     `json:"detail"`
-		SinceMs    int64      `json:"sinceMs"`
-		Carriers   int        `json:"carriers"`
-		StreamsOK  int        `json:"streams"`
-		Stats      pump.Stats `json:"stats"`
-		Configured bool       `json:"configured"`
-		WSURL      string     `json:"wsUrl"`
-		KeyID      int        `json:"keyId"`
-	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID})
+		State        string     `json:"state"`
+		Detail       string     `json:"detail"`
+		SinceMs      int64      `json:"sinceMs"`
+		Carriers     int        `json:"carriers"`
+		StreamsOK    int        `json:"streams"`
+		Stats        pump.Stats `json:"stats"`
+		Configured   bool       `json:"configured"`
+		WSURL        string     `json:"wsUrl"`
+		KeyID        int        `json:"keyId"`
+		TrafficUp    int64      `json:"trafficUp"`
+		TrafficDown  int64      `json:"trafficDown"`
+		CarrierRTTMs int64      `json:"carrierRttMs"`
+		LiveCarriers int        `json:"liveCarriers"`
+		PoolSize     int        `json:"poolSize"`
+	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize})
 	return string(out)
 }
