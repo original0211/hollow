@@ -9,8 +9,8 @@
 package core
 
 import (
-	"fmt"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync/atomic"
 )
@@ -132,8 +132,8 @@ type ClientOptions struct {
 	// INIT values reproduces pre-v0.2.1 behavior exactly.
 	StreamWindowGrant int
 	ConnWindowGrant   int
-	PSK   []byte
-	KeyID byte // zero means 1, as the JS default
+	PSK               []byte
+	KeyID             byte // zero means 1, as the JS default
 
 	// Test-only determinism hooks (nil in production): a fixed ephemeral
 	// key pair, client random and hello padding, so a recorded session
@@ -153,18 +153,18 @@ type HollowClient struct {
 	FailReason string
 	GoAwayCode *byte
 
-	streams         map[uint32]*ClientStream
-	nextStreamID    uint32
+	streams           map[uint32]*ClientStream
+	nextStreamID      uint32
 	streamWindowGrant int
 	connWindowGrant   int
 	halfStreamWindow  int
 	halfConnWindow    int
-	sender          *RecordSender
-	receiver        *RecordReceiver
-	connSendWindow  int
-	connRecvWindow  int
-	connRecvUnacked int
-	WireSizes       []int // observed inbound WS message sizes (F-8)
+	sender            *RecordSender
+	receiver          *RecordReceiver
+	connSendWindow    int
+	connRecvWindow    int
+	connRecvUnacked   int
+	WireSizes         []int // observed inbound WS message sizes (F-8)
 
 	keys           *SessionKeys
 	th             []byte
@@ -183,8 +183,8 @@ type HollowClient struct {
 	// SessionRotateThreshold, OnOpenThreshold fires (once). The
 	// callback runs on the event loop and MUST be non-blocking
 	// (signal a channel; the session layer rotates asynchronously).
-	opensSent     atomic.Int64
-	activeStreams atomic.Int64
+	opensSent       atomic.Int64
+	activeStreams   atomic.Int64
 	OnOpenThreshold func()
 
 	inbox chan func()
@@ -204,21 +204,21 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 		connGrant = ConnWindowGrant
 	}
 	c := &HollowClient{
-		transport:      t,
-		psk:            opts.PSK,
-		keyID:          keyID,
-		opts:           opts,
-		State:          "idle",
-		streams:        map[uint32]*ClientStream{},
-		nextStreamID:   1,
+		transport:         t,
+		psk:               opts.PSK,
+		keyID:             keyID,
+		opts:              opts,
+		State:             "idle",
+		streams:           map[uint32]*ClientStream{},
+		nextStreamID:      1,
 		streamWindowGrant: streamGrant,
 		connWindowGrant:   connGrant,
 		halfStreamWindow:  streamGrant / 2,
 		halfConnWindow:    connGrant / 2,
-		connSendWindow: ConnWindowInit,
-		connRecvWindow: connGrant,
-		hsDone:         make(chan struct{}),
-		inbox:          make(chan func(), 4096),
+		connSendWindow:    ConnWindowInit,
+		connRecvWindow:    connGrant,
+		hsDone:            make(chan struct{}),
+		inbox:             make(chan func(), 4096),
 	}
 	go c.run()
 	return c
@@ -313,13 +313,32 @@ func (c *HollowClient) ActiveStreams() int64 { return c.activeStreams.Load() }
 func (c *HollowClient) BudgetExhausted() bool { return c.opensSent.Load() >= SessionOpenHardCap }
 
 // OpenStream registers a stream and sends OPEN (§6.3).
+// StreamCallbacks bundles a stream's event handlers. They are
+// installed at construction, BEFORE the stream is registered
+// with the client's event loop, so the loop can never observe
+// a half-wired stream when the carrier dies mid-dial
+// (NP-1118-30 race fix: callback assignment used to race die()).
+type StreamCallbacks struct {
+	OnData  func([]byte)
+	OnEnd   func()
+	OnReset func(code byte)
+	OnFail  func(reason string)
+}
+
 func (c *HollowClient) OpenStream(host string, port int, schemeHint, gatePolicy byte) (*ClientStream, error) {
+	return c.OpenStreamWithCallbacks(host, port, schemeHint, gatePolicy, nil)
+}
+
+func (c *HollowClient) OpenStreamWithCallbacks(host string, port int, schemeHint, gatePolicy byte, cb *StreamCallbacks) (*ClientStream, error) {
 	s := &ClientStream{
 		client:     c,
 		State:      "opening",
 		sendWindow: StreamWindowInit,
 		recvWindow: c.streamWindowGrant,
 		openDone:   make(chan struct{}),
+	}
+	if cb != nil {
+		s.OnData, s.OnEnd, s.OnReset, s.OnFail = cb.OnData, cb.OnEnd, cb.OnReset, cb.OnFail
 	}
 	var buildErr error
 	c.enqueue(func() {

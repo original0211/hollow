@@ -43,6 +43,7 @@ type FlowDialer func(ip net.IP, port uint16) (net.Conn, error)
 // Config tunes the pump. Zero values get the production defaults.
 type Config struct {
 	DialFlow    FlowDialer    // upstream opener for TCP flows and DNS (required)
+	DialDNS     FlowDialer    // optional: DNS-only opener (defaults to DialFlow)
 	MaxFlows    int           // default 512
 	IdleTimeout time.Duration // default 120s
 	MTU         uint32        // default 1280
@@ -281,10 +282,14 @@ func (p *Pump) dnsDialers() []dns.DialFunc {
 			if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
 				return nil, err
 			}
-			if p.cfg.DialFlow == nil {
+			dial := p.cfg.DialFlow
+			if p.cfg.DialDNS != nil {
+				dial = p.cfg.DialDNS
+			}
+			if dial == nil {
 				return nil, fmt.Errorf("pump: no DialFlow configured")
 			}
-			return p.cfg.DialFlow(ip, uint16(port))
+			return dial(ip, uint16(port))
 		})
 	}
 	return out

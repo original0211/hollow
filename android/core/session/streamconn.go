@@ -27,24 +27,37 @@ type streamConn struct {
 func newStreamConn(stream *core.ClientStream, remote net.Addr) *streamConn {
 	c := &streamConn{stream: stream, remote: remote}
 	c.cond = sync.NewCond(&c.mu)
-	stream.OnData = func(d []byte) {
-		c.mu.Lock()
-		if !c.closed {
-			c.queue = append(c.queue, append([]byte(nil), d...))
-		}
-		c.mu.Unlock()
-		c.cond.Broadcast()
-	}
+	return c
+}
+
+// callbacks returns the stream event handlers wired to this
+// conn, for installation at stream construction via
+// OpenStreamWithCallbacks (see core.StreamCallbacks).
+func (c *streamConn) callbacks() *core.StreamCallbacks {
 	end := func() {
 		c.mu.Lock()
 		c.readEOF = true
 		c.mu.Unlock()
 		c.cond.Broadcast()
 	}
-	stream.OnEnd = end
-	stream.OnReset = func(byte) { end() }
-	stream.OnFail = func(string) { end() }
-	return c
+	return &core.StreamCallbacks{
+		OnData: func(d []byte) {
+			c.mu.Lock()
+			if !c.closed {
+				c.queue = append(c.queue, append([]byte(nil), d...))
+			}
+			c.mu.Unlock()
+			c.cond.Broadcast()
+		},
+		OnEnd:   end,
+		OnReset: func(byte) { end() },
+		OnFail:  func(string) { end() },
+	}
+}
+
+// bind attaches the stream created with this conn's callbacks.
+func (c *streamConn) bind(stream *core.ClientStream) {
+	c.stream = stream
 }
 
 func (c *streamConn) Read(b []byte) (int, error) {

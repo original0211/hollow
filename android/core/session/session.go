@@ -277,10 +277,12 @@ func (l *lineage) dial(ip net.IP, port uint16, deadline time.Time) (net.Conn, *c
 		if client == nil {
 			return nil, nil, errNoCarrier
 		}
-		stream, err := client.OpenStream(ip.String(), int(port), core.SchemeUnknown, 0)
+		sc := newStreamConn(nil, &net.TCPAddr{IP: ip, Port: int(port)})
+		stream, err := client.OpenStreamWithCallbacks(ip.String(), int(port), core.SchemeUnknown, 0, sc.callbacks())
 		if err != nil {
 			return nil, client, err
 		}
+		sc.bind(stream)
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			stream.Reset(core.ErrStreamTimeout)
@@ -288,7 +290,7 @@ func (l *lineage) dial(ip net.IP, port uint16, deadline time.Time) (net.Conn, *c
 		}
 		openErr := waitStreamOpen(stream, remaining)
 		if openErr == nil {
-			return newStreamConn(stream, &net.TCPAddr{IP: ip, Port: int(port)}), client, nil
+			return sc, client, nil
 		}
 		var rej *core.OpenRejectError
 		if errors.As(openErr, &rej) && rej.Code == core.ErrConcurrencyLimit && time.Now().Before(deadline) {
@@ -431,23 +433,26 @@ type Session struct {
 	rotateEvery time.Duration // timed rotation interval (0 = 15 min)
 
 	// Entry dispersion (NP-1118-09, edges.go), guarded by mu.
-	bootstrapIPs   []string // entry hostname's resolved set (NP-1118-11), guarded by mu
+	bootstrapIPs    []string     // entry hostname's resolved set (NP-1118-11), guarded by mu
 	bootstrapPinned map[int]bool // slots whose current pin came from the bootstrap tier (NP-1118-14)
-	edgeCandidates []EdgeCandidate
-	edgeFailCounts map[string]int
-	edgeDisfavored map[string]bool
-	slotEdges      map[int]string
-	measuring      bool
-	lastMeasure    time.Time
+	edgeCandidates  []EdgeCandidate
+	edgeFailCounts  map[string]int
+	edgeDisfavored  map[string]bool
+	slotEdges       map[int]string
+	measuring       bool
+	lastMeasure     time.Time
 
 	// UI-facing state machine (M3-4), guarded by mu: disconnected /
 	// connecting / connected / error, plus the counters the status
 	// surface presents.
-	state     string
-	detail    string
-	sinceMs   int64
-	streamsOK int
-	lastRTT   time.Duration
+	state      string
+	detail     string
+	sinceMs    int64
+	streamsOK  int
+	lastRTT    time.Duration
+	phx        phoenixBreaker
+	phxReopens atomic.Int64
+	phxSaved   atomic.Int64
 }
 
 func (s *Session) isStopping() bool {
@@ -601,6 +606,10 @@ type StateSnapshot struct {
 	// list — same field names as the JS bridge snapshot.
 	SlotEdges      []string
 	EdgeCandidates []EdgeCandidate
+	// Phoenix (NP-1118-30): pre-first-byte reopens performed and
+	// flows saved by one (reached first byte after a reopen).
+	PhoenixReopens int64
+	PhoenixSaved   int64
 }
 
 // State reads the presentation snapshot.
@@ -619,6 +628,7 @@ func (s *Session) State() StateSnapshot {
 	snap.LiveCarriers = live
 	s.mu.Lock()
 	snap.State, snap.Detail, snap.SinceMs, snap.StreamsOK = s.state, s.detail, s.sinceMs, s.streamsOK
+	snap.PhoenixReopens, snap.PhoenixSaved = s.phxReopens.Load(), s.phxSaved.Load()
 	snap.CarrierRTTMs = s.lastRTT.Milliseconds()
 	snap.SlotEdges = make([]string, len(lines))
 	for i := range lines {
@@ -662,7 +672,8 @@ func Start(cfg Config, tunFD int, protector Protector) (*Session, error) {
 		return nil, fmt.Errorf("session: fd endpoint: %w", err)
 	}
 	p, err := pump.NewPump(pump.Config{
-		DialFlow: s.dialFlow,
+		DialFlow: s.dialFlowPhoenix,
+		DialDNS:  s.dialFlow,
 		RTTHint: func() (int64, bool) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
