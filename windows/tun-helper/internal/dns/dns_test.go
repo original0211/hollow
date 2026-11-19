@@ -446,3 +446,91 @@ func TestColdStartTrapEscapes(t *testing.T) {
 		t.Fatalf("second exchange took %v, want first-attempt success (~5.5s)", d)
 	}
 }
+
+// ---- NP-1118-34: dial-stage recovery window (Plan B) ----
+
+func withDialRetry(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := dialRetryInterval
+	dialRetryInterval = d
+	t.Cleanup(func() { dialRetryInterval = old })
+}
+
+// A carrier recovery window: every dial fails for the first
+// ~1.2s (the replacement lineage is still handshaking), then
+// the path is back. The pre-Plan-B resolver SERVFAILed on the
+// first all-dialers-failed pass (~0ms); the windowed retry
+// must turn the same exchange into a slow success.
+func TestDialStageRecoveryWindow(t *testing.T) {
+	withDialRetry(t, 100*time.Millisecond)
+	good := startUpstream(t, 0, false)
+	defer good.ln.Close()
+	t0 := time.Now()
+	flaky := func() (net.Conn, error) {
+		if time.Since(t0) < 1200*time.Millisecond {
+			return nil, fmt.Errorf("carrier not ready")
+		}
+		return net.Dial("tcp", good.ln.Addr().String())
+	}
+	r := NewResolverMulti([]DialFunc{flaky}, 3*time.Second)
+	start := time.Now()
+	resp := r.Exchange(buildQuery(0x3401, "window.example"))
+	elapsed := time.Since(start)
+	if len(resp) < 12 || resp[3]&0x0f == 2 {
+		t.Fatalf("expected a slow success after the window, got SERVFAIL after %v", elapsed)
+	}
+	if elapsed < 1100*time.Millisecond {
+		t.Fatalf("exchange returned after %v — it did not wait out the window", elapsed)
+	}
+	if st := r.Stats(); st.Resolved != 1 || st.Servfail != 0 {
+		t.Fatalf("stats = %+v, want 1 resolved / 0 servfail", st)
+	}
+}
+
+// A permanent dial-stage outage still SERVFAILs — at the
+// dial window (NP-1118-34: clamp(2*cost + 2s, 2s, 8s); here
+// cost is 0, so 2s), not instantly and not past it. The
+// total budget remains the outer bound.
+func TestDialStagePermanentOutage(t *testing.T) {
+	withDialRetry(t, 200*time.Millisecond)
+	dead := func() (net.Conn, error) { return nil, fmt.Errorf("no carrier") }
+	r := NewResolverMulti([]DialFunc{dead}, 3*time.Second)
+	start := time.Now()
+	resp := r.Exchange(buildQuery(0x3402, "outage.example"))
+	elapsed := time.Since(start)
+	if len(resp) < 12 || resp[3]&0x0f != 2 {
+		t.Fatalf("expected SERVFAIL, got %v", resp)
+	}
+	if elapsed < 1800*time.Millisecond || elapsed > 4*time.Second {
+		t.Fatalf("SERVFAIL after %v, want roughly the 2s dial window", elapsed)
+	}
+	if st := r.Stats(); st.Servfail != 1 || st.Queries != 1 {
+		t.Fatalf("stats = %+v, want exactly 1 query / 1 servfail", st)
+	}
+}
+
+// Answer-stage deaths are NOT window-retried: when every
+// upstream connects but dies mid-exchange, the resolver
+// advances immediately and SERVFAILs fast.
+func TestAnswerStageDeathNotWindowRetried(t *testing.T) {
+	withDialRetry(t, 100*time.Millisecond)
+	die := func() (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() {
+			buf := make([]byte, 4096)
+			_, _ = c2.Read(buf)
+			c2.Close()
+		}()
+		return c1, nil
+	}
+	r := NewResolverMulti([]DialFunc{die, die, die}, 3*time.Second)
+	start := time.Now()
+	resp := r.Exchange(buildQuery(0x3403, "middeath.example"))
+	elapsed := time.Since(start)
+	if len(resp) < 12 || resp[3]&0x0f != 2 {
+		t.Fatalf("expected SERVFAIL, got %v", resp)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("answer-stage deaths took %v — the dial-stage window retry must not apply", elapsed)
+	}
+}

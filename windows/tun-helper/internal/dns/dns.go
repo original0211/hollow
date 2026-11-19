@@ -124,6 +124,7 @@ func (r *Resolver) Exchange(query []byte) []byte {
 	// and the cross-query winner keeps its ranking.
 	exchangeStart := time.Now()
 	deadline := exchangeStart
+	dialDeadline := exchangeStart.Add(r.dialWindow())
 	r.mu.Lock()
 	winner := r.nextTry
 	r.mu.Unlock()
@@ -143,13 +144,62 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		if remaining <= 0 {
 			break
 		}
-		wait := perAttempt
-		if wait > remaining {
-			wait = remaining
+		// Dial stage (NP-1118-34, Plan B): registerFrom failing
+		// means EVERY upstream failed at dial time — the
+		// signature of a carrier recovery window (the hosting
+		// lineage died and its replacement is still
+		// handshaking). Wait inside the total budget and
+		// redial instead of SERVFAILing on the spot; the
+		// attempt is not consumed, because no upstream has
+		// seen the query. Answer-stage deaths (write error,
+		// connection death, timeout — below) are NOT retried
+		// this way: they advance to the next upstream
+		// immediately, as before.
+		var conn net.Conn
+		var dieCh chan struct{}
+		var upID uint16
+		var p *pending
+		for {
+			var err error
+			conn, dieCh, upID, p, err = r.registerFrom(query, (winner+attempt)%len(r.dialers), attempt == 0)
+			if err == nil {
+				break
+			}
+			rem := time.Until(deadline)
+			if drem := time.Until(dialDeadline); drem < rem {
+				rem = drem
+			}
+			if rem <= 0 {
+				conn = nil
+				break
+			}
+			retryWait := dialRetryInterval
+			if retryWait > rem {
+				retryWait = rem
+			}
+			time.Sleep(retryWait)
+			// Budgets may have grown while waiting (another
+			// exchange's timeout raised the lower bound):
+			// re-derive the deadlines exactly as at the top
+			// of the attempt loop (NP-1118-23 semantics);
+			// both only ever extend.
+			if _, totalNow := r.budgets(); exchangeStart.Add(totalNow).After(deadline) {
+				deadline = exchangeStart.Add(totalNow)
+			}
+			if nd := exchangeStart.Add(r.dialWindow()); nd.After(dialDeadline) {
+				dialDeadline = nd
+			}
 		}
-		conn, dieCh, upID, p, err := r.registerFrom(query, (winner+attempt)%len(r.dialers), attempt == 0)
-		if err != nil {
-			break // every upstream failed at dial time
+		if conn == nil {
+			break // budget exhausted at the dial stage
+		}
+		wait := perAttempt
+		if rem := time.Until(deadline); wait > rem {
+			wait = rem
+		}
+		if wait <= 0 {
+			r.deregister(upID, p)
+			break
 		}
 		// Frame and send: 2-byte length prefix (RFC 7766).
 		up := make([]byte, len(query))
@@ -183,6 +233,29 @@ func (r *Resolver) Exchange(query []byte) []byte {
 	}
 	atomic.AddUint64(&r.servfail, 1)
 	return servfailFor(query)
+}
+
+// dialRetryInterval (NP-1118-34): the redial cadence while an
+// exchange is stuck at the dial stage inside its total budget.
+// A local parameter; tests shrink it.
+var dialRetryInterval = 500 * time.Millisecond
+
+// dialWindow (NP-1118-34): how long an exchange may stay at
+// the dial stage waiting out a carrier recovery window. The
+// wait covers one carrier handshake, whose duration scales
+// with the path cost (cost ~ 2x RTT seed); at zero cost it
+// stays short enough to preserve the pump's fail-closed
+// behaviour. The exchange's total budget remains the outer
+// bound — the two combine by taking the earlier deadline.
+func (r *Resolver) dialWindow() time.Duration {
+	w := 2*r.pathCost() + 2*time.Second
+	if w < 2*time.Second {
+		w = 2 * time.Second
+	}
+	if w > 8*time.Second {
+		w = 8 * time.Second
+	}
+	return w
 }
 
 // SetRTTHint installs an external path-RTT source (milliseconds).
