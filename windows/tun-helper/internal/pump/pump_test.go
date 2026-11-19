@@ -384,7 +384,7 @@ func TestICMPRejectV6(t *testing.T) {
 		t.Fatal("ICMPv6 does not quote the original IPv6 header + 8 bytes")
 	}
 	st := p.Stats()
-	if st.ICMPRejects != 1 || st.DroppedV6 != 1 {
+	if st.ICMPRejects6 != 1 || st.DroppedV6 != 1 || st.DroppedUDP6 != 1 || st.ICMPRejects != 0 {
 		t.Fatalf("stats = %+v", st)
 	}
 }

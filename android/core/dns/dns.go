@@ -54,8 +54,9 @@ type Resolver struct {
 	// carrier handshake RTT) and/or the resolver's own EWMA of
 	// successful exchange durations, whichever is larger. Set
 	// once at construction via SetRTTHint.
-	hintFn func() (int64, bool)
-	ewmaMs atomic.Int64
+	hintFn      func() (int64, bool)
+	ewmaMs      atomic.Int64
+	timeoutLbMs atomic.Int64 // largest unanswered per-attempt wait (NP-1118-23)
 
 	mu      sync.Mutex
 	conn    net.Conn
@@ -121,12 +122,23 @@ func (r *Resolver) Exchange(query []byte) []byte {
 	// timed-out connection is killed so the next attempt starts
 	// clean, but the upstream is NOT demoted — slow is not dead,
 	// and the cross-query winner keeps its ranking.
-	perAttempt, total := r.budgets()
-	deadline := time.Now().Add(total)
+	exchangeStart := time.Now()
+	deadline := exchangeStart
 	r.mu.Lock()
 	winner := r.nextTry
 	r.mu.Unlock()
 	for attempt := 0; attempt < len(r.dialers); attempt++ {
+		// Budgets are recomputed per attempt (NP-1118-23): a
+		// timeout earlier in THIS exchange raises the timeout
+		// lower bound, and the next attempt must already profit
+		// from it — otherwise the escalation only helps the next
+		// query while this one dies at the old numbers. The
+		// deadline only ever extends, and budgets() clamps the
+		// total to 20s, so the extension is bounded.
+		perAttempt, total := r.budgets()
+		if d := exchangeStart.Add(total); d.After(deadline) {
+			deadline = d
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
@@ -135,7 +147,6 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		if wait > remaining {
 			wait = remaining
 		}
-		attemptStart := time.Now()
 		conn, dieCh, upID, p, err := r.registerFrom(query, (winner+attempt)%len(r.dialers), attempt == 0)
 		if err != nil {
 			break // every upstream failed at dial time
@@ -156,7 +167,7 @@ func (r *Resolver) Exchange(query []byte) []byte {
 		select {
 		case resp := <-p.resp:
 			timer.Stop()
-			r.noteExchangeDuration(time.Since(attemptStart))
+			r.noteExchangeDuration(time.Since(exchangeStart))
 			atomic.AddUint64(&r.resolved, 1)
 			return resp
 		case <-dieCh:
@@ -165,6 +176,7 @@ func (r *Resolver) Exchange(query []byte) []byte {
 			continue
 		case <-timer.C:
 			r.deregister(upID, p)
+			r.noteTimeout(wait)
 			r.killConn(conn, false)
 			continue
 		}
@@ -176,21 +188,39 @@ func (r *Resolver) Exchange(query []byte) []byte {
 // SetRTTHint installs an external path-RTT source (milliseconds).
 func (r *Resolver) SetRTTHint(fn func() (int64, bool)) { r.hintFn = fn }
 
-// pathRTT is the best current estimate of the DNS path latency:
-// the larger of the external hint and the resolver's own EWMA of
-// successful exchanges (conservative — budgets err long).
-func (r *Resolver) pathRTT() time.Duration {
+// pathCost estimates what one exchange actually costs on this
+// path (NP-1118-23). The maximum of:
+//   - twice the external RTT hint: an exchange is a stream open
+//     plus a question/answer round trip over the tunnel, so the
+//     standing prior is 2x the carrier handshake RTT (the hint
+//     alone proved to be a lower bound, not an estimate);
+//   - the EWMA of FULL successful exchange durations;
+//   - the timeout lower bound: the largest per-attempt wait that
+//     ever expired unanswered — a censored sample proving the
+//     true cost was larger. Without it, a path whose exchanges
+//     all time out teaches the resolver nothing (zero successes
+//     -> EWMA frozen -> budgets frozen at the floor -> every
+//     later query repeats the failure: the cold-start trap
+//     reproduced in NP-1118-23).
+func (r *Resolver) pathCost() time.Duration {
 	var ms int64
 	if r.hintFn != nil {
-		if h, ok := r.hintFn(); ok && h > ms {
-			ms = h
+		if h, ok := r.hintFn(); ok && 2*h > ms {
+			ms = 2 * h
 		}
 	}
 	if e := r.ewmaMs.Load(); e > ms {
 		ms = e
 	}
+	if lb := r.timeoutLbMs.Load(); lb > ms {
+		ms = lb
+	}
 	return time.Duration(ms) * time.Millisecond
 }
+
+// CurrentBudgets exposes the live budget pair for status
+// surfaces (field reconciliation against observed SERVFAILs).
+func (r *Resolver) CurrentBudgets() (time.Duration, time.Duration) { return r.budgets() }
 
 // budgets derives the per-attempt wait and the total exchange
 // budget from the path RTT (NP-1118-19). The per-attempt wait
@@ -198,19 +228,19 @@ func (r *Resolver) pathRTT() time.Duration {
 // to [8s, 20s] so a slow answer beats no answer on multi-second
 // paths, while a dead path still fails in bounded time.
 func (r *Resolver) budgets() (perAttempt, total time.Duration) {
-	rtt := r.pathRTT()
+	cost := r.pathCost()
 	base := r.timeout
 	if base <= 0 {
 		base = 5 * time.Second
 	}
-	perAttempt = 2*rtt + time.Second
+	perAttempt = cost + time.Second
 	if perAttempt < base {
 		perAttempt = base
 	}
 	if perAttempt > 12*time.Second {
 		perAttempt = 12 * time.Second
 	}
-	total = 3*rtt + base
+	total = cost*3/2 + base
 	if total < 8*time.Second {
 		total = 8 * time.Second
 	}
@@ -221,6 +251,18 @@ func (r *Resolver) budgets() (perAttempt, total time.Duration) {
 		total = perAttempt
 	}
 	return perAttempt, total
+}
+
+// noteTimeout records a censored cost sample: an attempt waited
+// this long and got nothing, so the path costs more than this.
+func (r *Resolver) noteTimeout(waited time.Duration) {
+	ms := waited.Milliseconds()
+	for {
+		cur := r.timeoutLbMs.Load()
+		if ms <= cur || r.timeoutLbMs.CompareAndSwap(cur, ms) {
+			return
+		}
+	}
 }
 
 func (r *Resolver) noteExchangeDuration(d time.Duration) {

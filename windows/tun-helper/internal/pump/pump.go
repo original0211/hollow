@@ -109,16 +109,20 @@ func (f *flow) close() {
 
 // Stats is a point-in-time snapshot for status reporting.
 type Stats struct {
-	ActiveFlows int
-	TotalFlows  uint64
-	RefusedFull uint64
-	DroppedUDP  uint64 // all non-carried v4 UDP (NP-1118-21: mostly fast-rejected now, see ICMPRejects)
-	DroppedV6   uint64 // IPv6 non-carried counter (notes v2 §2)
-	ICMPRejects uint64 // ICMP(v6) port-unreachables actually sent (NP-1118-21)
-	DNSQueries  uint64
-	DNSResolved uint64
-	DNSServfail uint64
-	DNSConns    uint64 // upstream connections ever made (reuse proof, spec §4)
+	ActiveFlows        int
+	TotalFlows         uint64
+	RefusedFull        uint64
+	DroppedUDP         uint64 // all non-carried v4 UDP (NP-1118-21: mostly fast-rejected now, see ICMPRejects)
+	DroppedV6          uint64 // IPv6 non-carried counter (notes v2 §2)
+	ICMPRejects        uint64 // ICMP port-unreachables actually sent, v4 (NP-1118-21)
+	DroppedUDP6        uint64 // v6 UDP subset of DroppedV6 (NP-1118-23, for reconciliation)
+	ICMPRejects6       uint64 // ICMPv6 port-unreachables actually sent (NP-1118-23)
+	DNSBudgetAttemptMs int64  // live resolver budgets (NP-1118-23)
+	DNSBudgetTotalMs   int64
+	DNSQueries         uint64
+	DNSResolved        uint64
+	DNSServfail        uint64
+	DNSConns           uint64 // upstream connections ever made (reuse proof, spec §4)
 }
 
 // Pump owns the netstack and the flow table.
@@ -127,15 +131,17 @@ type Pump struct {
 	stack *stack.Stack
 	nicID tcpip.NICID
 
-	mu          sync.Mutex
-	flows       map[*flow]struct{}
-	total       uint64
-	refused     uint64
-	droppedUDP  uint64
-	droppedV6   uint64
-	icmpRejects uint64
-	reject      *rejectLimiter
-	resolver    *dns.Resolver
+	mu           sync.Mutex
+	flows        map[*flow]struct{}
+	total        uint64
+	refused      uint64
+	droppedUDP   uint64
+	droppedV6    uint64
+	icmpRejects  uint64
+	icmpRejects6 uint64
+	droppedUDP6  uint64
+	reject       *rejectLimiter
+	resolver     *dns.Resolver
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -284,11 +290,16 @@ func (p *Pump) handleUDP(req *udp.ForwarderRequest) bool {
 	}
 	if isV6 {
 		atomic.AddUint64(&p.droppedV6, 1)
+		atomic.AddUint64(&p.droppedUDP6, 1)
 	} else {
 		atomic.AddUint64(&p.droppedUDP, 1)
 	}
 	if p.reject.allow(id) {
-		atomic.AddUint64(&p.icmpRejects, 1)
+		if isV6 {
+			atomic.AddUint64(&p.icmpRejects6, 1)
+		} else {
+			atomic.AddUint64(&p.icmpRejects, 1)
+		}
 		return false // stack sends the ICMP(v6) port unreachable
 	}
 	return true // over the limit: silent drop, as before NP-1118-21
@@ -490,10 +501,12 @@ func (p *Pump) sweeper() {
 func (p *Pump) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	st := Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6), ICMPRejects: atomic.LoadUint64(&p.icmpRejects)}
+	st := Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6), ICMPRejects: atomic.LoadUint64(&p.icmpRejects), DroppedUDP6: atomic.LoadUint64(&p.droppedUDP6), ICMPRejects6: atomic.LoadUint64(&p.icmpRejects6)}
 	if p.resolver != nil {
 		ds := p.resolver.Stats()
 		st.DNSQueries, st.DNSResolved, st.DNSServfail, st.DNSConns = ds.Queries, ds.Resolved, ds.Servfail, ds.UpstreamConns
+		pa, tot := p.resolver.CurrentBudgets()
+		st.DNSBudgetAttemptMs, st.DNSBudgetTotalMs = pa.Milliseconds(), tot.Milliseconds()
 	}
 	return st
 }

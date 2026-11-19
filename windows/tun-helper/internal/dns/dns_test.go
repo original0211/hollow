@@ -408,3 +408,41 @@ func TestTimeoutDoesNotDemote(t *testing.T) {
 		t.Fatalf("dial order after recovery = %v, want third dial to be A", got)
 	}
 }
+
+// NP-1118-23 cold-start trap, inverted: the exact sequence that
+// failed forever under NP-1118-19 (hint 700ms, every upstream
+// answering in 5.5s, budgets frozen at the 5s/8s floor, EWMA
+// pinned at 0) must now succeed — the first exchange escalates
+// within itself via the timeout lower bound, and the second
+// starts from the learned cost.
+func TestColdStartTrapEscapes(t *testing.T) {
+	var dialers []DialFunc
+	for i := 0; i < 3; i++ {
+		up := startUpstream(t, 5500*time.Millisecond, false)
+		defer up.ln.Close()
+		dialers = append(dialers, dialerTo(up.ln.Addr().String(), nil))
+	}
+	r := NewResolverMulti(dialers, 5*time.Second)
+	r.SetRTTHint(func() (int64, bool) { return 700, true })
+	defer r.Close()
+	start := time.Now()
+	resp := r.Exchange(buildQuery(0x9200, "trap.example"))
+	if len(resp) < 12 || resp[3]&0x0F == 2 {
+		t.Fatalf("first exchange still SERVFAILs after %v — trap not escaped", time.Since(start))
+	}
+	if d := time.Since(start); d > 16*time.Second {
+		t.Fatalf("first exchange took %v, want success well inside the 20s hard cap", d)
+	}
+	pa, _ := r.CurrentBudgets()
+	if pa < 6*time.Second {
+		t.Fatalf("perAttempt after learning = %v, want >= 6s (timeout lower bound must feed budgets)", pa)
+	}
+	start = time.Now()
+	resp = r.Exchange(buildQuery(0x9201, "trap.example"))
+	if len(resp) < 12 || resp[3]&0x0F == 2 {
+		t.Fatal("second exchange SERVFAILed despite the learned cost")
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("second exchange took %v, want first-attempt success (~5.5s)", d)
+	}
+}
