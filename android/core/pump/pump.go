@@ -51,10 +51,10 @@ type Config struct {
 	HelperAddr6 string        // adapter's own IPv6 (default fd00::1, spec §1.3)
 	// assigned address before promiscuous acquisition will deliver
 	// foreign-destination packets to the transport layer at all.
-	ResolverAddr string        // single DNS upstream override (legacy; prefer ResolverAddrs)
-	ResolverAddrs []string     // DNS upstreams in preference order, all reached through the tunnel (NP-1118-14)
-	RTTHint func() (int64, bool) // optional path-RTT hint (ms) for the resolver's adaptive budgets (NP-1118-19)
-	DNSTimeout   time.Duration // per-query DNS timeout (default 5s, notes v2 §4)
+	ResolverAddr  string               // single DNS upstream override (legacy; prefer ResolverAddrs)
+	ResolverAddrs []string             // DNS upstreams in preference order, all reached through the tunnel (NP-1118-14)
+	RTTHint       func() (int64, bool) // optional path-RTT hint (ms) for the resolver's adaptive budgets (NP-1118-19)
+	DNSTimeout    time.Duration        // per-query DNS timeout (default 5s, notes v2 §4)
 }
 
 func (c *Config) withDefaults() {
@@ -119,8 +119,9 @@ type Stats struct {
 	ActiveFlows int    `json:"activeFlows"`
 	TotalFlows  uint64 `json:"totalFlows"`
 	RefusedFull uint64 `json:"refusedFull"`
-	DroppedUDP  uint64 `json:"droppedUdp"`
-	DroppedV6   uint64 `json:"droppedV6"` // IPv6 fast-reject counter (notes v2 §2)
+	DroppedUDP  uint64 `json:"droppedUdp"`  // all non-carried v4 UDP (NP-1118-21: mostly fast-rejected now, see ICMPRejects)
+	DroppedV6   uint64 `json:"droppedV6"`   // IPv6 non-carried counter (notes v2 §2)
+	ICMPRejects uint64 `json:"icmpRejects"` // ICMP(v6) port-unreachables actually sent (NP-1118-21)
 	DNSQueries  uint64 `json:"dnsQueries"`
 	DNSResolved uint64 `json:"dnsResolved"`
 	DNSServfail uint64 `json:"dnsServfail"`
@@ -133,13 +134,15 @@ type Pump struct {
 	stack *stack.Stack
 	nicID tcpip.NICID
 
-	mu         sync.Mutex
-	flows      map[*flow]struct{}
-	total      uint64
-	refused    uint64
-	droppedUDP uint64
-	droppedV6  uint64
-	resolver   *dns.Resolver
+	mu          sync.Mutex
+	flows       map[*flow]struct{}
+	total       uint64
+	refused     uint64
+	droppedUDP  uint64
+	droppedV6   uint64
+	icmpRejects uint64
+	reject      *rejectLimiter
+	resolver    *dns.Resolver
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -154,7 +157,7 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 		HandleLocal:        false,
 	})
-	p := &Pump{cfg: cfg, stack: s, nicID: 1, flows: make(map[*flow]struct{}), stopCh: make(chan struct{})}
+	p := &Pump{cfg: cfg, stack: s, nicID: 1, flows: make(map[*flow]struct{}), stopCh: make(chan struct{}), reject: newRejectLimiter()}
 	if err := s.CreateNIC(p.nicID, linkEP); err != nil {
 		return nil, fmt.Errorf("create nic: %v", err)
 	}
@@ -221,8 +224,14 @@ func NewPump(cfg Config, linkEP stack.LinkEndpoint) (*Pump, error) {
 	// destination. Rationale: a system resolver that ignores the VPN's
 	// declared DNS server (or is configured with a LAN resolver) must
 	// still land in the tunnel, not in the drop bucket. Everything
-	// else — and all of IPv6 — is dropped and counted. The DNS
-	// resolver has no path around the tunnel (fail-closed by construction).
+	// else is not carried: it is counted and — within a rate limit —
+	// FAST-REJECTED (NP-1118-21): the handler declines the packet
+	// and the stack itself answers with an ICMP(v6) destination
+	// port-unreachable quoting the real packet, so UDP applications
+	// (QUIC above all) fail over to TCP immediately instead of
+	// timing out against a silent black hole. Over the rate limit
+	// the packet is silently dropped, as before. The DNS resolver
+	// has no path around the tunnel (fail-closed by construction).
 	p.resolver = dns.NewResolverMulti(p.dnsDialers(), cfg.DNSTimeout)
 	p.resolver.SetRTTHint(cfg.RTTHint)
 	udpFwd := udp.NewForwarder(s, p.handleUDP)
@@ -276,29 +285,78 @@ func (p *Pump) dnsDialers() []dns.DialFunc {
 
 // handleUDP is the UDP forwarder entry: DNS sessions (any
 // destination address, port 53 — NP-1118-07) are created; every
-// other datagram is dropped + counted (no endpoint is created for
-// it, which IS the drop).
+// other datagram is not carried. Returning false declines the
+// packet, and the stack answers it with an ICMP(v6) port
+// unreachable (its unknown-destination path) — the fast reject
+// of NP-1118-21. The rate limiter decides reject vs silent drop.
 func (p *Pump) handleUDP(req *udp.ForwarderRequest) bool {
 	id := req.ID()
-	if len(id.LocalAddress.AsSlice()) == 16 {
+	isV6 := len(id.LocalAddress.AsSlice()) == 16
+	if !isV6 && id.LocalPort == 53 {
+		var wq waiter.Queue
+		ep, terr := req.CreateEndpoint(&wq)
+		if terr != nil {
+			atomic.AddUint64(&p.droppedUDP, 1)
+			return true
+		}
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.serveDNSSession(gonet.NewUDPConn(&wq, ep))
+		}()
+		return true
+	}
+	if isV6 {
 		atomic.AddUint64(&p.droppedV6, 1)
-		return true
-	}
-	if id.LocalPort != 53 {
+	} else {
 		atomic.AddUint64(&p.droppedUDP, 1)
-		return true
 	}
-	var wq waiter.Queue
-	ep, terr := req.CreateEndpoint(&wq)
-	if terr != nil {
-		atomic.AddUint64(&p.droppedUDP, 1)
-		return true
+	if p.reject.allow(id) {
+		atomic.AddUint64(&p.icmpRejects, 1)
+		return false // stack sends the ICMP(v6) port unreachable
 	}
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
-		p.serveDNSSession(gonet.NewUDPConn(&wq, ep))
-	}()
+	return true // over the limit: silent drop, as before NP-1118-21
+}
+
+// rejectLimiter bounds ICMP reject generation (NP-1118-21): a
+// global token bucket plus a per-4-tuple cooldown — one reject
+// per application socket per second is plenty for a fast
+// failover, and a datagram spray cannot turn the pump into an
+// ICMP reflector storm.
+type rejectLimiter struct {
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+	seen   map[stack.TransportEndpointID]time.Time
+}
+
+func newRejectLimiter() *rejectLimiter {
+	return &rejectLimiter{tokens: 64, last: time.Now(), seen: make(map[stack.TransportEndpointID]time.Time)}
+}
+
+func (l *rejectLimiter) allow(id stack.TransportEndpointID) bool {
+	const burst = 64.0
+	const refillPerSec = 64.0
+	const cooldown = time.Second
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	if t, ok := l.seen[id]; ok && now.Sub(t) < cooldown {
+		return false
+	}
+	l.tokens += now.Sub(l.last).Seconds() * refillPerSec
+	if l.tokens > burst {
+		l.tokens = burst
+	}
+	l.last = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	if len(l.seen) > 4096 {
+		l.seen = make(map[stack.TransportEndpointID]time.Time)
+	}
+	l.seen[id] = now
 	return true
 }
 
@@ -460,7 +518,7 @@ func (p *Pump) sweeper() {
 func (p *Pump) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	st := Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6)}
+	st := Stats{ActiveFlows: len(p.flows), TotalFlows: p.total, RefusedFull: p.refused, DroppedUDP: atomic.LoadUint64(&p.droppedUDP), DroppedV6: atomic.LoadUint64(&p.droppedV6), ICMPRejects: atomic.LoadUint64(&p.icmpRejects)}
 	if p.resolver != nil {
 		ds := p.resolver.Stats()
 		st.DNSQueries, st.DNSResolved, st.DNSServfail, st.DNSConns = ds.Queries, ds.Resolved, ds.Servfail, ds.UpstreamConns
