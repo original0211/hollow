@@ -14,8 +14,8 @@ android {
         // Versioning rule (M3-5, runbook §1): versionCode increments
         // by exactly 1 on EVERY release build that leaves the repo;
         // versionName is semver — M3 MVP line is 0.x.
-        versionCode = 14
-        versionName = "0.2.12"
+        versionCode = 15
+        versionName = "0.2.13"
         ndk {
             // D5: arm64-v8a only for the MVP.
             abiFilters += listOf("arm64-v8a")

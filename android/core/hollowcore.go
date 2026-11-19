@@ -231,6 +231,8 @@ func VPNStateJSON() string {
 		PoolSize       int                     `json:"poolSize"`
 		SlotEdges      []string                `json:"slotEdges"`
 		EdgeCandidates []session.EdgeCandidate `json:"edgeCandidates"`
-	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize, snap.SlotEdges, snap.EdgeCandidates})
+		PhoenixReopens int64                   `json:"phoenixReopens"`
+		PhoenixSaved   int64                   `json:"phoenixSaved"`
+	}{snap.State, snap.Detail, snap.SinceMs, snap.Carriers, snap.StreamsOK, stats, configured, wsURL, keyID, snap.TrafficUp, snap.TrafficDown, snap.CarrierRTTMs, snap.LiveCarriers, snap.PoolSize, snap.SlotEdges, snap.EdgeCandidates, snap.PhoenixReopens, snap.PhoenixSaved})
 	return string(out)
 }
