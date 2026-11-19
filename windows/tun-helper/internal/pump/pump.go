@@ -117,6 +117,7 @@ type Stats struct {
 	ICMPRejects        uint64 // ICMP port-unreachables actually sent, v4 (NP-1118-21)
 	DroppedUDP6        uint64 // v6 UDP subset of DroppedV6 (NP-1118-23, for reconciliation)
 	ICMPRejects6       uint64 // ICMPv6 port-unreachables actually sent (NP-1118-23)
+	DNSCostMs          int64  // live path-cost estimate (NP-1118-27)
 	DNSBudgetAttemptMs int64  // live resolver budgets (NP-1118-23)
 	DNSBudgetTotalMs   int64
 	DNSQueries         uint64
@@ -507,6 +508,7 @@ func (p *Pump) Stats() Stats {
 		st.DNSQueries, st.DNSResolved, st.DNSServfail, st.DNSConns = ds.Queries, ds.Resolved, ds.Servfail, ds.UpstreamConns
 		pa, tot := p.resolver.CurrentBudgets()
 		st.DNSBudgetAttemptMs, st.DNSBudgetTotalMs = pa.Milliseconds(), tot.Milliseconds()
+		st.DNSCostMs = p.resolver.CurrentCost().Milliseconds()
 	}
 	return st
 }

@@ -453,7 +453,7 @@ class MainActivity : Activity() {
         if (stats != null) {
             sb.append(
                 "载体 ${st.optInt("carriers")} · 流 ${st.optInt("streams")}（活跃 ${stats.optLong("activeFlows")}）\n" +
-                    "DNS 查询 ${stats.optLong("dnsQueries")} · 解析 ${stats.optLong("dnsResolved")} · SERVFAIL ${stats.optLong("dnsServfail")} · 预算 单${stats.optLong("dnsBudgetAttemptMs") / 1000}s/总${stats.optLong("dnsBudgetTotalMs") / 1000}s\n" +
+                    "DNS 查询 ${stats.optLong("dnsQueries")} · 解析 ${stats.optLong("dnsResolved")} · SERVFAIL ${stats.optLong("dnsServfail")} · 成本 ${(stats.optLong("dnsCostMs") / 100).toDouble() / 10}s · 预算 单${stats.optLong("dnsBudgetAttemptMs") / 1000}s/总${stats.optLong("dnsBudgetTotalMs") / 1000}s\n" +
                     "UDP 未承载 ${stats.optLong("droppedUdp")}（快速拒绝 ${stats.optLong("icmpRejects")}）\n" +
                     "IPv6 丢弃 ${stats.optLong("droppedV6")}（其中 UDP 未承载 ${stats.optLong("droppedUdp6")} · 快速拒绝 ${stats.optLong("icmpRejects6")}）"
             )

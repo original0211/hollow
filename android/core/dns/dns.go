@@ -46,7 +46,7 @@ type pending struct {
 
 // Resolver multiplexes DNS exchanges over one persistent connection.
 type Resolver struct {
-	dialers []DialFunc // upstreams in preference order (NP-1118-14)
+	dialers []DialFunc    // upstreams in preference order (NP-1118-14)
 	timeout time.Duration // base timeout (ctor); the adaptive floor
 
 	// Adaptive budget (NP-1118-19): exchange budgets scale with
@@ -217,6 +217,11 @@ func (r *Resolver) pathCost() time.Duration {
 	}
 	return time.Duration(ms) * time.Millisecond
 }
+
+// CurrentCost exposes the live path-cost estimate for status
+// surfaces (NP-1118-27: lets a field readout distinguish
+// "costs never got expensive" from "escalation not working").
+func (r *Resolver) CurrentCost() time.Duration { return r.pathCost() }
 
 // CurrentBudgets exposes the live budget pair for status
 // surfaces (field reconciliation against observed SERVFAILs).
