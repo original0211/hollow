@@ -10,6 +10,7 @@ import { HollowClient } from "../vendor/shared/client-core.js";
 import { SessionManager } from "../vendor/shared/session-manager.js";
 import { connectWs } from "../vendor/cli/src/ws-client.js";
 import { startSocks } from "../vendor/cli/src/socks.js";
+import { phoenixShared } from "../vendor/shared/phoenix.js";
 
 const AUTH_FATAL = /undecryptable|server hello rejected|finished|verifier/i;
 export const ROTATION_MS = 15 * 60 * 1000; // spec §5.6
@@ -466,6 +467,7 @@ export class CoreBridge {
       traffic: { ...this.traffic },
       effectiveEdgeIp: this.effectiveEdgeIp(),
       bearerLock: this.bearerLock === null ? null : [...this.bearerLock],
+      phoenixReopens: phoenixShared.reopens, phoenixSaved: phoenixShared.saved,
       stats: { ...this.stats },
     };
   }

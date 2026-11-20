@@ -22,7 +22,10 @@ function fakeStream() {
 test("socks pump: onEnd ends the local socket AND closeWrites the stream", async () => {
   const stream = fakeStream();
   const fakeClient = { state: "open", openStream: () => stream };
-  const server = await startSocks({ getClient: () => fakeClient, port: 0, host: "127.0.0.1" });
+  // Pump-layer characterization (NP-1116-02): phoenix:false —
+  // the session-layer phoenix composition (NP-1118-32) is not
+  // part of the pump contract, mirroring the Go pump tests.
+  const server = await startSocks({ getClient: () => fakeClient, port: 0, host: "127.0.0.1", phoenix: false });
   const port = server.address().port;
   const sock = net.connect(port, "127.0.0.1");
   await new Promise((r) => sock.once("connect", r));

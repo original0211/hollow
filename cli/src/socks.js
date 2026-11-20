@@ -7,6 +7,7 @@
 // get REP=5 (refused) unless the code says otherwise; nothing hangs silently.
 import net from "node:net";
 import { ERR, SCHEME } from "../../shared/protocol.js";
+import { wrapPhoenixStream } from "../../shared/phoenix.js";
 
 const REP = { SUCCESS: 0, GENERAL: 1, NOT_ALLOWED: 2, NET_UNREACH: 3, HOST_UNREACH: 4, REFUSED: 5, CMD_NOT_SUPPORTED: 7, ATYP_NOT_SUPPORTED: 8 };
 const repForOpenError = (code) => {
@@ -85,9 +86,20 @@ async function openWithRetry(getClient, opts, retry = {}, log = () => {}, hooks 
   }
 }
 
-export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {}, openRetry = {}, openHooks = {} }) {
+// openStreamPhoenix: openWithRetry plus the NP-1118-32 phoenix
+// wrapper (redial = the same openWithRetry). The phoenix layer
+// is a composition option: pump-layer tests that drive fake
+// streams pass phoenix:false, mirroring the Go pump tests,
+// whose DialFlow has no session-layer phoenix in it either.
+async function openStreamPhoenix(getClient, opts, openRetry, log, openHooks, phoenix) {
+  const stream = await openWithRetry(getClient, opts, openRetry, log, openHooks);
+  if (!phoenix) return stream;
+  return wrapPhoenixStream(stream, () => openWithRetry(getClient, opts, openRetry, log, openHooks));
+}
+
+export function startSocks({ getClient, host = "127.0.0.1", port = 1080, log = () => {}, openRetry = {}, openHooks = {}, phoenix = true }) {
   const server = net.createServer((sock) => {
-    handleConn(sock, getClient, log, openRetry, openHooks).catch(() => { try { sock.destroy(); } catch {} });
+    handleConn(sock, getClient, log, openRetry, openHooks, phoenix).catch(() => { try { sock.destroy(); } catch {} });
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -152,20 +164,20 @@ function makeReader(sock) {
   };
 }
 
-async function handleConn(sock, getClient, log, openRetry = {}, openHooks = {}) {
+async function handleConn(sock, getClient, log, openRetry = {}, openHooks = {}, phoenix = true) {
   sock.on("error", () => {});
   const reader = makeReader(sock);
   const first = await reader.readN(1);
   if (!first) { sock.destroy(); return; }
-  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry, openHooks);
+  if (first[0] === 0x05) return handleSocks(sock, reader, getClient, log, openRetry, openHooks, phoenix);
   // HTTP proxy requests start with a method letter (CONNECT, GET,
   // POST, ...). Anything else — including a SOCKS4 greeting (0x04),
   // which this listener deliberately does not speak — is destroyed.
-  if (first[0] >= 0x41 && first[0] <= 0x5a) return handleHttp(sock, reader, first, getClient, log, openRetry, openHooks);
+  if (first[0] >= 0x41 && first[0] <= 0x5a) return handleHttp(sock, reader, first, getClient, log, openRetry, openHooks, phoenix);
   sock.destroy();
 }
 
-async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHooks = {}) {
+async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHooks = {}, phoenix = true) {
   const readN = reader.readN;
   const nmethods = await readN(1);
   if (!nmethods) { sock.destroy(); return; }
@@ -204,7 +216,8 @@ async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHoo
   if (!client || client.state !== "open") { reply(sock, REP.GENERAL); return; }
   let stream;
   try {
-    stream = await openWithRetry(getClient, { host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
+    const opts = { host: targetHost, port: targetPort, schemeHint: 0, gatePolicy: 0 };
+    stream = await openStreamPhoenix(getClient, opts, openRetry, log, openHooks, phoenix);
   } catch (e) {
     reply(sock, e && e.code !== undefined ? repForOpenError(e.code) : REP.GENERAL);
     return;
@@ -217,7 +230,7 @@ async function handleSocks(sock, reader, getClient, log, openRetry = {}, openHoo
 // HTTP CONNECT (NP-1117-07): the other dialect browsers speak to this
 // port. Same open path, same pump; failures are HTTP status lines, and
 // anything that is not a well-formed CONNECT is destroyed.
-async function handleHttp(sock, reader, first, getClient, log, openRetry = {}, openHooks = {}) {
+async function handleHttp(sock, reader, first, getClient, log, openRetry = {}, openHooks = {}, phoenix = true) {
   const headBuf = await reader.readUntil("\r\n\r\n", 16384);
   if (!headBuf) { sock.destroy(); return; }
   const headText = Buffer.concat([first, headBuf]).toString("latin1");
@@ -233,7 +246,8 @@ async function handleHttp(sock, reader, first, getClient, log, openRetry = {}, o
     if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
     let stream;
     try {
-      stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 }, openRetry, log, openHooks);
+      const opts = { host: target.host, port: target.port, schemeHint: 0, gatePolicy: 0 };
+      stream = await openStreamPhoenix(getClient, opts, openRetry, log, openHooks, phoenix);
     } catch {
       httpReply(sock, 502, "Bad Gateway");
       return;
@@ -276,7 +290,8 @@ async function handleHttp(sock, reader, first, getClient, log, openRetry = {}, o
   if (!client || client.state !== "open") { httpReply(sock, 502, "Bad Gateway"); return; }
   let stream;
   try {
-    stream = await openWithRetry(getClient, { host: target.host, port: target.port, schemeHint: SCHEME.HTTP, gatePolicy: 0 }, openRetry, log, openHooks);
+    const opts = { host: target.host, port: target.port, schemeHint: SCHEME.HTTP, gatePolicy: 0 };
+    stream = await openStreamPhoenix(getClient, opts, openRetry, log, openHooks, phoenix);
   } catch {
     httpReply(sock, 502, "Bad Gateway");
     return;
