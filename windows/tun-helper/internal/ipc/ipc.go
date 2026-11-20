@@ -32,6 +32,7 @@ const (
 	VerbStatus        Verb = "status"
 	VerbRestore       Verb = "restore"
 	VerbPing          Verb = "ping"
+	VerbShutdown      Verb = "shutdown"
 )
 
 // Mode is the app-wide proxy mode the helper arbitrates for mutual
@@ -68,6 +69,7 @@ const MaxFrameBytes = 64 * 1024
 var knownVerbs = map[Verb]bool{
 	VerbEnableTun: true, VerbDisableTun: true, VerbNoteMode: true,
 	VerbStatus: true, VerbRestore: true, VerbPing: true, VerbSetExclusions: true,
+	VerbShutdown: true,
 }
 
 // ValidateRequest enforces the closed verb set and per-verb invariants.

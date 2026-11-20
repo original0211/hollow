@@ -16,7 +16,9 @@ import { parseAnyPayload, previewOf, buildExportObject, buildLink, qrDataUrl, bg
 import { BUILTIN_EDGES, fetchRemoteEdges, fetchMeta, measureEdges, bestEdge, rankedEdges } from "./edges.js";
 import { makePacProvider, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
-import { HelperClient } from "./helper-client.js";
+import { HelperClient, HELPER_PIPE_PATH } from "./helper-client.js";
+import { resolveHelperFiles, ensureHelperRunning } from "./helper-launch.js";
+import net from "node:net";
 import { HelperWatch } from "./helper-watch.js";
 import { planTunEnable, planCandidateRefresh, edgeModeDisabledInTun } from "./tun-policy.js";
 import { TunGraceSupervisor, createStaleRestoreHandler, tunStatusView, modeFamily } from "./tun-supervisor.js";
@@ -179,13 +181,19 @@ async function doConnect() {
     try {
       await enableTun(b);
     } catch (e) {
-      if (e && e.code === "TUN_HELPER_DOWN") {
-        // NP-1117-07 (d4): honest surface — the helper is not running,
-        // so TUN is not actually available yet; the UI must say so
-        // instead of failing in one log line. (Auto-launching the
-        // helper is a separate project, deliberately not this fix.)
-        log(`TUN enable failed: ${e.message}`);
-        b._setState("error", "TUN 助手未运行，本模式尚未启用");
+      if (e && typeof e.code === "string" && e.code.startsWith("TUN_")) {
+        // NP-1117-07 (d4) honest surface, extended by NP-1118-38:
+        // every launch-path failure gets its own named state —
+        // nothing was changed on the system, TUN is simply not on.
+        const copy = {
+          TUN_HELPER_MISSING: "TUN 助手文件缺失（hollow-tun-helper.exe / wintun.dll 不在程序目录），本模式不可用",
+          TUN_HELPER_BROKEN: "TUN 助手校验失败（wintun.dll 缺失或非钉版构建），本模式不可用",
+          TUN_UAC_CANCELED: "已取消管理员授权，TUN 未启用",
+          TUN_LAUNCH_FAILED: `TUN 助手拉起失败：${e.message}`,
+          TUN_HELPER_DOWN: "TUN 助手未能就绪，本模式尚未启用",
+        }[e.code] ?? `TUN 启用失败：${e.message}`;
+        log(`TUN enable failed [${e.code}]: ${e.message}`);
+        b._setState("error", copy);
       } else {
         log(`TUN enable failed: ${e.message} — not connecting (no silent fallback to a bare SOCKS)`);
       }
@@ -342,14 +350,98 @@ const grace = new TunGraceSupervisor({
     disableTun().catch((e) => log(`TUN auto-restore failed: ${e.message}`));
   },
 });
+// ---- Helper launch (NP-1118-38) ----
+// Resolution: the portable/loose layout keeps hollow-tun-helper.exe
+// and wintun.dll next to the app exe; the dev layout stages them
+// under dist/. helper-launch.js holds the decision logic; the real
+// effects (fs, PowerShell elevation, pipe probes) live here.
+function resolveHelper() {
+  return resolveHelperFiles({
+    appDir: path.dirname(process.execPath),
+    fallbackDir: path.join(here, "..", "dist"),
+    exists: (p) => fs.existsSync(p),
+  });
+}
 function helperExePath() {
-  // Packaged: staged next to the app in dist/. Dev: same relative shape.
-  return path.join(here, "..", "dist", "hollow-tun-helper.exe");
+  const r = resolveHelper();
+  return r.ok ? r.exe : path.join(here, "..", "dist", "hollow-tun-helper.exe");
+}
+function psQuote(s) { return "'" + String(s).replace(/'/g, "''") + "'"; }
+// Elevated start via ShellExecute "runas" (PowerShell Start-Process
+// -Verb RunAs). {wait:false} returns once the consent is granted and
+// the process created; {wait:true} also waits for its exit code
+// (for --restore-tun). A declined prompt resolves canceled:true —
+// Start-Process throws "canceled by the user" in that case.
+function spawnElevated(exe, args = [], { wait = false, timeoutMs = 120000 } = {}) {
+  return new Promise((resolve) => {
+    const argList = args.length ? ` -ArgumentList ${args.map(psQuote).join(",")}` : "";
+    const cmd = wait
+      ? `$p = Start-Process -FilePath ${psQuote(exe)}${argList} -Verb RunAs -Wait -PassThru; exit $p.ExitCode`
+      : `Start-Process -FilePath ${psQuote(exe)}${argList} -Verb RunAs`;
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
+      { timeout: timeoutMs }, (err, _stdout, stderr) => {
+        if (!err) return resolve({ ok: true });
+        const text = `${stderr || ""} ${err.message || ""}`;
+        if (/cancel/i.test(text)) return resolve({ ok: false, canceled: true, detail: "UAC 已取消" });
+        resolve({ ok: false, detail: text.trim().slice(0, 300) || "提权拉起失败" });
+      });
+  });
+}
+function pipeProbe() {
+  return new Promise((resolve) => {
+    const s = net.createConnection(HELPER_PIPE_PATH);
+    s.once("connect", () => { s.destroy(); resolve(true); });
+    s.once("error", () => resolve(false));
+  });
+}
+async function waitPipeReady(timeoutMs) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    if (await pipeProbe()) return true;
+    if (Date.now() >= end) return false;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+function runCheckDll(exe) {
+  return new Promise((resolve) => {
+    execFile(exe, ["--check-dll"], { timeout: 10000 }, (err) => resolve(!err));
+  });
+}
+let helperLaunchedByUs = false;
+async function ensureHelper() {
+  const r = await ensureHelperRunning({
+    resolveFiles: resolveHelper,
+    pipeReady: pipeProbe,
+    checkDll: runCheckDll,
+    spawnElevated: (exe) => spawnElevated(exe),
+    waitReady: waitPipeReady,
+    log,
+  });
+  if (r.ok && r.launched) helperLaunchedByUs = true;
+  return r;
+}
+// Stop the helper process (app quit, or an enable that failed after
+// WE launched it). The shutdown verb is refused while TUN is up, so
+// this only ever lands on an idle helper; the dead-man switch and
+// --restore-tun remain the backstops for every other exit path.
+async function shutdownHelper() {
+  const h = getHelper();
+  try {
+    if (!h.connected) await h.connect();
+    await h.request("shutdown", null, 2000);
+    log("helper shutdown requested");
+  } catch (e) {
+    log(`helper shutdown not confirmed (${e.message}) — a resident helper is harmless and self-guards`);
+  }
+  try { h.close(); } catch { /* ignore */ }
+  helperLaunchedByUs = false;
 }
 function runRestoreTunCli() {
-  return new Promise((resolve) => {
-    execFile(helperExePath(), ["--restore-tun"], { timeout: 30000 }, (err) => resolve(!err));
-  });
+  const r = resolveHelper();
+  if (!r.ok) { log("restore-tun: helper files missing — cannot run the CLI fallback"); return Promise.resolve(false); }
+  // --restore-tun must run elevated (it unwinds routes); pre-NP-1118-38
+  // this ran unelevated and could only fail on a real machine.
+  return spawnElevated(r.exe, ["--restore-tun"], { wait: true, timeoutMs: 120000 }).then((x) => x.ok);
 }
 function getHelper() {
   if (helperClient) return helperClient;
@@ -386,6 +478,12 @@ async function resolveWorkerIps() {
   } catch { return []; }
 }
 async function enableTun(b) {
+  const ensured = await ensureHelper();
+  if (!ensured.ok) {
+    const err = new Error(ensured.detail || ensured.code);
+    err.code = ensured.code;
+    throw err;
+  }
   const h = getHelper();
   try {
     await h.connect();
@@ -405,7 +503,15 @@ async function enableTun(b) {
   });
   for (const s of plan.stripped ?? []) log(`TUN candidate stripped: ${s.ip} (${s.reason})`);
   if (!plan.ok) throw new Error(`TUN plan refused: ${plan.reason}`);
-  await h.request("enable_tun", { socksPort: b.socksPort || cfg.socksPort, exclusions: plan.pins });
+  try {
+    await h.request("enable_tun", { socksPort: b.socksPort || cfg.socksPort, exclusions: plan.pins });
+  } catch (e) {
+    // We launched this helper and the takeover never engaged:
+    // do not leave a stray resident behind (a pre-existing
+    // resident is left alone — it is not ours to stop).
+    if (helperLaunchedByUs) { log(`TUN enable_tun failed (${e.message}) — stopping the helper we launched`); await shutdownHelper(); }
+    throw e;
+  }
   b.setBearerLock(plan.pins);
   if (b.state === "connected" || b.state === "reconnecting") b.setEdgeIp(plan.bearerIp);
   tunOn = true;
@@ -517,7 +623,14 @@ else {
     if (link) setTimeout(() => stageImport(link, "os-link"), 600);
   });
   app.on("window-all-closed", (e) => { if (e) e.preventDefault?.(); }); // tray-resident
-  app.on("before-quit", async () => { try { await doDisconnect(); } catch { /* ignore */ } });
+  app.on("before-quit", async () => {
+    try { await doDisconnect(); } catch { /* ignore */ }
+    // NP-1118-38: the app's own lifecycle end also stops the
+    // helper process (only when we are connected to one — the
+    // takeover is already unwound by doDisconnect; a helper we
+    // never touched this session is left to its dead-man switch).
+    if (helperClient && helperClient.connected) { try { await shutdownHelper(); } catch { /* ignore */ } }
+  });
 }
 
 // Packaged-state UI smoke (NP-1114-35): this guard exists because the

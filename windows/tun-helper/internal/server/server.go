@@ -28,6 +28,12 @@ import (
 type Deps struct {
 	// Elevated reports whether this process may create adapters.
 	Elevated func() bool
+	// Shutdown, when set, is invoked after a successful shutdown
+	// verb reply (NP-1118-38): the process exits. The verb is
+	// refused while the TUN takeover is up — disable_tun first,
+	// so a shutdown can never strand the takeover without its
+	// ordered unwind.
+	Shutdown func()
 	// NewLinkEndpoint creates the TUN link endpoint (Wintun in production).
 	NewLinkEndpoint func() (stack.LinkEndpoint, io.Closer, error)
 	// HeartbeatInterval defaults to 2s; FreshnessThreshold to 10s.
@@ -231,6 +237,14 @@ func (s *Server) dispatch(f *ipc.Frame) *ipc.Frame {
 		if _, err := s.deps.Netcfg.Enable(p.IPs); err != nil {
 			return fail(fmt.Errorf("set_exclusions: %w", err))
 		}
+	case ipc.VerbShutdown:
+		if s.mode == ipc.ModeTun {
+			return fail(fmt.Errorf("shutdown refused while TUN is up — disable_tun first"))
+		}
+		if s.deps.Shutdown != nil {
+			go s.deps.Shutdown()
+		}
+		return reply
 	case ipc.VerbDisableTun:
 		s.mu.Lock()
 		s.teardownLocked("disable_tun")

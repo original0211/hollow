@@ -19,6 +19,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"hollow/tun-helper/internal/netcfg"
 	"hollow/tun-helper/internal/pipe"
@@ -121,7 +122,13 @@ func main() {
 	}
 
 	srv := server.New(server.Deps{
-		Elevated:        isElevated,
+		Elevated: isElevated,
+		Shutdown: func() {
+			// Grace for the reply frame to flush before exit.
+			time.Sleep(150 * time.Millisecond)
+			log.Printf("shutdown verb — exiting")
+			os.Exit(0)
+		},
 		NewLinkEndpoint: platformLinkFactory(),
 		PumpConfig:      pump.Config{},
 		Netcfg:          nc,

@@ -226,3 +226,38 @@ func TestReconnectNewGenerationCancelsTeardown(t *testing.T) {
 	}
 	t.Fatal("second generation's death did not tear down")
 }
+
+// NP-1118-38: the shutdown verb — refused while the takeover is
+// up (disable first, so the unwind stays ordered), accepted
+// when off, and the exit hook fires only on acceptance.
+func TestShutdownVerb(t *testing.T) {
+	_, helperEP := pump.NewChannelPair(1280)
+	fired := make(chan struct{}, 1)
+	deps := testDeps(helperEP)
+	deps.Shutdown = func() { fired <- struct{}{} }
+	srv := New(deps)
+	c := newTestClient(t, srv)
+
+	if r := c.request(t, ipc.VerbEnableTun, ipc.EnableTunParams{SocksPort: 11081}); !*r.OK {
+		t.Fatalf("enable_tun: %+v", r)
+	}
+	if r := c.request(t, ipc.VerbShutdown, nil); r.OK != nil && *r.OK {
+		t.Fatal("shutdown during TUN must be refused")
+	}
+	select {
+	case <-fired:
+		t.Fatal("shutdown hook fired while TUN was up")
+	default:
+	}
+	if r := c.request(t, ipc.VerbDisableTun, nil); !*r.OK {
+		t.Fatalf("disable_tun: %+v", r)
+	}
+	if r := c.request(t, ipc.VerbShutdown, nil); !*r.OK {
+		t.Fatalf("shutdown while off: %+v", r)
+	}
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown hook not fired after acceptance")
+	}
+}
