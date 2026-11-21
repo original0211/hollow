@@ -107,14 +107,26 @@ export async function runWizard(deps, input) {
   if (d.__fail) return d.__fail;
 
   // Step 3 — workers.dev subdomain: read the account subdomain,
-  // claim one if the account never had it, enable the script's.
+  // claim one ONLY when the read definitively says "unset", and
+  // enable the script's. PUT /workers/subdomain on an account
+  // that HAS a subdomain RENAMES it (every existing workers.dev
+  // address breaks), so the claim ring is gated on the attested
+  // unset forms only: an ok response carrying no subdomain, or
+  // HTTP 404. A thrown read or any other status (403/5xx/…)
+  // fails closed with retry guidance and never issues a PUT
+  // (NP-1118-43).
   const s = await step("subdomain", async () => {
     let subName = null;
+    let readForm = "indeterminate";
     try {
       const r = await deps.api("GET", `/accounts/${account.id}/workers/subdomain`);
-      if (r.ok) subName = r.result?.subdomain ?? null;
-    } catch { /* treated as unset below */ }
-    if (!subName) {
+      if (r.ok && r.result?.subdomain) { subName = r.result.subdomain; readForm = "set"; }
+      else if (r.ok || r.status === 404) readForm = "unset";
+      else return { __fail: fail("subdomain", "SUBDOMAIN_FAILED", `子域读取失败（HTTP ${r.status}）——稍后重试向导即可；读不清时向导不会改动任何子域设置`) };
+    } catch (e) {
+      return { __fail: fail("subdomain", "SUBDOMAIN_FAILED", `子域读取请求失败：${e.message}——稍后重试向导即可；读不清时向导不会改动任何子域设置`) };
+    }
+    if (!subName && readForm === "unset") {
       for (let attempt = 0; attempt < 3 && !subName; attempt++) {
         const candidate = subdomainCandidate(account.name, deps.randomHex(2));
         try {

@@ -103,6 +103,24 @@ test("subdomain unset: the wizard claims a candidate, then enables the script", 
   assert.ok(claimIdx >= 0 && enableIdx > claimIdx, `calls: ${calls.join(" | ")}`);
 });
 
+test("NP-1118-43: subdomain read throws or 5xx — fail closed, ZERO claim PUTs", async () => {
+  for (const subdomainGet of ["throw", { ok: false, status: 500, result: null }, { ok: false, status: 403, result: null }]) {
+    const puts = [];
+    const { deps } = fakeDeps({ subdomainGet });
+    const baseApi = deps.api;
+    deps.api = async (method, path, body) => {
+      if (method === "PUT") puts.push(path);
+      if (subdomainGet === "throw" && method === "GET" && path.endsWith("/workers/subdomain")) throw new Error("socket reset");
+      return baseApi(method, path, body);
+    };
+    const r = await runWizard(deps, { token: "tok" });
+    assert.equal(r.ok, false, JSON.stringify(subdomainGet));
+    assert.equal(r.step, "subdomain");
+    assert.equal(r.code, "SUBDOMAIN_FAILED");
+    assert.deepEqual(puts, [], `no PUT may be issued for read form ${JSON.stringify(subdomainGet)}`);
+  }
+});
+
 test("subdomain claim impossible: SUBDOMAIN_FAILED with honest copy", async () => {
   const { deps } = fakeDeps({
     subdomainGet: { ok: false, status: 404, result: null },
