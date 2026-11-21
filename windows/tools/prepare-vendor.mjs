@@ -20,4 +20,8 @@ fs.cpSync(path.join(repoRoot, "shared"), path.join(vendor, "shared"), { recursiv
 for (const f of ["ws-client.js", "socks.js"]) {
   fs.copyFileSync(path.join(repoRoot, "cli", "src", f), path.join(vendor, "cli", "src", f));
 }
+// The deployment wizard (NP-1118-42) ships the Worker bundle
+// inside the app (design: bundled, same-version). worker/src/
+// index.js is the committed bundle built by tools/build-worker.mjs.
+fs.copyFileSync(path.join(repoRoot, "worker", "src", "index.js"), path.join(vendor, "worker-bundle.txt"));
 console.log("vendor prepared:", path.relative(winDir, vendor));

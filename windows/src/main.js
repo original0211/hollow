@@ -18,6 +18,11 @@ import { makePacProvider, startPacServer } from "./pac.js";
 import * as sysproxy from "./sysproxy.js";
 import { HelperClient, HELPER_PIPE_PATH } from "./helper-client.js";
 import { resolveHelperFiles, ensureHelperRunning } from "./helper-launch.js";
+import { runWizard, deleteDeployedWorker, WIZARD_SCRIPT_NAME } from "./deploy-wizard.js";
+import { loadCfToken, writeCfToken, deleteCfToken, cfTokenTail } from "./config.js";
+import { HollowClient } from "../vendor/shared/client-core.js";
+import { connectWs } from "../vendor/cli/src/ws-client.js";
+import { deriveVerifier } from "../vendor/shared/protocol.js";
 import net from "node:net";
 import { HelperWatch } from "./helper-watch.js";
 import { planTunEnable, planCandidateRefresh, edgeModeDisabledInTun } from "./tun-policy.js";
@@ -854,6 +859,112 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
     }
   }
   return { ok: Object.keys(errors).length === 0, errors, needsReconnect, workerUrl: cfg.workerUrl, proxyMode: cfg.proxyMode, directHosts: cfg.directHosts, socksPort: cfg.socksPort, poolSize: cfg.poolSize, pacPort: cfg.pacPort, autoConnect: cfg.autoConnect !== false };
+});
+
+// ---- Deployment wizard (NP-1118-42) ----
+// deploy-wizard.js holds the orchestration; the real effects live
+// here. The token reaches ONLY the Cloudflare API and the token
+// store — never logs, never diagnostics, never the renderer
+// (the renderer only ever sees its last four characters).
+const CF_API_BASE = "https://api.cloudflare.com/client/v4";
+function cfApiFor(token) {
+  return async (method, apiPath, body) => {
+    const res = await fetch(CF_API_BASE + apiPath, {
+      method,
+      headers: { "Authorization": `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    let json = null;
+    try { json = await res.json(); } catch { /* non-JSON error page */ }
+    return { ok: res.ok && json?.success === true, status: res.status, result: json?.result ?? null, errors: json?.errors ?? null };
+  };
+}
+async function cfDeployScript(token, { accountId, scriptName, bundle, metadata }) {
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("index.js", new Blob([bundle], { type: "application/javascript+module" }));
+  const res = await fetch(`${CF_API_BASE}/accounts/${accountId}/workers/scripts/${scriptName}`, {
+    method: "PUT", headers: { "Authorization": `Bearer ${token}` }, body: form,
+  });
+  let json = null;
+  try { json = await res.json(); } catch { /* ignore */ }
+  return { ok: res.ok && json?.success === true, status: res.status, errors: json?.errors ?? null };
+}
+async function probeWizardLiveness(pairing) {
+  const httpBase = pairing.workerUrl.replace(/^wss:/, "https:");
+  const parts = { facade: false, meta: false, handshake: false };
+  try {
+    const r = await fetch(httpBase + "/");
+    const body = await r.text();
+    parts.facade = r.status === 200 && body.length === 81;
+  } catch { /* stays false */ }
+  try {
+    const r = await fetch(httpBase + "/" + pairing.metaPath);
+    parts.meta = r.status === 200;
+    if (r.ok) { try { await r.json(); } catch { parts.meta = false; } }
+  } catch { /* stays false */ }
+  let client = null;
+  try {
+    const transport = await connectWs(pairing.workerUrl, {});
+    client = new HollowClient({ transport, psk: pairing.psk, keyId: pairing.keyId ?? 1 });
+    await client.handshake();
+    parts.handshake = true;
+  } catch { /* stays false */ }
+  try { client?.close(); } catch { /* ignore */ }
+  return parts;
+}
+let wizardRunning = false;
+let wizardAccountId = null;
+ipcMain.handle("hollow:wizardState", () => ({
+  hasToken: !!loadCfToken(), tokenTail: cfTokenTail(),
+  accountId: cfg.cfAccountId ?? wizardAccountId ?? null,
+  deployedUrl: cfg.cfAccountId ? (cfg.workerUrl || null) : null,
+}));
+ipcMain.handle("hollow:wizardStart", async (_e, { token, accountId } = {}) => {
+  if (wizardRunning) return { ok: false, code: "WIZARD_BUSY", detail: "向导正在运行" };
+  const useToken = (typeof token === "string" && token.trim()) ? token.trim() : loadCfToken();
+  if (!useToken) return { ok: false, step: "verify", code: "TOKEN_INVALID", detail: "没有可用的令牌" };
+  wizardRunning = true;
+  try {
+    const result = await runWizard({
+      api: cfApiFor(useToken),
+      deployScript: (args) => cfDeployScript(useToken, args),
+      getBundle: () => fs.readFileSync(path.join(here, "..", "vendor", "worker-bundle.txt"), "utf8"),
+      randomBytes: (n) => new Uint8Array(crypto.randomBytes(n)),
+      randomHex: (n) => crypto.randomBytes(n).toString("hex"),
+      deriveVerifierHex: async (psk) => Buffer.from(await deriveVerifier(psk)).toString("hex"),
+      probeLiveness: probeWizardLiveness,
+      now: () => Date.now(),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      progress: (p) => { if (win && !win.isDestroyed()) win.webContents.send("hollow:event", { type: "wizard-progress", ...p }); },
+      onTokenVerified: async (_t, account) => { writeCfToken(useToken); wizardAccountId = account.id; },
+      finalize: async (pairing, account) => {
+        writePsk(pairing.psk);
+        cfg = { ...cfg, workerUrl: pairing.workerUrl, keyId: pairing.keyId, metaPath: pairing.metaPath, edgesPath: pairing.edgesPath, cfAccountId: account.id };
+        safeSave();
+        if (bridge && (bridge.state === "disconnected" || bridge.state === "error")) bridge = null;
+        log(`wizard: deployed ${WIZARD_SCRIPT_NAME} to the user's own account; config saved — connecting`);
+        void doConnect();
+      },
+    }, { token: useToken, accountId: accountId ?? undefined });
+    if (!result.ok) log(`wizard stopped at ${result.step} [${result.code}]: ${result.detail}`);
+    return result;
+  } finally {
+    wizardRunning = false;
+  }
+});
+ipcMain.handle("hollow:wizardDeleteWorker", async () => {
+  const token = loadCfToken();
+  const accountId = wizardAccountId ?? cfg.cfAccountId ?? null;
+  if (!token || !accountId) return { ok: false, detail: "没有已存令牌或账号记录" };
+  const r = await deleteDeployedWorker({ api: cfApiFor(token) }, { accountId });
+  log(`wizard: delete deployed worker -> ${r.ok ? "ok" : "failed"}`);
+  return r;
+});
+ipcMain.handle("hollow:wizardDeleteToken", () => {
+  deleteCfToken();
+  log("wizard: stored Cloudflare token deleted");
+  return { ok: true };
 });
 
 // ---- Edge-IP selection (M2-4) ----

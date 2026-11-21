@@ -417,6 +417,86 @@ window.hollow.onEvent((ev) => {
   if (ev.type === "socks") { snapshot.socksPort = ev.socksPort; render(); }
   if (ev.type === "queued") { snapshot.queuedNow = ev.queuedNow; render(); }
   if (ev.type === "traffic") { trafficRates = { upRate: ev.upRate, downRate: ev.downRate }; snapshot.traffic = { up: ev.up, down: ev.down }; render(); }
+  if (ev.type === "wizard-progress") { wizardMarkStep(ev.step, ev.state); }
 });
 setInterval(render, 1000);
 refresh();
+
+// ---- Deployment wizard (NP-1118-42) ----
+const WIZARD_STEP_LABELS = [
+  ["verify", "验证令牌与账号"], ["generate", "本地生成配对密钥"], ["deploy", "部署 Worker"],
+  ["subdomain", "启用访问子域"], ["liveness", "验活（握手与落地）"], ["finalize", "保存配置并连接"],
+];
+function wizardRenderSteps() {
+  const ol = $("wizard-steps");
+  ol.textContent = "";
+  for (const [key, label] of WIZARD_STEP_LABELS) {
+    const li = document.createElement("li");
+    li.id = "wz-" + key;
+    li.textContent = label;
+    ol.appendChild(li);
+  }
+}
+function wizardMarkStep(key, state) {
+  const li = $("wz-" + key);
+  if (!li) return;
+  li.textContent = WIZARD_STEP_LABELS.find(([k]) => k === key)[1] + (state === "start" ? " …" : state === "done" ? " ✓" : " ✗");
+}
+async function wizardRefreshState() {
+  try {
+    const s = await window.hollow.wizardState();
+    $("wizard-token-state").textContent = s.hasToken ? `已存令牌（尾号 ${s.tokenTail}）——留空输入框即用已存令牌` : "尚无已存令牌";
+    $("btn-wizard-del-token").hidden = !s.hasToken;
+  } catch { /* card stays usable */ }
+}
+$("btn-wizard-start").addEventListener("click", async () => {
+  const btn = $("btn-wizard-start");
+  btn.disabled = true;
+  $("wizard-fail").hidden = true;
+  $("wizard-done").hidden = true;
+  $("btn-wizard-del-worker").hidden = true;
+  wizardRenderSteps();
+  const accountSel = $("wizard-account");
+  const args = { token: $("wizard-token").value };
+  if (!accountSel.hidden && accountSel.value) args.accountId = accountSel.value;
+  let r;
+  try { r = await window.hollow.wizardStart(args); }
+  catch (e) { r = { ok: false, detail: String(e && e.message || e) }; }
+  btn.disabled = false;
+  if (r.ok) {
+    $("wizard-token").value = "";
+    $("wizard-done").hidden = false;
+    $("wizard-done").textContent = `部署完成：${r.workerUrl}——已保存为当前配置并开始连接。令牌仍存在本机（便于以后一键更新），不需要时可点「删除已存令牌」。`;
+    wizardRefreshState();
+    return;
+  }
+  if (r.code === "MULTI_ACCOUNT" && Array.isArray(r.accounts)) {
+    accountSel.textContent = "";
+    for (const a of r.accounts) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = a.name;
+      accountSel.appendChild(opt);
+    }
+    accountSel.hidden = false;
+    $("wizard-account-label").hidden = false;
+    $("wizard-fail").hidden = false;
+    $("wizard-fail").textContent = "令牌下有多个账号——选好后再次点「开始部署」。";
+    return;
+  }
+  $("wizard-fail").hidden = false;
+  $("wizard-fail").textContent = `停在「${(WIZARD_STEP_LABELS.find(([k]) => k === r.step) || [])[1] || r.step || "未知"}」：${r.detail || r.code || "未知错误"}${r.workersNotEnabled ? "——该账号可能尚未开通 Workers：请先到 Cloudflare 控制台的 Workers 页面点一次开通（免费层），再重试向导。" : ""} 修改后可直接再次点「开始部署」，已完成的步骤会自动跳过/覆盖。`;
+  if (r.step === "liveness" || r.step === "finalize" || r.step === "subdomain") $("btn-wizard-del-worker").hidden = false;
+  wizardRefreshState();
+});
+$("btn-wizard-del-worker").addEventListener("click", async () => {
+  const r = await window.hollow.wizardDeleteWorker();
+  $("wizard-fail").textContent = r.ok ? "已删除账号里的 hollow Worker。" : `删除未成功：${r.detail || "HTTP " + r.status}——也可以在 Cloudflare 控制台手动删除同名脚本。`;
+  if (r.ok) $("btn-wizard-del-worker").hidden = true;
+});
+$("btn-wizard-del-token").addEventListener("click", async () => {
+  await window.hollow.wizardDeleteToken();
+  wizardRefreshState();
+});
+wizardRenderSteps();
+wizardRefreshState();

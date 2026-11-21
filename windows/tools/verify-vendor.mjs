@@ -21,9 +21,14 @@ function* walk(dir) {
   }
 }
 let checked = 0;
+// Files whose vendor name intentionally differs from their repo
+// source path (NP-1118-42: the wizard's Worker bundle is the
+// committed worker/src/index.js, vendored under a data name so
+// nothing mistakes it for an app module).
+const SOURCE_OVERRIDES = { "worker-bundle.txt": path.join("worker", "src", "index.js") };
 for (const f of walk(vendor)) {
   const rel = path.relative(vendor, f);
-  const src = path.join(repoRoot, rel);
+  const src = path.join(repoRoot, SOURCE_OVERRIDES[rel] ?? rel);
   if (!fs.existsSync(src)) { console.error(`vendor file without source: ${rel}`); failures++; continue; }
   if (sha(f) !== sha(src)) { console.error(`vendor hash mismatch: ${rel}`); failures++; }
   checked++;

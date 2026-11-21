@@ -78,6 +78,24 @@
     <div class="sub" id="test-result"></div>
   </section>
 
+  <!-- Deployment wizard (NP-1118-42): deploy the user's own
+       Worker from inside the app; the manual paths stay as-is. -->
+  <section class="card" id="wizard-card">
+    <h2>一键部署到我的 Cloudflare</h2>
+    <div class="sub">把 Hollow 服务端部署到你自己的 Cloudflare 账号，全程不用打开控制台。需要一个 API 令牌（在 dash.cloudflare.com/profile/api-tokens 创建，权限只勾两项：<span class="mono">Workers Scripts: Edit</span> 与 <span class="mono">Account Settings: Read</span>）。令牌只存本机、只显示尾四位，部署完成后可删除，不影响已部署的 Worker。</div>
+    <div class="sub" id="wizard-token-state"></div>
+    <label for="wizard-token">Cloudflare API 令牌</label>
+    <input type="password" id="wizard-token" spellcheck="false" autocomplete="off" placeholder="粘贴令牌（已存令牌可留空）">
+    <label for="wizard-account" id="wizard-account-label" hidden>部署到哪个账号</label>
+    <select id="wizard-account" hidden></select>
+    <button id="btn-wizard-start">开始部署</button>
+    <button id="btn-wizard-del-token" hidden>删除已存令牌</button>
+    <ol class="sub" id="wizard-steps"></ol>
+    <div class="sub" id="wizard-fail" hidden></div>
+    <button id="btn-wizard-del-worker" hidden>删除已部署的 Worker（可选）</button>
+    <div class="sub" id="wizard-done" hidden></div>
+  </section>
+
   <!-- (b)+(c) Settings: user fields up front, protocol internals in
        the advanced fold; every field applies on change. -->
   <section class="card" id="settings-card">

@@ -24,6 +24,11 @@ contextBridge.exposeInMainWorld("hollow", {
   importCancel: () => ipcRenderer.invoke("hollow:importCancel"),
   exportToFile: (includePsk) => ipcRenderer.invoke("hollow:exportToFile", { includePsk }),
   qrOwnConfig: (includePsk) => ipcRenderer.invoke("hollow:qrOwnConfig", { includePsk }),
+  // deployment wizard (NP-1118-42)
+  wizardState: () => ipcRenderer.invoke("hollow:wizardState"),
+  wizardStart: (args) => ipcRenderer.invoke("hollow:wizardStart", args),
+  wizardDeleteWorker: () => ipcRenderer.invoke("hollow:wizardDeleteWorker"),
+  wizardDeleteToken: () => ipcRenderer.invoke("hollow:wizardDeleteToken"),
   // edge selection (M2-4)
   getEdges: () => ipcRenderer.invoke("hollow:getEdges"),
   refreshEdges: () => ipcRenderer.invoke("hollow:refreshEdges"),

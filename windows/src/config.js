@@ -125,6 +125,49 @@ export function loadOrCreatePsk() {
   return psk;
 }
 
+// Cloudflare API token for the deployment wizard (NP-1118-42):
+// stored with the PSK's discipline — its own file in the config
+// dir, atomic write, 0600 + ACL tightening. The token is a
+// deploy-time credential: the app never logs it, never includes
+// it in diagnostics or exports, and the UI shows only its last
+// four characters. Deleting it does not affect a deployed Worker.
+function cfTokenFile() { return path.join(configDir(), "cftoken.txt"); }
+export function loadCfToken() {
+  const file = cfTokenFile();
+  if (!fs.existsSync(file)) return null;
+  const t = fs.readFileSync(file, "utf8").trim();
+  return t || null;
+}
+export function writeCfToken(token) {
+  if (typeof token !== "string" || !token.trim()) throw new Error("cf token must be a non-empty string");
+  fs.mkdirSync(configDir(), { recursive: true });
+  const file = cfTokenFile();
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, token.trim(), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  void tightenFileAcl(file);
+}
+export function deleteCfToken() {
+  try { fs.unlinkSync(cfTokenFile()); } catch { /* already gone */ }
+}
+export function cfTokenTail() {
+  const t = loadCfToken();
+  return t ? t.slice(-4) : null;
+}
+export async function tightenFileAcl(file, log = () => {}) {
+  if (!fs.existsSync(file)) return false;
+  if (process.platform !== "win32") {
+    try { fs.chmodSync(file, 0o600); return true; } catch { return false; }
+  }
+  const user = os.userInfo().username;
+  return new Promise((resolve) => {
+    execFile("icacls", pskAclArgs(file, user), (err) => {
+      if (err) log(`acl tighten failed for ${path.basename(file)}: ${err.message}`);
+      resolve(!err);
+    });
+  });
+}
+
 // ACL tightening (Windows): inheritance off; full control only for the
 // current process identity + SYSTEM. POSIX: 0600. Idempotent; the app runs
 // it at creation, after import writes, and once on every startup.
