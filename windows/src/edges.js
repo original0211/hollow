@@ -101,8 +101,10 @@ async function handshakeOnce(workerUrl, psk, keyId, edgeIp, timeoutMs = PROBE_TI
     await Promise.race([
       client.handshake(),
       new Promise((_, rej) => {
-        const t = setTimeout(() => rej(new Error("probe handshake timed out")), Math.max(1, timeoutMs - (Date.now() - t0)));
-        t.unref?.();
+        // NOT unref'd: a bounded deadline is real pending work —
+        // unref'ing lets the event loop drain out from under the
+        // race and the bound silently never fires.
+        setTimeout(() => rej(new Error("probe handshake timed out")), Math.max(1, timeoutMs - (Date.now() - t0)));
       }),
     ]);
     return Date.now() - t0;
@@ -120,8 +122,7 @@ function withinDeadline(promise, deadline, what) {
   return Promise.race([
     promise,
     new Promise((_, rej) => {
-      const t = setTimeout(() => rej(new Error(`${what} budget exhausted`)), remaining);
-      t.unref?.();
+      setTimeout(() => rej(new Error(`${what} budget exhausted`)), remaining); // not unref'd: see handshakeOnce
     }),
   ]);
 }

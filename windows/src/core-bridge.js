@@ -538,8 +538,7 @@ export class CoreBridge {
     // is discarded (the race has already settled).
     const TIMED_OUT = Symbol("remeasure-timed-out");
     const watchdog = new Promise((res) => {
-      const t = setTimeout(() => res(TIMED_OUT), this.remeasureTimeoutMs);
-      t.unref?.();
+      setTimeout(() => res(TIMED_OUT), this.remeasureTimeoutMs); // not unref'd: the bound must actually fire
     });
     Promise.race([Promise.resolve().then(() => this.measureEdgesFn()), watchdog])
       .then((list) => {
