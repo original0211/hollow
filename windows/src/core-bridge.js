@@ -188,6 +188,7 @@ export class CoreBridge {
   // has no candidate left for the slot; otherwise the target is left
   // to the bridge default (single pin / bearer lock), as before.
   async _establishClient(slotIndex = -1) {
+    const establishStart = Date.now();
     if (this.bearerLock !== null && this.bearerLock.length === 0) {
       throw new Error("bearer <redacted> is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
     }
@@ -213,6 +214,9 @@ export class CoreBridge {
       throw e;
     }
     if (!this._want) { try { client.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
+    // NP-1118-48: carrier establishments seed the phoenix
+    // path-cost estimate (the dial component).
+    phoenixShared.breaker.noteDialCost(Date.now() - establishStart);
     if (pick) {
       this._edgeFailCounts.delete(pick.ip);
       this.log(`carrier established: slot ${slotIndex}, entry ${pick.ip}, rtt ${pick.rttMs ?? "?"}ms`);

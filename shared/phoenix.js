@@ -6,12 +6,28 @@
 // local parameters, values identical to the Go side.
 export const PHOENIX_BUFFER_CAP = 64 * 1024;
 export const PHOENIX_MAX_REOPENS = 2;
-export const PHOENIX_ESTABLISH_WINDOW_MS = 15_000;
 export const PHOENIX_REDIAL_RETRY_MS = 400;
 export const PHOENIX_BREAKER_THRESHOLD = 5;
 export const PHOENIX_BREAKER_WINDOW_MS = 30_000;
 export const PHOENIX_BREAKER_COOLDOWN_MS = 60_000;
-export const PHOENIX_FAST_DEATH_MS = 2_000;
+// NP-1118-48 (Go parity): the establishment window and the
+// fast-death bar scale with the measured path cost; the
+// floors are the pre-NP-1118-48 constants, so cost 0
+// reproduces the old behavior exactly.
+export const PHOENIX_WINDOW_FLOOR_MS = 15_000;
+export const PHOENIX_WINDOW_CAP_MS = 45_000;
+export const PHOENIX_FAST_DEATH_FLOOR_MS = 2_000;
+export const PHOENIX_FAST_DEATH_CAP_MS = 10_000;
+
+// clamp(3*cost + 5s, 15s, 45s); cost 0 -> exactly 15s.
+export function phoenixWindowFor(costMs) {
+  return Math.min(PHOENIX_WINDOW_CAP_MS, Math.max(PHOENIX_WINDOW_FLOOR_MS, 3 * costMs + 5_000));
+}
+
+// clamp(1.5*cost, 2s, 10s); cost 0 -> exactly 2s.
+export function phoenixFastDeathFor(costMs) {
+  return Math.min(PHOENIX_FAST_DEATH_CAP_MS, Math.max(PHOENIX_FAST_DEATH_FLOOR_MS, 1.5 * costMs));
+}
 
 const IDEMPOTENT_METHODS = ["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"];
 
@@ -39,8 +55,21 @@ export class PhoenixBreaker {
     this.lastFastDeath = 0;
     this.openUntil = 0;
     this.trips = 0;
+    // NP-1118-48 path cost (Go parity): max of an EWMA of
+    // resolved attempt durations and an EWMA of dial
+    // durations (the seed the bridge feeds from carrier
+    // establishments).
+    this.attemptCostMs = 0;
+    this.dialCostMs = 0;
   }
   allow() { return Date.now() > this.openUntil; }
+  noteAttemptCost(ms) {
+    this.attemptCostMs = this.attemptCostMs > 0 ? (7 * this.attemptCostMs + 3 * ms) / 10 : ms;
+  }
+  noteDialCost(ms) {
+    this.dialCostMs = this.dialCostMs > 0 ? (7 * this.dialCostMs + 3 * ms) / 10 : ms;
+  }
+  costMs() { return Math.max(this.attemptCostMs, this.dialCostMs); }
   noteFastDeath() {
     const now = Date.now();
     if (now - this.lastFastDeath > PHOENIX_BREAKER_WINDOW_MS) this.fastDeaths = 0;
@@ -74,6 +103,7 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
   const w = {
     _cur: first,
     _curBorn: Date.now(),
+    _attemptStart: Date.now(),
     _gen: 0,
     _buf: [],
     _bufBytes: 0,
@@ -156,6 +186,7 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
           this._protected = false;
           this._buf = [];
           this._bufBytes = 0;
+          shared.breaker.noteAttemptCost(Date.now() - this._attemptStart);
           if (this._attempts > 0) {
             shared.saved++;
             shared.breaker.noteSuccess();
@@ -181,12 +212,17 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
       }
       if (this._redialing) return;
       const now = Date.now();
+      // The death is cost evidence first (Go parity): it
+      // extends this flow's own window before eligibility is
+      // judged.
+      shared.breaker.noteAttemptCost(now - this._attemptStart);
+      const costMs = shared.breaker.costMs();
       const flight = Buffer.concat(this._buf);
       const eligible = this._protected &&
         this._attempts < PHOENIX_MAX_REOPENS &&
-        now - this._t0 < PHOENIX_ESTABLISH_WINDOW_MS &&
+        now - this._t0 < phoenixWindowFor(costMs) &&
         replayableFlight(flight) && shared.breaker.allow();
-      const fastDeath = this._attempts > 0 && now - this._curBorn < PHOENIX_FAST_DEATH_MS;
+      const fastDeath = this._attempts > 0 && now - this._curBorn < phoenixFastDeathFor(costMs);
       this._cur = null;
       if (fastDeath) shared.breaker.noteFastDeath();
       if (!eligible) {
@@ -199,6 +235,7 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
     },
 
     async _redialLoop(flight) {
+      const dialStart = Date.now();
       for (;;) {
         let s = null;
         try { s = await redial(); } catch { s = null; }
@@ -206,8 +243,10 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
         if (s) {
           this._attempts++;
           shared.reopens++;
+          shared.breaker.noteDialCost(Date.now() - dialStart);
           this._cur = s;
           this._curBorn = Date.now();
+          this._attemptStart = dialStart;
           this._redialing = false;
           this._wire(s);
           for (const chunk of this._buf) s.write(chunk);
@@ -216,7 +255,7 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
         }
         // A failed dial does not consume a reopen (Go parity):
         // retry inside the establishment window.
-        if (Date.now() - this._t0 > PHOENIX_ESTABLISH_WINDOW_MS) {
+        if (Date.now() - this._t0 > phoenixWindowFor(shared.breaker.costMs())) {
           this._redialing = false;
           this._failed = true;
           if (this._onFail) this._onFail("phoenix: no carrier within the establishment window");

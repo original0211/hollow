@@ -518,3 +518,53 @@ func TestPhoenixBreakerStateMachine(t *testing.T) {
 		t.Fatal("breaker must allow again after cooldown")
 	}
 }
+
+// NP-1118-48: cost-scaled window / fast-death formulas. At cost
+// 0 both reproduce the pre-NP-1118-48 constants exactly (the
+// low-cost discrimination grid); the high-cost rows pin the
+// scaling and the caps.
+func TestPhoenixScalingFormulas(t *testing.T) {
+	win := []struct{ cost, want time.Duration }{
+		{0, 15 * time.Second},
+		{1 * time.Second, 15 * time.Second},
+		{2 * time.Second, 15 * time.Second},
+		{4 * time.Second, 17 * time.Second},
+		{6 * time.Second, 23 * time.Second},
+		{10 * time.Second, 35 * time.Second},
+		{20 * time.Second, 45 * time.Second},
+		{time.Minute, 45 * time.Second},
+	}
+	for _, tc := range win {
+		if got := phoenixWindowFor(tc.cost); got != tc.want {
+			t.Errorf("phoenixWindowFor(%v) = %v, want %v", tc.cost, got, tc.want)
+		}
+	}
+	fast := []struct{ cost, want time.Duration }{
+		{0, 2 * time.Second},
+		{1 * time.Second, 2 * time.Second},
+		{2 * time.Second, 3 * time.Second},
+		{4 * time.Second, 6 * time.Second},
+		{6 * time.Second, 9 * time.Second},
+		{7 * time.Second, 10 * time.Second},
+		{20 * time.Second, 10 * time.Second},
+	}
+	for _, tc := range fast {
+		if got := phoenixFastDeathFor(tc.cost); got != tc.want {
+			t.Errorf("phoenixFastDeathFor(%v) = %v, want %v", tc.cost, got, tc.want)
+		}
+	}
+	// Cost learning: first sample sets the estimate, the max of
+	// the attempt and dial components wins.
+	b := &phoenixBreaker{}
+	if b.cost() != 0 {
+		t.Fatalf("fresh breaker cost = %v, want 0", b.cost())
+	}
+	b.noteDialCost(3 * time.Second)
+	if b.cost() != 3*time.Second {
+		t.Fatalf("after dial sample cost = %v, want 3s", b.cost())
+	}
+	b.noteAttemptCost(6 * time.Second)
+	if b.cost() != 6*time.Second {
+		t.Fatalf("after attempt sample cost = %v, want 6s", b.cost())
+	}
+}

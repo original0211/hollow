@@ -298,3 +298,93 @@ test("PhoenixBreaker state machine (Go parity)", () => {
   b.openUntil = Date.now() - 1;
   assert.ok(b.allow(), "breaker allows again after cooldown");
 });
+
+// --- NP-1118-48: cost-scaled window / fast-death (JS parity) ---
+
+import { phoenixWindowFor, phoenixFastDeathFor } from "../shared/phoenix.js";
+
+test("phoenix scaling formulas (Go parity table)", () => {
+  const win = [[0, 15000], [1000, 15000], [2000, 15000], [4000, 17000], [6000, 23000], [10000, 35000], [20000, 45000], [60000, 45000]];
+  for (const [cost, want] of win) assert.equal(phoenixWindowFor(cost), want, `window(${cost})`);
+  const fast = [[0, 2000], [1000, 2000], [2000, 3000], [4000, 6000], [6000, 9000], [7000, 10000], [20000, 10000]];
+  for (const [cost, want] of fast) assert.equal(phoenixFastDeathFor(cost), want, `fastDeath(${cost})`);
+});
+
+class FakeStream {
+  constructor() {
+    this.opened = Promise.resolve();
+    this.id = 1; this.gate = null; this.state = "open"; this.pending = [];
+    this.paused = false; this.written = [];
+  }
+  write(b) { this.written.push(Buffer.from(b)); return true; }
+  reset() {} closeWrite() {} consume() {}
+  die() { if (this.onFail) this.onFail("carrier dead"); }
+}
+
+function freshShared(costMs = 0) {
+  const shared = { breaker: new PhoenixBreaker(), reopens: 0, saved: 0 };
+  // Seed via the DIAL component: in production the bridge feeds
+  // carrier-establishment durations there (the wrapper's own
+  // attempt samples start at wrap time and cannot see the dial).
+  if (costMs > 0) shared.breaker.noteDialCost(costMs);
+  return shared;
+}
+
+const TLS_FLIGHT = Buffer.from([0x16, 0x03, 0x01, 0x00, 0x2e, 0xaa]);
+
+test("NP-1118-48 window: a death 16s after dial reopens ONLY under the scaled window", async () => {
+  // cost 0 -> window is the historical 15s: a death at 16s is final.
+  {
+    const shared = freshShared(0);
+    let redials = 0;
+    const s1 = new FakeStream();
+    const w = wrapPhoenixStream(s1, async () => { redials++; return new FakeStream(); }, shared);
+    w.write(TLS_FLIGHT);
+    w._t0 = Date.now() - 16_000;
+    s1.die();
+    await sleep(30);
+    assert.equal(redials, 0);
+    assert.equal(w.state, "failed");
+  }
+  // cost 6s -> window 23s: the same death at 16s reopens.
+  {
+    const shared = freshShared(6000);
+    let redials = 0;
+    const s1 = new FakeStream();
+    const w = wrapPhoenixStream(s1, async () => { redials++; return new FakeStream(); }, shared);
+    w.write(TLS_FLIGHT);
+    w._t0 = Date.now() - 16_000;
+    s1.die();
+    await waitFor("redial under scaled window", () => redials === 1);
+    assert.equal(shared.reopens, 1);
+  }
+});
+
+test("NP-1118-48 fast-death: deaths 3s after birth trip the breaker ONLY under the scaled bar", async () => {
+  const run = async (costMs) => {
+    const shared = freshShared(costMs);
+    for (let flow = 0; flow < 5; flow++) {
+      // The bridge re-seeds the dial component from real carrier
+      // establishments continuously; model that per flow.
+      if (costMs > 0) shared.breaker.noteDialCost(costMs);
+      const s1 = new FakeStream();
+      const streams = [s1];
+      const w = wrapPhoenixStream(s1, async () => { await sleep(200); const s = new FakeStream(); streams.push(s); return s; }, shared);
+      w.write(TLS_FLIGHT);
+      s1.die(); // first death: earns the reopen
+      await waitFor("reopen", () => streams.length === 2);
+      w._curBorn = Date.now() - 3000; // the reopened stream dies 3s after birth
+      streams[1].die();
+      await sleep(20);
+      w.reset(); // stop this flow's machinery (the fast-death was noted synchronously)
+    }
+    return shared;
+  };
+  // Old fixed bar (2s): a 3s-after-birth death is NOT fast -> no trip.
+  const cold = await run(0);
+  assert.equal(cold.breaker.trips, 0);
+  // Scaled bar at cost 6s (9s): the same deaths are fast -> trips.
+  const hot = await run(6000);
+  assert.equal(hot.breaker.trips, 1);
+  assert.equal(hot.breaker.allow(), false);
+});
