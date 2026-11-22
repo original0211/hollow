@@ -18,8 +18,31 @@ import {
 
 const CONNECT_SPECIAL_ERROR = "proxy request failed, cannot connect to the specified address";
 
+// NP-1118-65 (audit NP-1118-63 B1/B2/S7/S8): local bounds for the
+// server-side waits that had none. All are §10.2 local parameters
+// (constructor-overridable, no wire change):
+//   OPEN_WATCHDOG_MS — a connect() establishment that never settles
+//     otherwise holds its §7.5 in-flight slot forever (a client
+//     RESET cannot release it: the identity check runs only after
+//     the await settles). 30 s sits far above any legitimate
+//     egress connect and matches the fetch bound below.
+//   FETCH_TIMEOUT_MS — the fetch gate holds its §7.5 slot until
+//     response headers arrive; an origin that never answers would
+//     hold it (and one of FETCH_CONCURRENCY) forever.
+//   HANDSHAKE_DEADLINE_MS — a session that never completes the §5
+//     handshake is parked indefinitely; 30 s stays above the
+//     client's own 20 s establishment bound (NP-1118-49/Go), so a
+//     handshake a client is still legitimately waiting on is
+//     never killed early.
+//   WRITER_CLOSE_TIMEOUT_MS — _onCloseFrame's writer.close()
+//     settle bound; past it the stream's release proceeds anyway.
+export const OPEN_WATCHDOG_MS = 30000;
+export const FETCH_TIMEOUT_MS = 30000;
+export const HANDSHAKE_DEADLINE_MS = 30000;
+export const WRITER_CLOSE_TIMEOUT_MS = 5000;
+
 export class HollowServer {
-  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = 16, queueDepth = 64, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT }) {
+  constructor({ transport, verifiers, ownHost, zoneSuffix, connectFn, fetchFn, streamLingerMs = 120000, maxInFlightOpens = 16, queueDepth = 64, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT, openWatchdogMs = OPEN_WATCHDOG_MS, fetchTimeoutMs = FETCH_TIMEOUT_MS, fetchRespMax = FETCH_BODY_MAX, handshakeDeadlineMs = HANDSHAKE_DEADLINE_MS, writerCloseTimeoutMs = WRITER_CLOSE_TIMEOUT_MS }) {
     // §6.5 v0.2.1 (NP-1117-25): receiver grant targets; passing the
     // INIT values reproduces pre-v0.2.1 behavior exactly (top-up is
     // 0), which is also the per-endpoint rollback switch.
@@ -59,6 +82,11 @@ export class HollowServer {
     // locally in lingerReleases.
     this.streamLingerMs = streamLingerMs;
     this.lingerReleases = 0;
+    this.openWatchdogMs = openWatchdogMs;
+    this.fetchTimeoutMs = fetchTimeoutMs;
+    this.fetchRespMax = fetchRespMax;
+    this.handshakeDeadlineMs = handshakeDeadlineMs;
+    this.writerCloseTimeoutMs = writerCloseTimeoutMs;
     this.connSendWindow = CONN_WINDOW_INIT;
     this.connRecvWindow = connWindowGrant;
     this.connRecvUnacked = 0;
@@ -73,10 +101,21 @@ export class HollowServer {
         .catch(() => this._carrierFail());
     });
     transport.onClose(() => { this._teardown(); });
+    // NP-1118-65 (S7): handshake completion deadline — cleared on
+    // reaching "open" and on teardown; the timer is real pending
+    // work and is deliberately not unref'd.
+    this._hsTimer = null;
+    if (this.handshakeDeadlineMs > 0) {
+      this._hsTimer = setTimeout(() => {
+        this._hsTimer = null;
+        if (this.state !== "open" && !this.dead) this._carrierFail();
+      }, this.handshakeDeadlineMs);
+    }
   }
 
   _teardown() {
     this.dead = true;
+    if (this._hsTimer) { clearTimeout(this._hsTimer); this._hsTimer = null; }
     for (const s of this.streams.values()) {
       if (s.lingerTimer) { clearTimeout(s.lingerTimer); s.lingerTimer = null; }
       this._closeSocket(s);
@@ -166,6 +205,7 @@ export class HollowServer {
       return this._carrierFail();
     }
     this.state = "open";
+    if (this._hsTimer) { clearTimeout(this._hsTimer); this._hsTimer = null; }
     // §6.5 v0.2.1: top up the client's connection window from the
     // legacy INIT to our grant target.
     this._topUp(0, this.connWindowGrant - CONN_WINDOW_INIT);
@@ -190,7 +230,12 @@ export class HollowServer {
       this._noteStreamError();
     }
     for (const f of parsed.frames) {
-      this._dispatch(f).catch(() => {});
+      // NP-1118-65 (S6, log ride-along only): a dispatch error is
+      // logged once instead of swallowed silently; the closing
+      // behavior is unchanged (no counter feeds _carrierFail).
+      this._dispatch(f).catch((e) => {
+        try { console.error("hollow: dispatch error:", e && e.message || e); } catch {}
+      });
       if (this.dead) return;
     }
   }
@@ -286,10 +331,38 @@ export class HollowServer {
     this._topUp(streamId, this.streamWindowGrant - STREAM_WINDOW_INIT);
     // §7.3 step 1: connect gate first
     let sock = null, connectErr = null;
-    try {
-      sock = await this.connectFn({ hostname: open.host, port: open.port });
-      if (sock.opened) await sock.opened;
-    } catch (e) { connectErr = e; }
+    if (this.openWatchdogMs > 0) {
+      // NP-1118-65 (B1): 30 s watchdog on the establishment. A
+      // connect() that never settles otherwise holds the §7.5
+      // in-flight slot forever — the mid-establishment identity
+      // check below runs only after the await settles, so even a
+      // client RESET cannot release it. On expiry the failure
+      // flows through the existing §7.3 mapping ("timed out" ->
+      // TARGET_UNREACHABLE) and the slot releases through the
+      // normal paths. A socket that settles LATE (after the
+      // watchdog won) is closed on arrival so it cannot leak.
+      const est = (async () => {
+        const sk = await this.connectFn({ hostname: open.host, port: open.port });
+        if (sk && sk.opened) await sk.opened;
+        return sk;
+      })();
+      let wd = null;
+      try {
+        sock = await Promise.race([
+          est,
+          new Promise((_, rej) => {
+            wd = setTimeout(() => rej(new Error("connect timed out (open watchdog)")), this.openWatchdogMs);
+          }),
+        ]);
+      } catch (e) { connectErr = e; }
+      if (wd) clearTimeout(wd);
+      est.then((sk) => { if (connectErr && sk) { try { sk.close(); } catch {} } }, () => {});
+    } else {
+      try {
+        sock = await this.connectFn({ hostname: open.host, port: open.port });
+        if (sock.opened) await sock.opened;
+      } catch (e) { connectErr = e; }
+    }
     // NP-1117-10 (must-fix B): the mid-establishment death check is by
     // OBJECT IDENTITY, not by id presence. A client may reset a stream
     // and reuse its id while the old establishment is still in flight;
@@ -546,7 +619,16 @@ export class HollowServer {
     if (!s) return;
     s.remoteClosed = true;
     if (s.gate === GATE.CONNECT) {
-      if (s.writer) { try { await s.writer.close(); } catch {} }
+      if (s.writer) {
+        // NP-1118-65 (S8): bound the close settle — past the
+        // timeout the release below proceeds anyway.
+        try {
+          await Promise.race([
+            Promise.resolve().then(() => s.writer.close()),
+            new Promise((res) => setTimeout(res, this.writerCloseTimeoutMs)),
+          ]);
+        } catch {}
+      }
       if (s.localClosed || s.outEof) this._freeStream(s);
     } else if (s.gate === GATE.FETCH) {
       this._runFetch(s);
@@ -618,6 +700,12 @@ export class HollowServer {
         headers: outHeaders,
         body: ["GET", "HEAD"].includes(method) ? undefined : body,
         redirect: "manual",
+        // NP-1118-65 (B2): 30 s abort — the fetch gate holds its
+        // §7.5 slot until headers arrive, so an origin that never
+        // answers must not hold it (or a FETCH_CONCURRENCY slot)
+        // forever. An abort lands in the catch below and fails
+        // the transaction like any other fetch error.
+        signal: this._fetchSignal(),
       });
     } catch {
       return fail(ERR.FETCH_FALLBACK_FAILED);
@@ -630,7 +718,18 @@ export class HollowServer {
     const statusText = resp.statusText || "";
     let head = `HTTP/1.1 ${resp.status} ${statusText}\r\n`;
     let respBody = null;
-    try { respBody = new Uint8Array(await resp.arrayBuffer()); } catch { respBody = new Uint8Array(0); }
+    try {
+      // NP-1118-65 (B2): the response body is read with a cap at
+      // the §7.4 transaction magnitude (FETCH_BODY_MAX, 4 MiB —
+      // the same ceiling the request side enforces): the fetch
+      // gate synthesizes one HTTP/1.1 response in memory, so an
+      // unbounded body is an unbounded memory + occupancy hold.
+      // Overflow fails the transaction; a read error keeps the
+      // historical empty-body tolerance.
+      const capped = await this._readBodyCapped(resp);
+      if (capped.overflow) return fail(ERR.FETCH_BODY_TOO_LARGE);
+      respBody = capped.body;
+    } catch { respBody = new Uint8Array(0); }
     const rh = {};
     resp.headers.forEach((v, k) => { rh[k.toLowerCase()] = v; });
     for (const [k, v] of Object.entries(rh)) {
@@ -659,6 +758,49 @@ export class HollowServer {
       s.localClosed = true;
       this._freeStream(s);
     }
+  }
+
+  // NP-1118-65 (B2): the fetch abort signal (AbortSignal.timeout
+  // where available, an AbortController fallback elsewhere).
+  _fetchSignal() {
+    if (this.fetchTimeoutMs <= 0) return undefined;
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return AbortSignal.timeout(this.fetchTimeoutMs);
+    }
+    if (typeof AbortController !== "undefined") {
+      const ac = new AbortController();
+      setTimeout(() => { try { ac.abort(); } catch {} }, this.fetchTimeoutMs);
+      return ac.signal;
+    }
+    return undefined;
+  }
+
+  // NP-1118-65 (B2): read a fetch response body with the
+  // fetchRespMax cap. Returns { body } or { overflow: true }.
+  // Streams when a reader is available (cancelling on overflow);
+  // falls back to arrayBuffer for response doubles without one.
+  async _readBodyCapped(resp) {
+    if (resp.body && typeof resp.body.getReader === "function") {
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          total += value.length;
+          if (total > this.fetchRespMax) {
+            try { await reader.cancel(); } catch {}
+            return { overflow: true };
+          }
+          chunks.push(value);
+        }
+      }
+      return { body: concat(...chunks) };
+    }
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    if (buf.length > this.fetchRespMax) return { overflow: true };
+    return { body: buf };
   }
 }
 
