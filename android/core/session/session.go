@@ -163,6 +163,9 @@ func (l *lineage) rotate(ctx context.Context, drainOld bool) error {
 	}
 	client := core.NewClient(tport, core.ClientOptions{PSK: l.pool.cfg.PSK, KeyID: byte(l.pool.cfg.KeyID)})
 	client.OnOpenThreshold = l.signalRotate
+	// NP-1118-66 (S3): a server GOAWAY rotates the lineage the
+	// same way the open budget does.
+	client.OnGoAway = func(byte) { l.signalRotate() }
 	tport.attach(client)
 	client.OnCarrierDead = func(reason string) {
 		l.mu.Lock()

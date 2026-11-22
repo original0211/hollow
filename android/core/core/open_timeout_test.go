@@ -25,6 +25,9 @@ func (t *otPipe) Close()        {}
 type otServer struct {
 	mu     sync.Mutex
 	resets []uint32
+	// NP-1118-66 (S3 grid): when set, the server answers an OPEN
+	// and immediately sends GOAWAY.
+	goAwayOnOpen bool
 }
 
 func (s *otServer) gotReset(id uint32) bool {
@@ -98,6 +101,9 @@ func runOTServer(psk []byte, pipe *otPipe, client *HollowClient, srv *otServer) 
 					sender.Push(BuildFrame(FTOpenOK, f.StreamID, []byte{GateConnect}), true)
 				default:
 					sender.Push(BuildFrame(FTOpenOK, f.StreamID, []byte{GateConnect}), true)
+					if srv.goAwayOnOpen {
+						sender.Push(BuildFrame(FTGoAway, 0, []byte{0x03}), true)
+					}
 				}
 			case FTData:
 				sender.Push(BuildFrame(FTData, f.StreamID, f.Payload), true)

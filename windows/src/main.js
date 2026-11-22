@@ -19,6 +19,7 @@ import * as sysproxy from "./sysproxy.js";
 import { HelperClient, HELPER_PIPE_PATH } from "./helper-client.js";
 import { resolveHelperFiles, ensureHelperRunning } from "./helper-launch.js";
 import { runWizard, deleteDeployedWorker, WIZARD_SCRIPT_NAME } from "./deploy-wizard.js";
+import { cfApiFor as cfApiForImpl, cfDeployScript as cfDeployScriptImpl, probeWizardLiveness as probeWizardLivenessImpl } from "./wizard-effects.js";
 import { loadCfToken, writeCfToken, deleteCfToken, cfTokenTail } from "./config.js";
 import { HollowClient } from "../vendor/shared/client-core.js";
 import { connectWs } from "../vendor/cli/src/ws-client.js";
@@ -874,52 +875,18 @@ ipcMain.handle("hollow:saveSettings", async (_e, s) => {
 // here. The token reaches ONLY the Cloudflare API and the token
 // store — never logs, never diagnostics, never the renderer
 // (the renderer only ever sees its last four characters).
-const CF_API_BASE = "https://api.cloudflare.com/client/v4";
+// NP-1118-66 (B3/B4): the effects themselves live in
+// wizard-effects.js, where every wait is bounded (30 s abort on
+// the API fetches; the liveness handshake raced at 15 s). These
+// bindings keep the NP-1118-42 call sites unchanged.
 function cfApiFor(token) {
-  return async (method, apiPath, body) => {
-    const res = await fetch(CF_API_BASE + apiPath, {
-      method,
-      headers: { "Authorization": `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    });
-    let json = null;
-    try { json = await res.json(); } catch { /* non-JSON error page */ }
-    return { ok: res.ok && json?.success === true, status: res.status, result: json?.result ?? null, errors: json?.errors ?? null };
-  };
+  return cfApiForImpl(fetch, token);
 }
-async function cfDeployScript(token, { accountId, scriptName, bundle, metadata }) {
-  const form = new FormData();
-  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-  form.append("index.js", new Blob([bundle], { type: "application/javascript+module" }));
-  const res = await fetch(`${CF_API_BASE}/accounts/${accountId}/workers/scripts/${scriptName}`, {
-    method: "PUT", headers: { "Authorization": `Bearer ${token}` }, body: form,
-  });
-  let json = null;
-  try { json = await res.json(); } catch { /* ignore */ }
-  return { ok: res.ok && json?.success === true, status: res.status, errors: json?.errors ?? null };
+async function cfDeployScript(token, args) {
+  return cfDeployScriptImpl(fetch, token, args);
 }
 async function probeWizardLiveness(pairing) {
-  const httpBase = pairing.workerUrl.replace(/^wss:/, "https:");
-  const parts = { facade: false, meta: false, handshake: false };
-  try {
-    const r = await fetch(httpBase + "/");
-    const body = await r.text();
-    parts.facade = r.status === 200 && body.length === 81;
-  } catch { /* stays false */ }
-  try {
-    const r = await fetch(httpBase + "/" + pairing.metaPath);
-    parts.meta = r.status === 200;
-    if (r.ok) { try { await r.json(); } catch { parts.meta = false; } }
-  } catch { /* stays false */ }
-  let client = null;
-  try {
-    const transport = await connectWs(pairing.workerUrl, {});
-    client = new HollowClient({ transport, psk: pairing.psk, keyId: pairing.keyId ?? 1 });
-    await client.handshake();
-    parts.handshake = true;
-  } catch { /* stays false */ }
-  try { client?.close(); } catch { /* ignore */ }
-  return parts;
+  return probeWizardLivenessImpl(pairing, { fetchImpl: fetch, connectWs, HollowClient });
 }
 let wizardRunning = false;
 let wizardAccountId = null;

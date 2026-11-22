@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "check": "node --check worker/src/index.js && node --check cli/src/cli.js",
-    "test": "node --test --test-force-exit tests/protocol.test.mjs tests/smoke.test.mjs tests/socks.test.mjs tests/aead.test.mjs tests/x25519.test.mjs tests/occupancy.test.mjs tests/session-pool.test.mjs tests/windows-v021.test.mjs tests/phoenix.test.mjs tests/ws-client.test.mjs tests/open-timeout.test.mjs tests/server-hardening.test.mjs"
+    "test": "node --test --test-force-exit tests/protocol.test.mjs tests/smoke.test.mjs tests/socks.test.mjs tests/aead.test.mjs tests/x25519.test.mjs tests/occupancy.test.mjs tests/session-pool.test.mjs tests/windows-v021.test.mjs tests/phoenix.test.mjs tests/ws-client.test.mjs tests/open-timeout.test.mjs tests/server-hardening.test.mjs tests/cli-establish.test.mjs tests/goaway.test.mjs tests/pending-cap.test.mjs"
   },
   "type": "module",
   "version": "0.0.1"

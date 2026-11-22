@@ -388,3 +388,22 @@ test("NP-1118-48 fast-death: deaths 3s after birth trip the breaker ONLY under t
   assert.equal(hot.breaker.trips, 1);
   assert.equal(hot.breaker.allow(), false);
 });
+
+test("NP-1118-66 S5: a write in the redial gap after protection ended is refused, not dropped", () => {
+  const shared = freshShared(0);
+  // Unprotected gap (first byte already seen in production terms):
+  // the chunk would be discarded — write must say so.
+  const w1 = wrapPhoenixStream(new FakeStream(), async () => new FakeStream(), shared);
+  w1._cur = null; w1._protected = false;
+  assert.equal(w1.write(Buffer.from("lost?")), false);
+  // Protected gap: the chunk is buffered for replay — accepted.
+  const w2 = wrapPhoenixStream(new FakeStream(), async () => new FakeStream(), shared);
+  w2._cur = null; w2._protected = true;
+  assert.equal(w2.write(Buffer.from("held")), true);
+  assert.equal(Buffer.concat(w2._buf).toString(), "held");
+  // Live stream: forwarding unchanged.
+  const s3 = new FakeStream();
+  const w3 = wrapPhoenixStream(s3, async () => new FakeStream(), shared);
+  assert.equal(w3.write(Buffer.from("live")), true);
+  assert.equal(s3.written.length, 1);
+});

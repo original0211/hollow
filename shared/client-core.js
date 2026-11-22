@@ -27,6 +27,7 @@ export class ClientStream {
     this.localClosed = false; // we sent CLOSE
     this.remoteClosed = false; // peer sent CLOSE
     this.paused = false;
+    this.pendingBytes = 0; // NP-1118-66 (S4): bytes held in pending
     this.onOpenOk = null; this.onQueued = null; this.onReject = null;
     this.onData = null; this.onEnd = null; this.onReset = null; this.onFail = null;
     this._openResolve = null; this._openReject = null;
@@ -34,7 +35,18 @@ export class ClientStream {
   }
   write(data) {
     if (this.state !== "open" && this.state !== "opening" && this.state !== "queued") return false;
-    this.pending.push(new Uint8Array(data));
+    const buf = new Uint8Array(data);
+    // NP-1118-66 (S4): the pending queue is capped. Overflow is a
+    // stream-level failure (onFail + RESET), and write reports
+    // the refusal — it must never accept data it then holds
+    // without bound.
+    const cap = this.client.streamPendingMaxBytes;
+    if (cap && this.pendingBytes + buf.length > cap) {
+      this.client._failPendingOverflow(this);
+      return false;
+    }
+    this.pending.push(buf);
+    this.pendingBytes += buf.length;
     this.client._pumpStream(this);
     return true;
   }
@@ -75,9 +87,18 @@ export const SESSION_ROTATE_THRESHOLD = 40; // rotate here; margin = 10
 // worst-grade RTTs) and matches the NP-1118-49 establishment
 // budget family. 0/null disables (rollback switch).
 export const OPEN_TIMEOUT_MS = 20000;
+// NP-1118-66 (S4): per-stream cap on app data queued behind a
+// peer that has stopped granting window. The stream's granted
+// send window tops out at the 1 MiB v0.2.1 grant target; a queue
+// four times that means the application is 4 MiB ahead of a peer
+// that has granted everything it will — the stream is dead in
+// practice, and the queue must fail the stream instead of
+// growing memory without bound while write() keeps reporting
+// success.
+export const STREAM_PENDING_MAX_BYTES = 4 * 1024 * 1024;
 
 export class HollowClient {
-  constructor({ transport, psk, keyId = 1, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT, openTimeoutMs = OPEN_TIMEOUT_MS }) {
+  constructor({ transport, psk, keyId = 1, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT, openTimeoutMs = OPEN_TIMEOUT_MS, streamPendingMaxBytes = STREAM_PENDING_MAX_BYTES }) {
     this.transport = transport;
     this.psk = psk; this.keyId = keyId;
     // §6.5 v0.2.1 (NP-1117-25): receiver grant targets. Passing the
@@ -86,6 +107,7 @@ export class HollowClient {
     this.streamWindowGrant = streamWindowGrant;
     this.connWindowGrant = connWindowGrant;
     this.openTimeoutMs = openTimeoutMs; // NP-1118-54 (0/null = disabled)
+    this.streamPendingMaxBytes = streamPendingMaxBytes; // NP-1118-66 S4 (0/null = disabled)
     this.halfStream = streamWindowGrant / 2;
     this.halfConn = connWindowGrant / 2;
     this.state = "idle"; // idle | hello | wait-finished | open | dead
@@ -105,6 +127,7 @@ export class HollowClient {
     this._hsResolve = null; this._hsReject = null;
     this._th = null; this._keys = null;
     this.onCarrierDead = null;
+    this.onGoAway = null; // NP-1118-66 (S3): fired once when the server sends GOAWAY
     // Serialize message handling (async crypto in handshake steps; wire order
     // must be observed even for back-to-back messages).
     this._chain = Promise.resolve();
@@ -245,6 +268,22 @@ export class HollowClient {
 
   openStream({ host, port, schemeHint = 0, gatePolicy = 0 }) {
     if (this.state !== "open") throw new Error("session not open");
+    if (this.goAway) {
+      // NP-1118-66 (S3): the server has told this session to wind
+      // down — refuse the stream locally (nothing is sent, no id
+      // is consumed) and let the host's rotation (onGoAway) move
+      // later streams onto a fresh carrier. Existing streams are
+      // untouched and drain on this carrier.
+      const s = new ClientStream(this, 0);
+      s.state = "failed";
+      s.opened = new Promise((res, rej) => { s._openResolve = res; s._openReject = rej; });
+      const err = new Error("session going away (GOAWAY received)");
+      queueMicrotask(() => {
+        if (s._openReject) { s._openReject(err); s._openReject = null; }
+        if (s.onFail) s.onFail("session going away");
+      });
+      return s;
+    }
     const id = this.nextStreamId; this.nextStreamId += 2;
     const s = new ClientStream(this, id);
     this.streams.set(id, s);
@@ -295,6 +334,22 @@ export class HollowClient {
     this._forgetStream(s);
   }
 
+  // NP-1118-66 (S4): the pending cap tripped. Same closure shape as
+  // the OPEN bound: stream-local failure, onFail, a RESET to free
+  // the server-side bookkeeping, and the stream is forgotten.
+  _failPendingOverflow(s) {
+    if (!this.streams.has(s.id)) return;
+    s.state = "failed";
+    if (s._openReject) {
+      const e = new Error("send queue overflow (pending cap)");
+      s._openReject(e); s._openReject = null;
+    }
+    if (s.onFail) s.onFail("send queue overflow");
+    this._sendFrame(buildFrame(FT.RESET, s.id,
+      new Uint8Array([0x00, 0, 0])), true);
+    this._forgetStream(s);
+  }
+
   _pumpStream(s) {
     while (s.pending.length > 0 && (s.state === "open")) {
       const avail = Math.min(s.sendWindow, this.connSendWindow);
@@ -304,6 +359,7 @@ export class HollowClient {
       const chunk = head.subarray(0, take);
       if (take === head.length) s.pending.shift();
       else s.pending[0] = head.subarray(take);
+      s.pendingBytes -= take;
       s.sendWindow -= take; this.connSendWindow -= take;
       this._sendFrame(buildFrame(FT.DATA, s.id, chunk), false);
     }
@@ -444,8 +500,15 @@ export class HollowClient {
         break;
       }
       case FT.GOAWAY: {
-        // stop opening new streams; existing handling left to app (§8.2)
+        // NP-1118-66 (S3): consumed, not just recorded — the
+        // openStream gate above refuses new streams and the host
+        // is notified once so the session layer rotates (existing
+        // streams drain here; §8.2 semantics).
+        const firstGoAway = !this.goAway;
         this.goAway = { code: f.payload[0] };
+        if (firstGoAway && this.onGoAway) {
+          try { this.onGoAway(this.goAway.code); } catch { /* the session layer's problem, not the stream's */ }
+        }
         break;
       }
       default: {

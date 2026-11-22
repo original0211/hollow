@@ -114,9 +114,34 @@ func dialCarrier(ctx context.Context, wsURL string, netDial func(ctx context.Con
 	return &wsTransport{conn: conn, done: make(chan struct{}), counters: counters}, nil
 }
 
+// pongSilenceBound (NP-1118-66, audit NP-1118-63 S2) is the
+// inbound-silence deadline for a carrier: the read deadline is
+// refreshed by every inbound message and every pong, and a
+// carrier silent for the whole bound is declared dead through
+// the ordinary read-error path. Two ping cycles (the ping loop
+// runs at 30 s) plus scheduling grace = 65 s: one missed cycle
+// can be a dropped pong or a scheduling hiccup; two full cycles
+// with zero inbound bytes of any kind is not a live peer.
+// A package var so tests can shrink it (the dialRetryInterval
+// precedent in the dns package).
+var pongSilenceBound = 65 * time.Second
+
+func (t *wsTransport) refreshReadDeadline() {
+	_ = t.conn.SetReadDeadline(time.Now().Add(pongSilenceBound))
+}
+
 // attach binds the core client and starts the read loop + WS ping ticker
 // (transport-level keepalive, as in the JS transport).
 func (t *wsTransport) attach(client *core.HollowClient) {
+	// NP-1118-66 (S2): arm the pong deadline before the loops
+	// start — data messages refresh it in readLoop, pongs refresh
+	// it here (gorilla dispatches control frames inside its read
+	// path, so a pongs-only carrier still refreshes).
+	t.refreshReadDeadline()
+	t.conn.SetPongHandler(func(string) error {
+		t.refreshReadDeadline()
+		return nil
+	})
 	t.client = client
 	go t.readLoop()
 	go t.pingLoop()
@@ -129,6 +154,7 @@ func (t *wsTransport) readLoop() {
 			t.shutdown()
 			return
 		}
+		t.refreshReadDeadline()
 		if t.counters != nil {
 			t.counters.down.Add(int64(len(msg)))
 		}

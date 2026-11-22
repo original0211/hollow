@@ -158,7 +158,15 @@ export function wrapPhoenixStream(first, redial, shared = phoenixShared) {
         }
       }
       if (this._cur) return this._cur.write(chunk);
-      return true; // mid-redial: buffered, replayed on install
+      // NP-1118-66 (S5): mid-redial. While protection lasts, the
+      // chunk was buffered above and replays on install — true is
+      // honest. Once protection has ended (first byte seen, or
+      // the replay cap dropped the buffer) the chunk would be
+      // DISCARDED here: write must refuse (false) so the pump
+      // takes its ordinary failure path, instead of the byte
+      // stream silently losing a chunk that only the peer's
+      // TLS/protocol layer would ever notice.
+      return this._protected;
     },
 
     closeWrite() {

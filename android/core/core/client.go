@@ -63,6 +63,13 @@ func (e *OpenTimeoutError) Error() string {
 // (NP-1118-52 assessment).
 const DefaultOpenTimeoutMs = 20000
 
+// DefaultStreamPendingMaxBytes is the NP-1118-66 (S4) per-stream
+// cap on application data queued behind a peer that has stopped
+// granting window: 4x the 1 MiB v0.2.1 stream grant target. A
+// queue past it means the stream is dead in practice; the write
+// fails the stream instead of growing memory without bound.
+const DefaultStreamPendingMaxBytes = 4 * 1024 * 1024
+
 type ClientStream struct {
 	client *HollowClient
 	ID     uint32
@@ -73,6 +80,7 @@ type ClientStream struct {
 	QueuedInfo *QueuedInfo
 
 	pending      [][]byte
+	pendingBytes int // NP-1118-66 (S4): bytes held in pending
 	sendWindow   int
 	recvWindow   int
 	recvUnacked  int
@@ -106,7 +114,14 @@ func (s *ClientStream) Write(data []byte) {
 		if s.State != "open" && s.State != "opening" && s.State != "queued" {
 			return
 		}
+		if cap := s.client.streamPendingMax; cap > 0 && s.pendingBytes+len(cp) > cap {
+			// NP-1118-66 (S4): overflow is a stream-level failure,
+			// never silent acceptance.
+			s.client.failPendingOverflow(s)
+			return
+		}
 		s.pending = append(s.pending, cp)
+		s.pendingBytes += len(cp)
 		s.client.pumpStream(s)
 	})
 }
@@ -157,8 +172,12 @@ type ClientOptions struct {
 	// NP-1118-54: OPEN-answer bound in ms. 0 selects
 	// DefaultOpenTimeoutMs; a negative value disables the bound.
 	OpenTimeoutMs int
-	PSK           []byte
-	KeyID         byte // zero means 1, as the JS default
+	// StreamPendingMaxBytes caps one stream's queued-but-unframed
+	// bytes (NP-1118-66 S4). Zero selects
+	// DefaultStreamPendingMaxBytes; a negative value disables.
+	StreamPendingMaxBytes int
+	PSK                   []byte
+	KeyID                 byte // zero means 1, as the JS default
 
 	// Test-only determinism hooks (nil in production): a fixed ephemeral
 	// key pair, client random and hello padding, so a recorded session
@@ -211,7 +230,13 @@ type HollowClient struct {
 	opensSent       atomic.Int64
 	activeStreams   atomic.Int64
 	OnOpenThreshold func()
-	openTimeout     time.Duration // NP-1118-54; 0 = disabled
+	// NP-1118-66 (S3): fired once when the server sends GOAWAY.
+	// Same contract as OnOpenThreshold: runs on the event loop,
+	// MUST be non-blocking. OpenStream refuses new streams once
+	// GoAwayCode is set (see OpenStreamWithCallbacks).
+	OnGoAway         func(code byte)
+	openTimeout      time.Duration // NP-1118-54; 0 = disabled
+	streamPendingMax int           // NP-1118-66 (S4); 0 = disabled
 
 	inbox chan func()
 }
@@ -228,6 +253,12 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 	connGrant := opts.ConnWindowGrant
 	if connGrant == 0 {
 		connGrant = ConnWindowGrant
+	}
+	pendingMax := opts.StreamPendingMaxBytes
+	if pendingMax == 0 {
+		pendingMax = DefaultStreamPendingMaxBytes
+	} else if pendingMax < 0 {
+		pendingMax = 0 // disabled
 	}
 	openTimeout := time.Duration(opts.OpenTimeoutMs) * time.Millisecond
 	if opts.OpenTimeoutMs == 0 {
@@ -250,6 +281,7 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 		connSendWindow:    ConnWindowInit,
 		connRecvWindow:    connGrant,
 		openTimeout:       openTimeout,
+		streamPendingMax:  pendingMax,
 		hsDone:            make(chan struct{}),
 		inbox:             make(chan func(), 4096),
 	}
@@ -381,6 +413,15 @@ func (c *HollowClient) OpenStreamWithCallbacks(host string, port int, schemeHint
 			close(s.openDone)
 			return
 		}
+		if c.GoAwayCode != nil {
+			// NP-1118-66 (S3): the server has told this session to
+			// wind down — refuse locally; nothing is sent, no id
+			// or open budget is consumed.
+			buildErr = errors.New("session going away (GOAWAY received)")
+			s.openErr = buildErr
+			close(s.openDone)
+			return
+		}
 		s.ID = c.nextStreamID
 		c.nextStreamID += 2
 		c.streams[s.ID] = s
@@ -445,6 +486,37 @@ func (c *HollowClient) failOpenTimeout(s *ClientStream) {
 		s.OnOpenError("open timed out")
 	}
 	c.sendFrame(BuildFrame(FTReset, s.ID, []byte{ErrStreamTimeout, 0, 0}), true)
+	c.forgetStream(s)
+}
+
+// failPendingOverflow expires one stream whose application data
+// queued past the pending cap (NP-1118-66 S4). Runs on the event
+// loop. Stream-local failure only: OnFail fires, WaitOpen (if the
+// stream was still opening) returns the overflow error, and a
+// RESET frees the server-side bookkeeping.
+func (c *HollowClient) failPendingOverflow(s *ClientStream) {
+	if _, ok := c.streams[s.ID]; !ok {
+		return
+	}
+	if s.State != "open" && s.State != "opening" && s.State != "queued" {
+		return
+	}
+	s.State = "failed"
+	if s.openErr == nil {
+		s.openErr = errors.New("send queue overflow (pending cap)")
+	}
+	select {
+	case <-s.openDone:
+	default:
+		close(s.openDone)
+	}
+	if s.OnFail != nil {
+		s.OnFail("send queue overflow")
+	}
+	if s.OnOpenError != nil {
+		s.OnOpenError("send queue overflow")
+	}
+	c.sendFrame(BuildFrame(FTReset, s.ID, []byte{0x00, 0, 0}), true)
 	c.forgetStream(s)
 }
 
@@ -606,6 +678,7 @@ func (c *HollowClient) pumpStream(s *ClientStream) {
 		} else {
 			s.pending[0] = head[take:]
 		}
+		s.pendingBytes -= take
 		s.sendWindow -= take
 		c.connSendWindow -= take
 		c.sendFrame(BuildFrame(FTData, s.ID, chunk), false)
@@ -801,9 +874,16 @@ func (c *HollowClient) dispatch(f Frame) {
 	case FTPing:
 		c.sendFrame(BuildFrame(FTPong, f.StreamID, f.Payload), true)
 	case FTGoAway:
-		if len(f.Payload) > 0 {
+		// NP-1118-66 (S3): consumed, not just recorded — the
+		// OpenStream gate refuses new streams and the host is
+		// notified once so the session layer rotates (existing
+		// streams drain on this carrier; §8.2 semantics).
+		if len(f.Payload) > 0 && c.GoAwayCode == nil {
 			code := f.Payload[0]
 			c.GoAwayCode = &code
+			if c.OnGoAway != nil {
+				c.OnGoAway(code)
+			}
 		}
 	default:
 		// unknown frame type: stream-level protocol error (§8.2/§10.2)

@@ -76,6 +76,13 @@ class SessionLineage {
       this.log(`session open budget reached (${this.rotateThreshold} opens); rotating`);
       this.rotateNow("open budget");
     };
+    // NP-1118-66 (S3): a server GOAWAY rotates the lineage the
+    // same way the open budget does — a fresh carrier is built
+    // alongside and the GOAWAY'd one drains.
+    client.onGoAway = (code) => {
+      this.log(`server sent GOAWAY (code ${code}); rotating`);
+      this.rotateNow("goaway");
+    };
   }
 
   _onClientDeath(client) {

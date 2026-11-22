@@ -76,6 +76,11 @@ function makeTransport(socket, head, pingIntervalMs) {
   let fragOpcode = 0;
   let closed = false;
   let pingTimer = null;
+  // NP-1118-66 (S2): inbound-liveness tracking for the pong
+  // deadline — refreshed by EVERY inbound frame (data, ping,
+  // pong); the ping tick declares the carrier dead after two
+  // full ping cycles of total inbound silence.
+  let lastInboundAt = Date.now();
 
   const transport = {
     rawSizes: [], // received WS message sizes on the wire (records/hello)
@@ -131,6 +136,7 @@ function makeTransport(socket, head, pingIntervalMs) {
       if (buf.length < off + len) return;
       let payload = Buffer.from(buf.subarray(off, off + len));
       buf = buf.subarray(off + len);
+      lastInboundAt = Date.now();
       if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
       if (opcode === 0x9) { // ping -> pong
         if (!closed) socket.write(encodeFrame(0xA, payload));
@@ -170,7 +176,25 @@ function makeTransport(socket, head, pingIntervalMs) {
     // §2-5: idle liveness probes de-periodized to 75-150s; the caller passes a
     // value already randomized in that range.
     pingTimer = setInterval(() => {
-      if (!closed) { try { socket.write(encodeFrame(0x9, Buffer.alloc(0))); } catch {} }
+      if (closed) return;
+      // NP-1118-66 (S2): pong deadline. A peer whose TCP is alive
+      // but whose WS layer is dead (half-dead carrier) used to
+      // look "connected" while idle indefinitely — death only
+      // surfaced on the first stream, through the 20 s open
+      // bound. Two full ping cycles without ANY inbound frame
+      // (the peer answers every ping with a pong, and live
+      // traffic counts too) is not a live peer: declare death
+      // through the ordinary close path. The socket handle keeps
+      // the event loop alive while the carrier lives, so the
+      // tick's unref cannot starve the deadline.
+      if (Date.now() - lastInboundAt > 2 * pingIntervalMs) {
+        closed = true;
+        clearInterval(pingTimer);
+        try { socket.destroy(); } catch {}
+        if (closeCb) closeCb(1006);
+        return;
+      }
+      try { socket.write(encodeFrame(0x9, Buffer.alloc(0))); } catch {}
     }, pingIntervalMs);
     pingTimer.unref();
   }

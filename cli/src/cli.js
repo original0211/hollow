@@ -13,9 +13,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "../../shared/crypto.js";
 import { deriveVerifier } from "../../shared/protocol.js";
-import { HollowClient } from "../../shared/client-core.js";
+import { establishClient } from "./establish.js";
 import { SessionManager } from "../../shared/session-manager.js";
-import { connectWs } from "./ws-client.js";
 import { startSocks } from "./socks.js";
 
 export const NAME = "hollow-cli";
@@ -79,10 +78,10 @@ async function serve(argv) {
   const sessions = new SessionManager({
     establish: async () => {
       const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5: 75–150s randomized
-      const transport = await connectWs(url, { pingIntervalMs: pingMs });
-      const client = new HollowClient({ transport, psk, keyId });
-      await client.handshake();
-      return client;
+      // NP-1118-66 (S1): one shared 20 s establishment deadline
+      // (cli/src/establish.js) — a blackholed entry can no longer
+      // park the supervisor inside its first attempt forever.
+      return establishClient({ url, psk, keyId, pingIntervalMs: pingMs });
     },
     log: (m) => log(m),
     size: poolSize,

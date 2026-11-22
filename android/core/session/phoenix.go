@@ -8,6 +8,7 @@ package session
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -233,6 +234,10 @@ func (s *Session) dialFlowPhoenix(ip net.IP, port uint16) (net.Conn, error) {
 	}, nil
 }
 
+// errPhoenixGapWrite is returned for a write that lands in the
+// redial gap after replay protection has ended (NP-1118-66 S5).
+var errPhoenixGapWrite = errors.New("phoenix: write during redial gap after replay protection ended")
+
 func (c *phoenixConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -251,8 +256,16 @@ func (c *phoenixConn) Write(b []byte) (int, error) {
 	}
 	if c.cur != nil {
 		c.cur.Write(b) // streamConn.Write never errors; death surfaces on Read
+		return len(b), nil
 	}
-	return len(b), nil
+	if c.protected {
+		return len(b), nil // buffered above; replayed on install
+	}
+	// NP-1118-66 (S5): mid-redial with protection already ended —
+	// the chunk would be discarded. Surface it as a write error
+	// (the pump's ordinary failure path) instead of reporting
+	// success for bytes that go nowhere.
+	return 0, errPhoenixGapWrite
 }
 
 func (c *phoenixConn) Read(b []byte) (int, error) {
