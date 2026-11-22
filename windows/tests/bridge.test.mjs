@@ -646,3 +646,94 @@ test("traffic counters (NP-1118-01): an echo exchange moves up/down; snapshot ex
     assert.ok(after.traffic.down > before.traffic.down, "down counted the echoed bytes");
   } finally { await bridge.disconnect(); }
 });
+
+// ---- NP-1118-49: establishment deadline (NP-1118-47 main fix) ----
+// A blackholed attempt (dial or upgrade swallowed, handshake
+// never answered) previously hung _establishClient forever, and
+// every recovery mechanism keys off attempt completion, so the
+// pool sat at 0/N indefinitely. The deadline turns the hang into
+// an ordinary failure.
+
+test("NP-1118-49 blackhole transport: attempts die at the deadline and the loop keeps cycling", async () => {
+  const logs = [];
+  const b = mkBridge({
+    log: (m) => logs.push(m),
+    makeTransport: () => new Promise(() => {}), // never settles
+    establishTimeoutMs: 300,
+  });
+  const t0 = Date.now();
+  await b.connect();
+  await waitFor(() => logs.filter((m) => m.includes("establishment timed out (transport)")).length >= 3, 8000);
+  assert.ok(Date.now() - t0 < 5000, "three timed-out attempts complete in bounded time");
+  assert.equal(b.sessions.healthyCount(), 0);
+  await b.disconnect();
+});
+
+test("NP-1118-49 blackhole handshake: the deadline closes the transport", async () => {
+  const logs = [];
+  let closes = 0;
+  const b = mkBridge({
+    log: (m) => logs.push(m),
+    makeTransport: async () => {
+      const [ct] = memoryTransportPair(); // no server: the hello is never answered
+      const rawClose = ct.close.bind(ct);
+      ct.close = () => { closes++; rawClose(); };
+      return ct;
+    },
+    establishTimeoutMs: 300,
+  });
+  await b.connect();
+  await waitFor(() => logs.filter((m) => m.includes("establishment timed out (handshake)")).length >= 2, 8000);
+  assert.ok(closes >= 1, "the timed-out handshake's transport was closed");
+  await b.disconnect();
+});
+
+test("NP-1118-49 blackhole pool: demotion cascades to domain dials; the pool self-heals when the domain path turns healthy", async () => {
+  const dials = [];
+  let domainHealthy = false;
+  const makeTransport = async (dialIp) => {
+    dials.push(dialIp);
+    if (dialIp !== null || !domainHealthy) return new Promise(() => {}); // blackhole
+    const [ct, st] = memoryTransportPair();
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const b = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1,
+    makeTransport, rotationMs: 60000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize: 4, edgeCandidates: CANDS, establishTimeoutMs: 300,
+  });
+  await b.connect();
+  // Every candidate blackholes: each slot burns its 3 failures per
+  // candidate, demotions cascade, and slots end up dialing by
+  // domain (dialIp === null is observable in the factory record).
+  await waitFor(() => dials.includes(null), 30000);
+  assert.equal(b.sessions.healthyCount(), 0);
+  domainHealthy = true;
+  await waitFor(() => b.sessions.healthyCount() === 4, 20000);
+  await b.disconnect();
+});
+
+test("NP-1118-49 slow handshake inside the budget is not killed", async () => {
+  const factory = async () => {
+    const [ct, st] = memoryTransportPair();
+    const rawSend = st.send.bind(st);
+    // Uniform 1.5s latency on the server's sends (order preserved):
+    // a slow handshake path, not a reordered one.
+    st.send = (bytes) => { setTimeout(() => rawSend(bytes), 1500); };
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const b = mkBridge({ makeTransport: factory, establishTimeoutMs: 5000 });
+  await b.connect();
+  await waitFor(() => b.sessions.healthyCount() === 1, 8000);
+  await b.disconnect();
+});

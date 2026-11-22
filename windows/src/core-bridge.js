@@ -25,7 +25,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null, establishTimeoutMs = 20000 }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -33,6 +33,14 @@ export class CoreBridge {
     this.rotationMs = rotationMs;
     this.backoffBaseMs = backoffBaseMs;
     this.backoffCapMs = backoffCapMs;
+    // NP-1118-49: total establishment budget for ONE carrier
+    // attempt (transport connect/upgrade + Hollow handshake).
+    // Before this bound existed, a blackholed dial or upgrade
+    // hung the attempt forever and no recovery (demotion,
+    // backoff, domain fallback) ever fired, because all of them
+    // key off attempt completion (NP-1118-47).
+    this.establishTimeoutMs = establishTimeoutMs;
+    this._attemptDeadline = 0; // deadline of the in-flight attempt, for the default factory
     // Edge-IP selection (M2-4): read at every carrier attempt, so changing it
     // takes effect on the NEXT carrier (rotation/reconnect) and never tears
     // down the live one.
@@ -66,7 +74,8 @@ export class CoreBridge {
     // bearer-lock path). Injected factories may ignore the argument.
     this.makeTransport = makeTransport || (async (dialIp) => {
       const pingMs = 75000 + Math.floor(Math.random() * 75000); // §2-5 randomized keepalive
-      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: dialIp !== undefined ? dialIp : this.effectiveEdgeIp(), userAgent: "HollowClient/0.1" });
+      const remainMs = this._attemptDeadline ? Math.max(1, this._attemptDeadline - Date.now()) : null;
+      const raw = await connectWs(this.workerUrl, { pingIntervalMs: pingMs, edgeIp: dialIp !== undefined ? dialIp : this.effectiveEdgeIp(), userAgent: "HollowClient/0.1", timeoutMs: remainMs });
       return {
         send: (b) => raw.send(b), close: () => raw.close(), closeCarrier: () => raw.close(),
         onMessage: (cb) => raw.onMessage(cb), onClose: (cb) => raw.onClose(cb),
@@ -187,8 +196,41 @@ export class CoreBridge {
   // the slot's pinned candidate - or explicit domain when the list
   // has no candidate left for the slot; otherwise the target is left
   // to the bridge default (single pin / bearer lock), as before.
+  // NP-1118-49: race one establishment stage against the
+  // attempt deadline. A timeout is an ORDINARY failure (the
+  // lineage loop's counting, edge demotion, backoff and domain
+  // fallback all proceed as for any other failed attempt). On
+  // timeout, onTimeout tears the stage down (handshake: close
+  // the client, which closes its transport); a transport that
+  // resolves only after its deadline is closed on arrival
+  // instead of leaking.
+  async _establishStage(promise, deadline, stage, onTimeout = null) {
+    const remaining = deadline - Date.now();
+    let done = false;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        if (onTimeout) { try { onTimeout(); } catch { /* ignore */ } }
+        reject(new Error(`establishment timed out (${stage}) after ${this.establishTimeoutMs}ms`));
+      }, Math.max(1, remaining));
+      Promise.resolve(promise).then(
+        (v) => {
+          if (done) {
+            if (stage === "transport" && v && typeof v.close === "function") { try { v.close(); } catch { /* ignore */ } }
+            return;
+          }
+          done = true; clearTimeout(timer); resolve(v);
+        },
+        (e) => { if (done) return; done = true; clearTimeout(timer); reject(e); },
+      );
+    });
+  }
+
   async _establishClient(slotIndex = -1) {
     const establishStart = Date.now();
+    const deadline = establishStart + this.establishTimeoutMs;
+    this._attemptDeadline = deadline;
     if (this.bearerLock !== null && this.bearerLock.length === 0) {
       throw new Error("bearer <redacted> is empty: TUN mode forbids default-resolution dialing (would loop into the tunnel)");
     }
@@ -204,10 +246,10 @@ export class CoreBridge {
     }
     let client;
     try {
-      const transport = this._countTransport(await this.makeTransport(dialIp));
+      const transport = this._countTransport(await this._establishStage(this.makeTransport(dialIp), deadline, "transport"));
       if (!this._want) { try { transport.close(); } catch { /* ignore */ } throw new Error("connect aborted"); }
       client = this._instrument(new HollowClient({ transport, psk: this.psk, keyId: this.keyId }));
-      await client.handshake();
+      await this._establishStage(client.handshake(), deadline, "handshake", () => { try { client.close(); } catch { /* ignore */ } });
     } catch (e) {
       const msg = String(e && e.message || e);
       if (pick && msg !== "connect aborted" && !AUTH_FATAL.test(msg)) this._noteEdgeFailure(pick.ip);

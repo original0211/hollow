@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 
 export const CLIENT_UA = "HollowClient/0.1"; // §2-2: custom, no proxy/vpn/tunnel words
 
-export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null, edgeIp = null } = {}) {
+export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null, edgeIp = null, timeoutMs = null } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
     if (url.protocol !== "wss:" && url.protocol !== "ws:") {
@@ -35,7 +35,21 @@ export function connectWs(urlStr, { userAgent = CLIENT_UA, pingIntervalMs = null
       },
     });
     let settled = false;
+    // NP-1118-49: optional establishment bound. A blackholed path
+    // (SYN or upgrade response swallowed) otherwise never settles
+    // this promise, and every recovery mechanism above it keys off
+    // attempt COMPLETION. Opt-in only: callers that pass no
+    // timeoutMs (the CLI) keep the historical unbounded behavior.
+    if (timeoutMs) {
+      req.setTimeout(timeoutMs, () => {
+        if (settled) return;
+        settled = true;
+        try { req.destroy(); } catch {}
+        reject(new Error("connect timed out"));
+      });
+    }
     req.on("upgrade", (res, socket, head) => {
+      try { req.setTimeout(0); } catch {} // disarm: the socket belongs to the transport now
       const accept = res.headers["sec-websocket-accept"];
       const expect = crypto.createHash("sha1")
         .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
