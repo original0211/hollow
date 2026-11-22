@@ -343,6 +343,16 @@ export class SessionManager {
     return n;
   }
 
+  // NP-1118-53: per-slot health (the edge self-healing in the
+  // bridge needs to know WHICH slots are down without reaching
+  // into lineage internals).
+  slotHealthy(index) {
+    const slot = this._slots[index];
+    if (!slot) return false;
+    const c = slot.lineage.current();
+    return !!(c && c.state === "open");
+  }
+
   get rotations() {
     return this._slots.reduce((sum, s) => sum + s.lineage.rotations, 0);
   }

@@ -93,7 +93,15 @@ function getBridge() {
       return null;
     }
     bridgeError = null;
-    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp(), poolSize: cfg.poolSize, edgeCandidates: cfg.edgeMode === "auto" ? rankedEdges(cfg.edgeResults || {}, edgeList()) : null });
+    bridge = new CoreBridge({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, log, edgeIp: resolveEdgeIp(), poolSize: cfg.poolSize, edgeCandidates: cfg.edgeMode === "auto" ? rankedEdges(cfg.edgeResults || {}, edgeList()) : null,
+      // NP-1118-53: degraded-pool auto re-measurement (the bridge
+      // only invokes this while a ranked candidate list is active).
+      measureEdgesFn: async () => {
+        const results = await measureEdges({ workerUrl: cfg.workerUrl, psk, keyId: cfg.keyId, edges: edgeList(), metaPath: cfg.metaPath });
+        cfg = { ...cfg, edgeResults: results };
+        safeSave();
+        return rankedEdges(results, edgeList());
+      } });
     let restoring = false;
     bridge.onEvent((ev) => {
       // RF-06-03: if the bridge lands in its Error terminal state while the

@@ -542,7 +542,7 @@ test("pool (NP-1117-23): a budget rotation stays inside its own lineage", async 
 });
 
 // ---- NP-1117-27: entry dispersion — one pinned entry IP per carrier ----
-function mkDispersed({ candidates = null, poolSize = 4, failIps = new Set(), edgeIp = null } = {}) {
+function mkDispersed({ candidates = null, poolSize = 4, failIps = new Set(), edgeIp = null, ...bridgeOpts } = {}) {
   const logs = [];
   const dials = [];
   const makeTransport = async (dialIp) => {
@@ -559,7 +559,7 @@ function mkDispersed({ candidates = null, poolSize = 4, failIps = new Set(), edg
   const bridge = new CoreBridge({
     workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1, log: (m) => logs.push(m),
     makeTransport, rotationMs: 60000, backoffBaseMs: 40, backoffCapMs: 200,
-    poolSize, edgeIp, edgeCandidates: candidates,
+    poolSize, edgeIp, edgeCandidates: candidates, ...bridgeOpts,
   });
   return { bridge, logs, dials };
 }
@@ -736,4 +736,110 @@ test("NP-1118-49 slow handshake inside the budget is not killed", async () => {
   await b.connect();
   await waitFor(() => b.sessions.healthyCount() === 1, 8000);
   await b.disconnect();
+});
+
+// ---- NP-1118-53: edge self-healing (demotion cooldown + auto re-measure) ----
+
+test("NP-1118-53 cooldown: a demoted candidate is probed after expiry and rehabilitated by a success", async () => {
+  const down = new Set(["10.0.0.1"]); // .1 starts dead, .2 alive
+  let domainDown = false;
+  const dials = [];
+  let livePair = null;
+  const makeTransport = async (dialIp) => {
+    dials.push(dialIp);
+    if (dialIp === null ? domainDown : down.has(dialIp)) throw new Error("dial refused (test)");
+    const [ct, st] = memoryTransportPair();
+    livePair = [ct, st];
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const bridge = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1,
+    makeTransport, rotationMs: 60000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize: 1, edgeCandidates: CANDS.slice(0, 2), edgeDemoteCooldownMs: 4000,
+  });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 1);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.2" }); // fell over to .2 after .1's demotion
+  assert.deepEqual(bridge.snapshot().edgeDisfavored, ["10.0.0.1"]);
+  // Flip the world: .1 revives, .2's path dies, domain is dead
+  // too — and kill the live carrier, since a healthy lineage
+  // never re-dials on its own. The slot demotes .2, finds .1
+  // still inside its cooldown, falls to domain dials — and once
+  // the cooldown expires it probes .1 and is rehabilitated by
+  // the success.
+  down.delete("10.0.0.1"); down.add("10.0.0.2"); domainDown = true;
+  const dialMark = dials.length;
+  try { livePair[0].closeCarrier(); } catch {}
+  try { livePair[1].closeCarrier(); } catch {}
+  await waitFor(() => bridge.snapshot().slotEdges[0] === "10.0.0.1" && bridge.sessions.healthyCount() === 1, 15000);
+  assert.ok(dials.slice(dialMark).includes(null), "the slot sat on domain dials during the cooldown");
+  assert.deepEqual(bridge.snapshot().edgeDisfavored, ["10.0.0.2"]); // .1 formally rehabilitated
+  await bridge.disconnect();
+});
+
+test("NP-1118-53 tonight's shape: 1/4 floor holds, then the pool self-heals back to the ranked pin layout", async () => {
+  const down = new Set(["10.0.0.1", "10.0.0.2", "10.0.0.3"]); // only .4 (slot 3's primary) lives
+  let domainDown = true;
+  const dials = [];
+  let measureCalls = 0;
+  const makeTransport = async (dialIp) => {
+    dials.push(dialIp);
+    if (dialIp === null ? domainDown : down.has(dialIp)) return new Promise(() => {}); // blackhole
+    const [ct, st] = memoryTransportPair();
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const bridge = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1,
+    makeTransport, rotationMs: 60000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize: 4, edgeCandidates: CANDS, establishTimeoutMs: 150,
+    edgeDemoteCooldownMs: 60000, // long: phase-2 recovery must come from the re-measure, not the cooldown
+    edgeRemeasureAfterMs: 3000, edgeRemeasureMinIntervalMs: 1500, remeasureTickMs: 100,
+    measureEdgesFn: async () => { measureCalls++; return CANDS; },
+  });
+  await bridge.connect();
+  // Phase 1: the cascade runs (demotions, then domain dials) and
+  // the floor holds at exactly one healthy carrier — the slot
+  // pinned to the surviving candidate.
+  await waitFor(() => dials.includes(null), 30000);
+  const t1 = Date.now();
+  while (Date.now() - t1 < 1500) {
+    assert.equal(bridge.sessions.healthyCount(), 1);
+    assert.equal(bridge.snapshot().slotEdges[3], "10.0.0.4");
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  await waitFor(() => measureCalls >= 1, 15000); // degraded >= edgeRemeasureAfterMs, then the tick fires
+  // The survivor's stream must flow now and keep flowing.
+  const survivor = bridge.sessions.pick();
+  const s = survivor.openStream({ host: "localhost", port: echoPort });
+  await s.opened;
+  const echoOnce = async (bytes) => {
+    const got = await new Promise((res, rej) => {
+      const chunks = [];
+      const to = setTimeout(() => rej(new Error("echo timeout")), 6000);
+      s.onData = (d) => { chunks.push(Buffer.from(d)); if (Buffer.concat(chunks).length >= bytes.length) { clearTimeout(to); res(Buffer.concat(chunks)); } };
+      s.write(new Uint8Array(bytes));
+    });
+    assert.deepEqual([...got], bytes);
+  };
+  await echoOnce([1, 2, 3, 4]);
+  // Phase 2: the candidate paths open (the domain landing stays
+  // blackholed, as tonight). The next auto re-measure re-ranks,
+  // drops the unhealthy slots' stale pins, and the pool returns
+  // to the full ranked layout with no manual measurement and no
+  // reconnect — while the survivor's stream never breaks.
+  down.clear();
+  await waitFor(() => bridge.sessions.healthyCount() === 4, 30000);
+  assert.deepEqual(bridge.snapshot().slotEdges, { 0: "10.0.0.1", 1: "10.0.0.2", 2: "10.0.0.3", 3: "10.0.0.4" });
+  await echoOnce([5, 6, 7, 8]);
+  await bridge.disconnect();
 });

@@ -25,7 +25,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null, establishTimeoutMs = 20000 }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null, establishTimeoutMs = 20000, edgeDemoteCooldownMs = 120000, edgeRemeasureAfterMs = 60000, edgeRemeasureMinIntervalMs = 300000, remeasureTickMs = 10000, measureEdgesFn = null }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -41,6 +41,22 @@ export class CoreBridge {
     // key off attempt completion (NP-1118-47).
     this.establishTimeoutMs = establishTimeoutMs;
     this._attemptDeadline = 0; // deadline of the in-flight attempt, for the default factory
+    // NP-1118-53: edge self-healing. Demotions expire after a
+    // cooldown (a demoted candidate becomes probe-eligible again;
+    // one success formally rehabilitates it, one failure
+    // re-demotes it with a fresh timestamp). Separately, a pool
+    // that stays degraded (not all slots healthy) for
+    // edgeRemeasureAfterMs re-runs the caller's measurement and
+    // re-ranks — at most once per edgeRemeasureMinIntervalMs.
+    this.edgeDemoteCooldownMs = edgeDemoteCooldownMs;
+    this.edgeRemeasureAfterMs = edgeRemeasureAfterMs;
+    this.edgeRemeasureMinIntervalMs = edgeRemeasureMinIntervalMs;
+    this.remeasureTickMs = remeasureTickMs;
+    this.measureEdgesFn = measureEdgesFn;
+    this._degradedSince = 0;
+    this._lastRemeasureAt = 0;
+    this._remeasureInFlight = false;
+    this._remeasureTimer = null;
     // Edge-IP selection (M2-4): read at every carrier attempt, so changing it
     // takes effect on the NEXT carrier (rotation/reconnect) and never tears
     // down the live one.
@@ -58,7 +74,7 @@ export class CoreBridge {
     // under a lock the dial set is a routing-safety matter.
     this.edgeCandidates = null;
     this._edgeFailCounts = new Map(); // ip -> consecutive establishment failures
-    this._edgeDisfavored = new Set(); // demoted ips (until the next refresh)
+    this._edgeDisfavored = new Map(); // ip -> demotion time (NP-1118-53: expires after the cooldown)
     this._slotEdge = new Map(); // slotIndex -> ip currently pinned by that slot
     if (edgeCandidates) this.setEdgeCandidates(edgeCandidates);
     // Bearer lock (TUN mode, notes v2 §3 / mandatory change C): while TUN
@@ -161,6 +177,13 @@ export class CoreBridge {
   // demoted or already-taken primary falls through to the best-ranked
   // candidate that is healthy and not pinned by another slot; when
   // none qualifies the slot dials by domain (dispatch NP-1117-27 (a)).
+  // NP-1118-53: a demotion counts only inside its cooldown;
+  // after that the candidate is probe-eligible again.
+  _isDisfavored(ip) {
+    const at = this._edgeDisfavored.get(ip);
+    return at !== undefined && Date.now() - at < this.edgeDemoteCooldownMs;
+  }
+
   _pickSlotEdge(slotIndex) {
     const list = this.edgeCandidates;
     if (!list || this.bearerLock !== null) return null;
@@ -170,9 +193,9 @@ export class CoreBridge {
     const usedByOthers = new Set();
     for (const [slot, ip] of this._slotEdge) if (slot !== slotIndex) usedByOthers.add(ip);
     const primary = list[slotIndex];
-    if (primary && !this._edgeDisfavored.has(primary.ip) && !usedByOthers.has(primary.ip)) return primary;
+    if (primary && !this._isDisfavored(primary.ip) && !usedByOthers.has(primary.ip)) return primary;
     for (const c of list) {
-      if (!this._edgeDisfavored.has(c.ip) && !usedByOthers.has(c.ip)) return c;
+      if (!this._isDisfavored(c.ip) && !usedByOthers.has(c.ip)) return c;
     }
     return null;
   }
@@ -183,9 +206,9 @@ export class CoreBridge {
   _noteEdgeFailure(ip) {
     const n = (this._edgeFailCounts.get(ip) || 0) + 1;
     this._edgeFailCounts.set(ip, n);
-    if (n >= EDGE_FALLBACK_THRESHOLD && !this._edgeDisfavored.has(ip)) {
-      this._edgeDisfavored.add(ip);
-      this.log(`edge ${ip} demoted after ${n} consecutive establishment failures; its slot re-pins at the next attempt`);
+    if (n >= EDGE_FALLBACK_THRESHOLD && !this._isDisfavored(ip)) {
+      this._edgeDisfavored.set(ip, Date.now());
+      this.log(`edge ${ip} demoted after ${n} consecutive establishment failures (cooldown ${Math.round(this.edgeDemoteCooldownMs / 1000)}s); its slot re-pins at the next attempt`);
     }
   }
 
@@ -261,6 +284,7 @@ export class CoreBridge {
     phoenixShared.breaker.noteDialCost(Date.now() - establishStart);
     if (pick) {
       this._edgeFailCounts.delete(pick.ip);
+      this._edgeDisfavored.delete(pick.ip); // NP-1118-53: a success formally rehabilitates a probed candidate
       this.log(`carrier established: slot ${slotIndex}, entry ${pick.ip}, rtt ${pick.rttMs ?? "?"}ms`);
     } else if (dispersed) {
       this.log(`carrier established: slot ${slotIndex}, entry domain (no candidate for this slot)`);
@@ -340,9 +364,58 @@ export class CoreBridge {
     return client;
   }
 
+  // NP-1118-53: degraded-pool auto re-measurement. While the
+  // pool is not fully healthy for edgeRemeasureAfterMs
+  // continuously, re-run the injected measurement and re-rank.
+  // Healthy slots are never disturbed: re-ranking only changes
+  // future picks, a healthy slot's pin stays reserved (the
+  // usedByOthers semantics in _pickSlotEdge), and only
+  // UNHEALTHY slots have their stale pin dropped so their next
+  // attempt re-picks from the fresh ranking.
+  _remeasureTick() {
+    if (!this._want || !this.edgeCandidates || !this.measureEdgesFn) { this._degradedSince = 0; return; }
+    if (this.sessions.healthyCount() >= this.sessions.size) { this._degradedSince = 0; return; }
+    const now = Date.now();
+    if (!this._degradedSince) { this._degradedSince = now; return; }
+    if (now - this._degradedSince < this.edgeRemeasureAfterMs) return;
+    if (now - this._lastRemeasureAt < this.edgeRemeasureMinIntervalMs) return;
+    if (this._remeasureInFlight) return;
+    this._remeasureInFlight = true;
+    this._lastRemeasureAt = now;
+    this._degradedSince = 0; // the next trigger needs a fresh sustained-degradation window
+    Promise.resolve()
+      .then(() => this.measureEdgesFn())
+      .then((list) => {
+        if (!this._want) return;
+        if (!list || !list.length) {
+          this.log("edge auto re-measure: no candidate measured reachable; keeping the current ranking");
+          return;
+        }
+        this.setEdgeCandidates(list);
+        for (let i = 0; i < this.sessions.size; i++) {
+          if (!this.sessions.slotHealthy(i)) this._slotEdge.delete(i);
+        }
+        this.log("edge auto re-measure: re-ranked; unhealthy slots re-pin on their next attempt (healthy carriers untouched)");
+      })
+      .catch((e) => { this.log(`edge auto re-measure failed (${String(e && e.message || e)}); keeping the current ranking`); })
+      .finally(() => { this._remeasureInFlight = false; });
+  }
+
+  _startRemeasureWatch() {
+    if (this._remeasureTimer) return;
+    this._remeasureTimer = setInterval(() => this._remeasureTick(), this.remeasureTickMs);
+    if (this._remeasureTimer.unref) this._remeasureTimer.unref();
+  }
+
+  _stopRemeasureWatch() {
+    if (this._remeasureTimer) { clearInterval(this._remeasureTimer); this._remeasureTimer = null; }
+    this._degradedSince = 0;
+  }
+
   async connect() {
     if (this._want) return;
     this._want = true;
+    this._startRemeasureWatch();
     this.failures = 0;
     this._setState("connecting");
     this._loopPromise = this._runLoop();
@@ -471,6 +544,7 @@ export class CoreBridge {
   }
 
   async disconnect() {
+    this._stopRemeasureWatch();
     this._want = false;
     this._wakeAll();
     this.sessions.stop();
@@ -509,6 +583,7 @@ export class CoreBridge {
       edgeIp: this.edgeIp,
       slotEdges: Object.fromEntries(this._slotEdge),
       edgeCandidates: this.edgeCandidates ? this.edgeCandidates.map((c) => c.ip) : null,
+      edgeDisfavored: [...this._edgeDisfavored.keys()].filter((ip) => this._isDisfavored(ip)),
       edgeCandidateRtts: this.edgeCandidates ? Object.fromEntries(this.edgeCandidates.map((c) => [c.ip, c.rttMs])) : {},
       traffic: { ...this.traffic },
       effectiveEdgeIp: this.effectiveEdgeIp(),
