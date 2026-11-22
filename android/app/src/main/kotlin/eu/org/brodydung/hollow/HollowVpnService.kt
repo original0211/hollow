@@ -193,6 +193,11 @@ class HollowVpnService : VpnService() {
         pfd.close()
         return try {
             Hollowcore.startVPN(cfg, fd.toLong(), ProtectorBridge())
+            // NP-1118-62: while the service runs, the deployment
+            // wizard's direct dialer protects its sockets through
+            // the same bridge — wizard traffic never enters the
+            // tunnel it may be (re)deploying.
+            try { Hollowcore.wizardSetProtector(ProtectorBridge()) } catch (_: Exception) {}
             sessionRunning = true
             startNotifTicker()
             true
@@ -202,6 +207,7 @@ class HollowVpnService : VpnService() {
     }
 
     private fun stopSession() {
+        try { Hollowcore.wizardClearProtector() } catch (_: Exception) {}
         stopNotifTicker()
         if (sessionRunning) {
             try { Hollowcore.stopVPN() } catch (_: Exception) {}

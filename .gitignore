@@ -28,3 +28,4 @@ windows/dist/
 
 # gomobile output (built in CI / locally, never committed)
 android/app/libs/*.aar
+

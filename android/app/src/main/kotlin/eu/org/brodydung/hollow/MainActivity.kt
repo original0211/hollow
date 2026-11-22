@@ -10,6 +10,7 @@ import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -51,6 +52,28 @@ class MainActivity : Activity() {
     private lateinit var autoConnectNote: TextView
     private lateinit var diagBody: LinearLayout
     private lateinit var log: TextView
+
+    // Deployment wizard (NP-1118-62, the Windows NP-1118-42 card
+    // carried over): one-tap deploy of the user's own Worker.
+    private lateinit var wizardSection: LinearLayout
+    private lateinit var wizardTokenState: TextView
+    private lateinit var wizardTokenInput: EditText
+    private lateinit var wizardAccountNote: TextView
+    private lateinit var wizardSteps: TextView
+    private lateinit var wizardFail: TextView
+    private lateinit var wizardDone: TextView
+    private lateinit var wizardStartButton: Button
+    private lateinit var wizardDelTokenButton: Button
+    private lateinit var wizardDelWorkerButton: Button
+    private var wizardAccountId = ""
+    private var wizardRunning = false
+    private var wizardTokenDirty = true
+    private val wizardPoll = object : Runnable {
+        override fun run() {
+            renderWizardRun()
+            if (wizardRunning) handler.postDelayed(this, 500)
+        }
+    }
 
     private val handler = Handler(Looper.getMainLooper())
     private val poll = object : Runnable {
@@ -115,6 +138,8 @@ class MainActivity : Activity() {
             addView(errorDetail)
             addView(btn("立即重试") { retryConnection() })
         }
+
+        wizardSection = buildWizardSection()
 
         // (j) First run: one import action, nothing else.
         firstRunSection = LinearLayout(this).apply {
@@ -209,6 +234,7 @@ class MainActivity : Activity() {
             addView(mainButton)
             addView(retryButton)
             addView(errorCard)
+            addView(wizardSection)
             addView(firstRunSection)
             addView(settingsSection)
             addView(ioSection)
@@ -412,6 +438,7 @@ class MainActivity : Activity() {
             "connected", "connecting" -> "断开"
             else -> "连接"
         }
+        if (wizardTokenDirty) refreshWizardToken()
         firstRunSection.visibility = if (firstRun) View.VISIBLE else View.GONE
         settingsSection.visibility = if (firstRun) View.GONE else View.VISIBLE
         ioSection.visibility = if (firstRun) View.GONE else View.VISIBLE
@@ -510,6 +537,197 @@ class MainActivity : Activity() {
         n < 1024 * 1024 -> String.format("%.1f KB", n / 1024.0)
         n < 1024 * 1024 * 1024 -> String.format("%.1f MB", n / 1024.0 / 1024.0)
         else -> String.format("%.2f GB", n / 1024.0 / 1024.0 / 1024.0)
+    }
+
+    // ---- deployment wizard (NP-1118-62) ----
+    private fun buildWizardSection(): LinearLayout {
+        wizardTokenState = TextView(this).apply { textSize = 12f }
+        wizardTokenInput = EditText(this).apply {
+            hint = "粘贴令牌（已存令牌可留空）"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        wizardAccountNote = TextView(this).apply { visibility = View.GONE }
+        wizardSteps = TextView(this).apply { textSize = 13f }
+        wizardFail = TextView(this).apply { visibility = View.GONE }
+        wizardDone = TextView(this).apply { visibility = View.GONE }
+        fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
+            text = label
+            setOnClickListener { onClick() }
+        }
+        wizardStartButton = btn("开始部署") { startWizard() }
+        wizardDelTokenButton = btn("删除已存令牌") {
+            Thread {
+                try { Hollowcore.wizardDeleteToken() } catch (_: Exception) {}
+                runOnUiThread { wizardTokenDirty = true; refreshWizardToken() }
+            }.start()
+        }
+        wizardDelWorkerButton = btn("删除已部署的 Worker（可选）") { deleteWizardWorker() }
+        wizardDelWorkerButton.visibility = View.GONE
+        renderWizardSteps(null, null)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@MainActivity).apply { text = "\n— 一键部署到我的 Cloudflare —"; textSize = 17f })
+            addView(TextView(this@MainActivity).apply {
+                text = "把 Hollow 服务端部署到你自己的 Cloudflare 账号，全程不用打开控制台。需要一个 API 令牌（在 dash.cloudflare.com/profile/api-tokens 创建，权限只勾两项：Workers Scripts: Edit 与 Account Settings: Read）。令牌只存本机、只显示尾四位，部署完成后可删除，不影响已部署的 Worker。"
+            })
+            addView(wizardTokenState)
+            addView(TextView(this@MainActivity).apply { text = "Cloudflare API 令牌" })
+            addView(wizardTokenInput)
+            addView(wizardAccountNote)
+            addView(wizardStartButton)
+            addView(wizardDelTokenButton)
+            addView(wizardSteps)
+            addView(wizardFail)
+            addView(wizardDelWorkerButton)
+            addView(wizardDone)
+        }
+    }
+
+    private fun refreshWizardToken() {
+        wizardTokenDirty = false
+        Thread {
+            val st = try { JSONObject(Hollowcore.wizardTokenStatusJSON()) } catch (_: Exception) { JSONObject() }
+            runOnUiThread {
+                if (st.optBoolean("hasToken")) {
+                    wizardTokenState.text = "已存令牌（尾号 ${st.optString("tail")}）——留空输入框即用已存令牌"
+                    wizardDelTokenButton.visibility = View.VISIBLE
+                } else {
+                    wizardTokenState.text = "尚无已存令牌"
+                    wizardDelTokenButton.visibility = View.GONE
+                }
+            }
+        }.start()
+    }
+
+    private fun renderWizardSteps(current: String?, failed: String?) {
+        val order = WIZARD_STEPS.map { it.first }
+        val curIdx = if (current != null) order.indexOf(current) else -1
+        wizardSteps.text = WIZARD_STEPS.mapIndexed { i, (_, label) ->
+            val mark = when {
+                failed != null && order.indexOf(failed) == i -> " ✗"
+                failed != null && order.indexOf(failed) > i -> ""
+                current == null && failed == null -> ""
+                curIdx < 0 -> " ✓"
+                i < curIdx -> " ✓"
+                i == curIdx -> " …"
+                else -> ""
+            }
+            "${i + 1}. $label$mark"
+        }.joinToString("\n")
+    }
+
+    private fun startWizard() {
+        if (wizardRunning) return
+        wizardFail.visibility = View.GONE
+        wizardDone.visibility = View.GONE
+        wizardDelWorkerButton.visibility = View.GONE
+        renderWizardSteps(WIZARD_STEPS.first().first, null)
+        val token = wizardTokenInput.text.toString().trim()
+        val input = JSONObject().put("token", token).put("accountId", wizardAccountId).toString()
+        Thread {
+            val err = try {
+                Hollowcore.wizardStartJSON(input)
+                null
+            } catch (e: Exception) {
+                e.message ?: "启动失败"
+            }
+            runOnUiThread {
+                if (err != null) {
+                    wizardFail.text = "向导未能启动：$err"
+                    wizardFail.visibility = View.VISIBLE
+                    renderWizardSteps(null, null)
+                } else {
+                    wizardTokenInput.text.clear()
+                    wizardRunning = true
+                    handler.post(wizardPoll)
+                }
+            }
+        }.start()
+    }
+
+    /** One 500 ms poll beat while a run is in flight. */
+    private fun renderWizardRun() {
+        val st = try { JSONObject(Hollowcore.wizardStateJSON()) } catch (_: Exception) { return }
+        if (st.optBoolean("running")) {
+            renderWizardSteps(st.optString("step").takeIf { it.isNotEmpty() }, null)
+            return
+        }
+        if (!wizardRunning) return
+        wizardRunning = false
+        val result = st.optJSONObject("result") ?: return
+        onWizardResult(result)
+    }
+
+    private fun onWizardResult(r: JSONObject) {
+        wizardTokenDirty = true
+        if (r.optBoolean("ok")) {
+            renderWizardSteps(null, null)
+            wizardSteps.text = WIZARD_STEPS.mapIndexed { i, (_, label) -> "${i + 1}. $label ✓" }.joinToString("\n")
+            val url = r.optString("workerUrl")
+            wizardDone.text = if (lastState == "connected" || lastState == "connecting") {
+                "部署完成：$url——已保存为当前配置，重新连接后生效。令牌仍存在本机（便于以后一键更新），不需要时可点「删除已存令牌」。"
+            } else {
+                "部署完成：$url——已保存为当前配置并开始连接。令牌仍存在本机（便于以后一键更新），不需要时可点「删除已存令牌」。"
+            }
+            wizardDone.visibility = View.VISIBLE
+            log.append("\n向导部署完成：$url")
+            renderState()
+            if (lastState != "connected" && lastState != "connecting") requestConsentOrStart()
+            return
+        }
+        val code = r.optString("code")
+        if (code == "MULTI_ACCOUNT") {
+            val accounts = r.optJSONArray("accounts")
+            if (accounts != null && accounts.length() > 0) {
+                val names = (0 until accounts.length()).map { accounts.optJSONObject(it)?.optString("name") ?: "" }
+                AlertDialog.Builder(this)
+                    .setTitle("部署到哪个账号")
+                    .setItems(names.toTypedArray()) { _, which ->
+                        val a = accounts.optJSONObject(which)
+                        wizardAccountId = a?.optString("id") ?: ""
+                        wizardAccountNote.text = "将部署到：${a?.optString("name")}——点「开始部署」继续"
+                        wizardAccountNote.visibility = View.VISIBLE
+                    }
+                    .show()
+            }
+            wizardFail.text = "令牌下有多个账号——选好后再次点「开始部署」。"
+            wizardFail.visibility = View.VISIBLE
+            renderWizardSteps("verify", null)
+            return
+        }
+        val stepKey = r.optString("step")
+        val stepLabel = WIZARD_STEPS.firstOrNull { it.first == stepKey }?.second ?: stepKey.ifEmpty { "未知" }
+        val sb = StringBuilder("停在「$stepLabel」：${r.optString("detail").ifEmpty { code.ifEmpty { "未知错误" } }}")
+        if (r.optBoolean("workersNotEnabled")) {
+            sb.append("——该账号可能尚未开通 Workers：请先到 Cloudflare 控制台的 Workers 页面点一次开通（免费层），再重试向导。")
+        }
+        sb.append(" 修改后可直接再次点「开始部署」，已完成的步骤会自动跳过/覆盖。")
+        wizardFail.text = sb.toString()
+        wizardFail.visibility = View.VISIBLE
+        if (stepKey == "liveness" || stepKey == "finalize" || stepKey == "subdomain") {
+            wizardDelWorkerButton.visibility = View.VISIBLE
+        }
+        renderWizardSteps(null, stepKey)
+    }
+
+    private fun deleteWizardWorker() {
+        Thread {
+            val out = try {
+                JSONObject(Hollowcore.wizardDeleteWorkerJSON())
+            } catch (e: Exception) {
+                JSONObject().put("ok", false).put("detail", e.message ?: "")
+            }
+            runOnUiThread {
+                if (out.optBoolean("ok")) {
+                    wizardFail.text = "已删除账号里的 hollow Worker。"
+                    wizardDelWorkerButton.visibility = View.GONE
+                } else {
+                    val d = out.optString("detail")
+                    wizardFail.text = "删除未成功：${if (d.isNotEmpty()) d else "HTTP " + out.optInt("status")}——也可以在 Cloudflare 控制台手动删除同名脚本。"
+                }
+                wizardFail.visibility = View.VISIBLE
+            }
+        }.start()
     }
 
     // ---- the one import funnel (M3-3, unchanged semantics) ----
@@ -692,6 +910,15 @@ class MainActivity : Activity() {
     }
 
     companion object {
+        // Wizard step keys mirror the Go/JS orchestration verbatim.
+        private val WIZARD_STEPS = listOf(
+            "verify" to "验证令牌与账号",
+            "generate" to "本地生成配对密钥",
+            "deploy" to "部署 Worker",
+            "subdomain" to "启用访问子域",
+            "liveness" to "验活（握手与落地）",
+            "finalize" to "保存配置并连接",
+        )
         private const val REQUEST_VPN_CONSENT = 1
         private const val REQ_OPEN_FILE = 2
         private const val REQ_OPEN_IMAGE = 3
