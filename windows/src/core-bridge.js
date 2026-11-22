@@ -25,7 +25,7 @@ export function backoffDelay(failures, baseMs = 1000, capMs = 60000, rnd = Math.
 }
 
 export class CoreBridge {
-  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null, establishTimeoutMs = 20000, edgeDemoteCooldownMs = 120000, edgeRemeasureAfterMs = 60000, edgeRemeasureMinIntervalMs = 300000, remeasureTickMs = 10000, measureEdgesFn = null }) {
+  constructor({ workerUrl, psk, keyId = 1, log = () => {}, makeTransport = null, rotationMs = ROTATION_MS, backoffBaseMs = 1000, backoffCapMs = 60000, edgeIp = null, poolSize = 4, edgeCandidates = null, establishTimeoutMs = 20000, edgeDemoteCooldownMs = 120000, edgeRemeasureAfterMs = 60000, edgeRemeasureMinIntervalMs = 300000, remeasureTickMs = 10000, measureEdgesFn = null, edgeEarlyDeathMs = 120000, remeasureTimeoutMs = 180000, edgeSelfHealExhaustAfter = 3, edgeSelfHealExhaustMs = 600000 }) {
     this.workerUrl = workerUrl;
     this.psk = psk;
     this.keyId = keyId;
@@ -53,10 +53,41 @@ export class CoreBridge {
     this.edgeRemeasureMinIntervalMs = edgeRemeasureMinIntervalMs;
     this.remeasureTickMs = remeasureTickMs;
     this.measureEdgesFn = measureEdgesFn;
-    this._degradedSince = 0;
+    // NP-1118-59 (fix A): the degradation trigger is a leaky
+    // bucket, not a continuous-sample timer. NP-1118-58 showed
+    // the old rule (any fully-healthy 10 s sample resets the
+    // 60 s window) starves under churn: a slot that establishes
+    // and dies minutes later reads "healthy" at most samples.
+    // The bucket accrues one tick per degraded sample, decays
+    // one tick per fully-healthy sample, and — decisively — is
+    // fed directly by early-death evidence (fix C): each
+    // short-lived generation adds half the trigger threshold,
+    // so sustained churn reaches a re-measure in bounded time
+    // no matter how the samples happen to fall.
+    this._degradedCreditMs = 0;
+    this._degradedSinceAt = 0; // wall-clock start of the current degradation episode
+    this._fullSinceAt = 0; // start of the current CONTINUOUS full-health streak
     this._lastRemeasureAt = 0;
     this._remeasureInFlight = false;
     this._remeasureTimer = null;
+    // NP-1118-59 (fixes C+D): survival evidence and the
+    // self-heal state surfaced in the snapshot. A generation
+    // that dies before edgeEarlyDeathMs, or ends having carried
+    // streams but succeeded at none, counts against its entry
+    // candidate in a dedicated counter (an establishment success
+    // does NOT clear it — in the churn shape establishment is
+    // exactly what succeeds; a clean-surviving generation or a
+    // qualifying fresh measurement clears it). Three counted
+    // generations demote the candidate through the usual
+    // cooldown path.
+    this.edgeEarlyDeathMs = edgeEarlyDeathMs;
+    this.remeasureTimeoutMs = remeasureTimeoutMs;
+    this.edgeSelfHealExhaustAfter = edgeSelfHealExhaustAfter;
+    this.edgeSelfHealExhaustMs = edgeSelfHealExhaustMs;
+    this._edgeEarlyDeathAt = new Map(); // ip -> last early-death evidence time
+    this._edgeEarlyDeathCount = new Map(); // ip -> consecutive counted generations
+    this._remeasuresSinceRecovery = 0;
+    this.edgeSelfHealState = null; // null | "degraded" | "exhausted"
     // Edge-IP selection (M2-4): read at every carrier attempt, so changing it
     // takes effect on the NEXT carrier (rotation/reconnect) and never tears
     // down the live one.
@@ -131,25 +162,37 @@ export class CoreBridge {
       log: (m) => this.log(m),
       rotationMs: this.rotationMs,
       size: poolSize,
-      onSwap: (next) => {
+      onSwap: (next, old) => {
         this.client = next;
         this._rollDay(); this.stats.carriers++;
         this.connectedSince = Date.now();
         this._emit("stats", { stats: { ...this.stats } });
+        // NP-1118-59 (fix C): a generation rotated out having
+        // attempted streams but succeeded at none is survival
+        // evidence against its entry candidate.
+        if (old) this._noteGenerationEnd(old, "rotated out");
       },
-      onLineageEnd: () => {
+      onLineageEnd: (slot, deadClient) => {
         // Repoint the representative at any surviving carrier.
         this.client = this.sessions.pick();
+        // NP-1118-59 (fixes C+D): a carrier death used to be
+        // log-silent unless the whole pool hit zero. Log every
+        // one with its slot, entry, lifetime and stream record,
+        // and feed the survival-evidence counter.
+        if (deadClient) this._noteGenerationEnd(deadClient, "carrier lost");
       },
     });
     this.poolSize = this.sessions.size;
   }
 
   // NP-1117-27: replace the ranked candidate list (fresh measurement).
-  // A refresh is new health evidence: demotions and failure counts
-  // reset, so a candidate that measures well again may rise again.
-  // Live carriers are never torn down; new pins apply at each slot's
-  // next establishment.
+  // A refresh is new health evidence, so a candidate that measures
+  // well again may rise again. Live carriers are never torn down;
+  // new pins apply at each slot's next establishment.
+  // NP-1118-59 (fix C): rehabilitation is no longer unconditional —
+  // a demotion is cleared only for a candidate on the fresh list
+  // with no early-death evidence inside the cooldown window (see
+  // the clearing loops below).
   setEdgeCandidates(list) {
     if (!list || !list.length) {
       this.edgeCandidates = null;
@@ -165,8 +208,19 @@ export class CoreBridge {
       out.sort((a, b) => (a.rttMs ?? Infinity) - (b.rttMs ?? Infinity));
       this.edgeCandidates = out.length ? out : null;
     }
-    this._edgeFailCounts.clear();
-    this._edgeDisfavored.clear();
+    const fresh = new Set((this.edgeCandidates || []).map((c) => c.ip));
+    for (const ip of [...this._edgeDisfavored.keys()]) {
+      const lastEarly = this._edgeEarlyDeathAt.get(ip);
+      const earlyFresh = lastEarly !== undefined && Date.now() - lastEarly < this.edgeDemoteCooldownMs;
+      if (fresh.has(ip) && !earlyFresh) {
+        this._edgeDisfavored.delete(ip);
+        this._edgeFailCounts.delete(ip);
+        this._edgeEarlyDeathCount.delete(ip);
+      }
+    }
+    for (const ip of [...this._edgeFailCounts.keys()]) {
+      if (fresh.has(ip)) this._edgeFailCounts.delete(ip);
+    }
     this.log(this.edgeCandidates
       ? `edge candidates ranked: ${this.edgeCandidates.map((c) => `${c.ip}(${c.rttMs ?? "?"}ms)`).join(", ")}`
       : "edge candidates cleared (single-entry behavior)");
@@ -209,6 +263,57 @@ export class CoreBridge {
     if (n >= EDGE_FALLBACK_THRESHOLD && !this._isDisfavored(ip)) {
       this._edgeDisfavored.set(ip, Date.now());
       this.log(`edge ${ip} demoted after ${n} consecutive establishment failures (cooldown ${Math.round(this.edgeDemoteCooldownMs / 1000)}s); its slot re-pins at the next attempt`);
+    }
+  }
+
+  // NP-1118-59 (fix C): survival evidence. A generation ends in
+  // exactly two observable places: its lineage ends (the carrier
+  // died as current) or it is rotated out. Either way, if it
+  // died before edgeEarlyDeathMs, or it attempted streams and
+  // succeeded at none, that counts against its entry candidate
+  // in the early-death counter; EDGE_FALLBACK_THRESHOLD counted
+  // generations demote the candidate through the usual cooldown
+  // path. A generation that ends clean (lived past the
+  // threshold, no zero-success record) clears its candidate's
+  // counter. Every lineage end is also logged (fix D): before
+  // this, an established carrier's death produced no log line
+  // at all unless the whole pool reached zero.
+  _noteGenerationEnd(client, how) {
+    const birth = client._hollowBirth;
+    if (!birth) return;
+    const gen = client._hollowGen || { opens: 0, ok: 0 };
+    const livedMs = Date.now() - birth.bornAt;
+    const ip = birth.ip;
+    if (how === "carrier lost") {
+      this.log(`carrier lost: slot ${birth.slot}, entry ${ip ?? "domain"}, lived ${Math.round(livedMs / 1000)}s, streams ${gen.ok}/${gen.opens} ok, cause ${client.failReason || client.state}`);
+      // Fix A feed (pool-scoped): ANY carrier death is churn
+      // evidence for the re-measure trigger, whatever entry the
+      // carrier used — the bucket measures that the pool is
+      // losing generations, not who is to blame (the demotion
+      // evidence below is the entry-scoped part). Two deaths
+      // inside the decay horizon fire a re-measure regardless
+      // of how the health samples fall.
+      if (this._want) {
+        this._fullSinceAt = 0; // a death breaks any recovery streak
+        if (!this._degradedSinceAt) this._degradedSinceAt = Date.now();
+        if (this.edgeSelfHealState === null) this.edgeSelfHealState = "degraded";
+        this._degradedCreditMs = Math.min(this._degradedCreditMs + this.edgeRemeasureAfterMs / 2, this.edgeRemeasureAfterMs * 10);
+      }
+    }
+    if (!ip || !this._want) return;
+    const zeroSuccess = gen.opens >= 3 && gen.ok === 0;
+    const earlyDeath = livedMs < this.edgeEarlyDeathMs || zeroSuccess;
+    if (!earlyDeath) {
+      this._edgeEarlyDeathCount.delete(ip);
+      return;
+    }
+    const n = (this._edgeEarlyDeathCount.get(ip) || 0) + 1;
+    this._edgeEarlyDeathCount.set(ip, n);
+    this._edgeEarlyDeathAt.set(ip, Date.now());
+    this.log(`entry ${ip}: short-lived generation ${n}/${EDGE_FALLBACK_THRESHOLD} (lived ${Math.round(livedMs / 1000)}s, streams ${gen.ok}/${gen.opens} ok)`);
+    if (n >= EDGE_FALLBACK_THRESHOLD && !this._isDisfavored(ip)) {
+      this._edgeDisfavored.set(ip, Date.now());
+      this.log(`edge ${ip} demoted after ${n} short-lived generations (cooldown ${Math.round(this.edgeDemoteCooldownMs / 1000)}s); its slot re-pins at the next attempt`);
     }
   }
 
@@ -282,6 +387,7 @@ export class CoreBridge {
     // NP-1118-48: carrier establishments seed the phoenix
     // path-cost estimate (the dial component).
     phoenixShared.breaker.noteDialCost(Date.now() - establishStart);
+    client._hollowBirth = { ip: pick ? pick.ip : null, slot: slotIndex, bornAt: Date.now() };
     if (pick) {
       this._edgeFailCounts.delete(pick.ip);
       this._edgeDisfavored.delete(pick.ip); // NP-1118-53: a success formally rehabilitates a probed candidate
@@ -330,9 +436,13 @@ export class CoreBridge {
   // exit — OPEN_OK resolve, OPEN_REJECT reject, carrier death reject —
   // and a local reset() is wrapped to settle the count too.
   _instrument(client) {
+    const gen = { opens: 0, ok: 0 };
+    client._hollowGen = gen;
     const origOpen = client.openStream.bind(client);
     client.openStream = (opts) => {
       const s = origOpen(opts);
+      gen.opens++;
+      s.opened.then(() => { gen.ok++; }, () => {});
       this._rollDay(); this.stats.streams++;
       this._emit("stats", { stats: { ...this.stats } });
       let counted = false;
@@ -364,29 +474,80 @@ export class CoreBridge {
     return client;
   }
 
-  // NP-1118-53: degraded-pool auto re-measurement. While the
-  // pool is not fully healthy for edgeRemeasureAfterMs
-  // continuously, re-run the injected measurement and re-rank.
-  // Healthy slots are never disturbed: re-ranking only changes
+  // NP-1118-53: degraded-pool auto re-measurement, reworked by
+  // NP-1118-59 (fix A): the trigger is the leaky bucket described
+  // at _degradedCreditMs — degraded samples accrue, full-health
+  // samples decay, early-death evidence feeds it directly. At
+  // the threshold (and at most once per
+  // edgeRemeasureMinIntervalMs) the injected measurement re-runs
+  // and the pool re-ranks. Healthy slots are never disturbed:
+  // re-ranking only changes
   // future picks, a healthy slot's pin stays reserved (the
   // usedByOthers semantics in _pickSlotEdge), and only
   // UNHEALTHY slots have their stale pin dropped so their next
   // attempt re-picks from the fresh ranking.
   _remeasureTick() {
-    if (!this._want || !this.edgeCandidates || !this.measureEdgesFn) { this._degradedSince = 0; return; }
-    if (this.sessions.healthyCount() >= this.sessions.size) { this._degradedSince = 0; return; }
-    const now = Date.now();
-    if (!this._degradedSince) { this._degradedSince = now; return; }
-    if (now - this._degradedSince < this.edgeRemeasureAfterMs) return;
-    if (now - this._lastRemeasureAt < this.edgeRemeasureMinIntervalMs) return;
+    if (!this._want || !this.edgeCandidates || !this.measureEdgesFn) {
+      this._degradedCreditMs = 0; this._degradedSinceAt = 0; this._fullSinceAt = 0;
+      this._remeasuresSinceRecovery = 0; this.edgeSelfHealState = null;
+      return;
+    }
+    const full = this.sessions.healthyCount() >= this.sessions.size;
+    if (full) {
+      // Leaky decay: full health drains the bucket one tick at a
+      // time. The EPISODE (and its exhausted bookkeeping) ends
+      // only after full health persists CONTINUOUSLY for a whole
+      // trigger window — under fast churn the bucket can touch
+      // zero between deaths while nothing has actually
+      // recovered, and an episode reset there would restart the
+      // re-measure attempt counter forever (NP-1118-59 grid).
+      if (!this._fullSinceAt) this._fullSinceAt = Date.now();
+      this._degradedCreditMs = Math.max(0, this._degradedCreditMs - this.remeasureTickMs);
+      if (Date.now() - this._fullSinceAt >= this.edgeRemeasureAfterMs) {
+        this._degradedCreditMs = 0;
+        this._degradedSinceAt = 0;
+        this._remeasuresSinceRecovery = 0;
+        this.edgeSelfHealState = null;
+        this._fullSinceAt = 0;
+      }
+      return;
+    }
+    this._fullSinceAt = 0;
+    if (!this._degradedSinceAt) this._degradedSinceAt = Date.now();
+    if (this.edgeSelfHealState === null) this.edgeSelfHealState = "degraded";
+    this._degradedCreditMs = Math.min(this._degradedCreditMs + this.remeasureTickMs, this.edgeRemeasureAfterMs * 10);
+    this._maybeExhausted();
+    if (this._degradedCreditMs < this.edgeRemeasureAfterMs) return;
+    if (Date.now() - this._lastRemeasureAt < this.edgeRemeasureMinIntervalMs) return;
     if (this._remeasureInFlight) return;
+    this._fireRemeasure();
+  }
+
+  _fireRemeasure() {
+    const now = Date.now();
     this._remeasureInFlight = true;
     this._lastRemeasureAt = now;
-    this._degradedSince = 0; // the next trigger needs a fresh sustained-degradation window
-    Promise.resolve()
-      .then(() => this.measureEdgesFn())
+    this._degradedCreditMs = 0; // the next trigger re-accrues from evidence
+    this._remeasuresSinceRecovery++;
+    this.log(`edge auto re-measure: triggered (attempt ${this._remeasuresSinceRecovery} this degradation, healthy ${this.sessions.healthyCount()}/${this.sessions.size})`);
+    // NP-1118-59 (fix B): a watchdog around the measurement
+    // itself. Fix B bounds every probe, but the bridge does not
+    // trust that alone: if the injected measurement ever hangs
+    // anyway, the run is abandoned at remeasureTimeoutMs, the
+    // in-flight flag clears on every exit, and the late result
+    // is discarded (the race has already settled).
+    const TIMED_OUT = Symbol("remeasure-timed-out");
+    const watchdog = new Promise((res) => {
+      const t = setTimeout(() => res(TIMED_OUT), this.remeasureTimeoutMs);
+      t.unref?.();
+    });
+    Promise.race([Promise.resolve().then(() => this.measureEdgesFn()), watchdog])
       .then((list) => {
         if (!this._want) return;
+        if (list === TIMED_OUT) {
+          this.log(`edge auto re-measure: timed out after ${Math.round(this.remeasureTimeoutMs / 1000)}s; keeping the current ranking`);
+          return;
+        }
         if (!list || !list.length) {
           this.log("edge auto re-measure: no candidate measured reachable; keeping the current ranking");
           return;
@@ -401,6 +562,20 @@ export class CoreBridge {
       .finally(() => { this._remeasureInFlight = false; });
   }
 
+  // NP-1118-59 (fix D): when degradation outlasts repeated
+  // re-measures, say so in the snapshot instead of sitting at a
+  // silent partial pool forever: after edgeSelfHealExhaustAfter
+  // re-measures without recovery and at least
+  // edgeSelfHealExhaustMs of continuous degradation, the state
+  // becomes "exhausted" until the pool is fully healthy again.
+  _maybeExhausted() {
+    if (this.edgeSelfHealState === "exhausted") return;
+    if (this._remeasuresSinceRecovery < this.edgeSelfHealExhaustAfter) return;
+    if (!this._degradedSinceAt || Date.now() - this._degradedSinceAt < this.edgeSelfHealExhaustMs) return;
+    this.edgeSelfHealState = "exhausted";
+    this.log(`edge self-heal exhausted: ${this._remeasuresSinceRecovery} re-measures over ${Math.round((Date.now() - this._degradedSinceAt) / 1000)}s did not restore the pool; staying on the surviving carriers`);
+  }
+
   _startRemeasureWatch() {
     if (this._remeasureTimer) return;
     this._remeasureTimer = setInterval(() => this._remeasureTick(), this.remeasureTickMs);
@@ -409,7 +584,11 @@ export class CoreBridge {
 
   _stopRemeasureWatch() {
     if (this._remeasureTimer) { clearInterval(this._remeasureTimer); this._remeasureTimer = null; }
-    this._degradedSince = 0;
+    this._degradedCreditMs = 0;
+    this._degradedSinceAt = 0;
+    this._fullSinceAt = 0;
+    this._remeasuresSinceRecovery = 0;
+    this.edgeSelfHealState = null;
   }
 
   async connect() {
@@ -584,6 +763,7 @@ export class CoreBridge {
       slotEdges: Object.fromEntries(this._slotEdge),
       edgeCandidates: this.edgeCandidates ? this.edgeCandidates.map((c) => c.ip) : null,
       edgeDisfavored: [...this._edgeDisfavored.keys()].filter((ip) => this._isDisfavored(ip)),
+      edgeSelfHeal: this.edgeSelfHealState,
       edgeCandidateRtts: this.edgeCandidates ? Object.fromEntries(this.edgeCandidates.map((c) => [c.ip, c.rttMs])) : {},
       traffic: { ...this.traffic },
       effectiveEdgeIp: this.effectiveEdgeIp(),

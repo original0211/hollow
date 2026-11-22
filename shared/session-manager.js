@@ -90,15 +90,15 @@ class SessionLineage {
       // The current died mid-rotation: the rotation's outcome decides
       // the lineage — success installs a successor (lineage goes on),
       // failure ends it (the host reconnects from scratch).
-      this._rotating.then((ok) => { if (!ok) this._endLineage(); });
+      this._rotating.then((ok) => { if (!ok) this._endLineage(client); });
       return;
     }
-    this._endLineage();
+    this._endLineage(client);
   }
 
-  _endLineage() {
+  _endLineage(deadClient = null) {
     this._clearRotationTimer();
-    try { this.onLineageEnd(); } catch { /* host callback */ }
+    try { this.onLineageEnd(deadClient); } catch { /* host callback */ }
     const waiters = this._waiters.splice(0);
     for (const res of waiters) res();
   }
@@ -277,9 +277,9 @@ export class SessionManager {
       ...this._lineageOpts,
       establish: () => this.establish(index),
       onSwap: (next, old) => { this._onSwap(next, old); },
-      onLineageEnd: () => {
+      onLineageEnd: (deadClient) => {
         slot.busy = false;
-        this._onLineageEnd();
+        this._onLineageEnd(index, deadClient);
       },
     });
     this._slots.push(slot);

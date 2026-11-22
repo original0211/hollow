@@ -843,3 +843,170 @@ test("NP-1118-53 tonight's shape: 1/4 floor holds, then the pool self-heals back
   await echoOnce([5, 6, 7, 8]);
   await bridge.disconnect();
 });
+
+// ---- NP-1118-59: self-heal rework (event-fed trigger, bounded probes,
+//      survival evidence, observability) ----
+
+// Churn factory: every establishment succeeds, but the servers
+// behind `streamRefuseIps` refuse every stream (the zombie shape:
+// handshake fine, data plane dead). Pairs are recorded so the
+// test can kill live carriers by entry IP.
+function mkChurn({ candidates = CANDS, poolSize = 4, streamRefuseIps = new Set(), ...bridgeOpts } = {}) {
+  const logs = [];
+  const dials = [];
+  const pairs = [];
+  const makeTransport = async (dialIp) => {
+    dials.push(dialIp);
+    const [ct, st] = memoryTransportPair();
+    const refuse = streamRefuseIps.has(dialIp);
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: refuse ? async () => { throw new Error("target unreachable (test)"); } : nodeConnect,
+      fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    const rec = { dialIp, ct, st, killed: false };
+    pairs.push(rec);
+    return ct;
+  };
+  const bridge = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1, log: (m) => logs.push(m),
+    makeTransport, rotationMs: 300000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize, edgeCandidates: candidates, ...bridgeOpts,
+  });
+  const killPair = (rec) => {
+    if (!rec || rec.killed) return;
+    rec.killed = true;
+    try { rec.ct.closeCarrier(); } catch {}
+    try { rec.st.closeCarrier(); } catch {}
+  };
+  const killLiveFor = (ip) => {
+    const rec = [...pairs].reverse().find((r) => !r.killed && r.dialIp === ip);
+    if (rec) killPair(rec);
+    return !!rec;
+  };
+  const killAllLive = () => { for (const r of pairs) killPair(r); };
+  return { bridge, logs, dials, pairs, killLiveFor, killAllLive };
+}
+
+test("NP-1118-59 churn: re-measure fires despite momentary full health, early deaths demote, the pool converges, the survivor stream never breaks", async () => {
+  const churnIps = ["10.0.0.1", "10.0.0.2", "10.0.0.3"];
+  let measureCalls = 0;
+  const { bridge, logs, killLiveFor } = mkChurn({
+    streamRefuseIps: new Set(churnIps),
+    edgeDemoteCooldownMs: 60000, // demotions must stick: recovery comes from evidence, not expiry
+    edgeRemeasureAfterMs: 1000, edgeRemeasureMinIntervalMs: 500, remeasureTickMs: 50,
+    measureEdgesFn: async () => { measureCalls++; return CANDS; },
+  });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 4);
+  // Place the survivor stream: only .4's carrier can actually
+  // carry a stream, so the first stream that opens successfully
+  // is provably on it.
+  let s = null;
+  for (let i = 0; i < 12 && !s; i++) {
+    const c = bridge.sessions.pick();
+    if (!c) break;
+    const cand = c.openStream({ host: "localhost", port: echoPort });
+    try { await cand.opened; s = cand; } catch { /* zombie carrier: retry on another */ }
+  }
+  assert.ok(s, "a stream opened on the surviving carrier");
+  const echoOnce = async (bytes) => {
+    const got = await new Promise((res, rej) => {
+      const chunks = [];
+      const to = setTimeout(() => rej(new Error("echo timeout")), 6000);
+      s.onData = (d) => { chunks.push(Buffer.from(d)); if (Buffer.concat(chunks).length >= bytes.length) { clearTimeout(to); res(Buffer.concat(chunks)); } };
+      s.write(new Uint8Array(bytes));
+    });
+    assert.deepEqual([...got], bytes);
+  };
+  await echoOnce([1, 2, 3, 4]);
+  // Churn: kill every churn carrier shortly after it appears.
+  const churn = setInterval(() => { for (const ip of churnIps) killLiveFor(ip); }, 200);
+  try {
+    // (i) the re-measure fires in bounded time even though the
+    // pool reads fully healthy at many samples.
+    await waitFor(() => measureCalls >= 1, 15000);
+    // (iii) early-death evidence demotes all three churn
+    // candidates (the re-measure keeps returning them as
+    // probe-ok, so only the survival evidence can stick), the
+    // slots converge to domain carriers, and the layout settles.
+    await waitFor(() => {
+      const snap = bridge.snapshot();
+      return bridge.sessions.healthyCount() === 4
+        && new Set(snap.edgeDisfavored).size === 3
+        && churnIps.every((ip) => snap.edgeDisfavored.includes(ip))
+        && Object.keys(snap.slotEdges).length === 1 && snap.slotEdges[3] === "10.0.0.4";
+    }, 15000);
+    for (const ip of churnIps) {
+      assert.ok(logs.some((l) => l.includes("short-lived generation") && l.includes(ip)), "evidence logged for " + ip);
+      assert.ok(logs.some((l) => l.includes("carrier lost:") && l.includes(ip)), "death logged for " + ip);
+    }
+    const t = Date.now();
+    while (Date.now() - t < 800) {
+      assert.equal(bridge.sessions.healthyCount(), 4);
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    // (iv) the survivor's stream flowed through all of it.
+    await echoOnce([5, 6, 7, 8]);
+  } finally {
+    clearInterval(churn);
+    await bridge.disconnect();
+  }
+});
+
+test("NP-1118-59 watchdog: a hung measurement is abandoned and the next trigger still fires", async () => {
+  const down = new Set(["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
+  let domainDown = true;
+  let measureCalls = 0;
+  const makeTransport = async (dialIp) => {
+    if (dialIp === null ? domainDown : down.has(dialIp)) return new Promise(() => {}); // blackhole
+    const [ct, st] = memoryTransportPair();
+    new HollowServer({
+      transport: st, verifiers: new Map([[1, VERIFIER]]),
+      ownHost: "test.workers.dev", zoneSuffix: "workers.dev",
+      connectFn: nodeConnect, fetchFn: async () => { throw new Error("no fetch in harness"); },
+    });
+    return ct;
+  };
+  const bridge = new CoreBridge({
+    workerUrl: "wss://test.workers.dev/", psk: PSK, keyId: 1,
+    makeTransport, rotationMs: 300000, backoffBaseMs: 40, backoffCapMs: 200,
+    poolSize: 4, edgeCandidates: CANDS, establishTimeoutMs: 150,
+    edgeDemoteCooldownMs: 60000,
+    edgeRemeasureAfterMs: 800, edgeRemeasureMinIntervalMs: 400, remeasureTickMs: 50,
+    remeasureTimeoutMs: 400,
+    measureEdgesFn: () => { measureCalls++; return new Promise(() => {}); }, // hangs forever
+  });
+  const logs = [];
+  bridge.log = ((orig) => (m) => { logs.push(m); orig(m); })(bridge.log);
+  await bridge.connect();
+  await waitFor(() => measureCalls >= 1, 15000);
+  await waitFor(() => logs.some((l) => l.includes("auto re-measure: timed out")), 15000);
+  // The in-flight flag cleared on the timeout exit: a second
+  // trigger fires (and also times out) instead of wedging.
+  await waitFor(() => measureCalls >= 2, 15000);
+  await bridge.disconnect();
+});
+
+test("NP-1118-59 exhausted: unrecoverable churn surfaces the self-heal state instead of silence", async () => {
+  const { bridge, logs, killAllLive } = mkChurn({
+    candidates: CANDS.slice(0, 2), poolSize: 2,
+    edgeDemoteCooldownMs: 60000,
+    edgeRemeasureAfterMs: 800, edgeRemeasureMinIntervalMs: 400, remeasureTickMs: 50,
+    edgeSelfHealExhaustAfter: 3, edgeSelfHealExhaustMs: 1000,
+    measureEdgesFn: async () => CANDS.slice(0, 2),
+  });
+  await bridge.connect();
+  await waitFor(() => bridge.sessions.healthyCount() === 2);
+  const kill = setInterval(() => killAllLive(), 200);
+  try {
+    await waitFor(() => bridge.snapshot().edgeSelfHeal === "exhausted", 15000);
+    assert.ok(logs.some((l) => l.includes("carrier lost:")), "carrier deaths are logged");
+    assert.ok(logs.some((l) => l.includes("auto re-measure: triggered")), "re-measure triggers are logged");
+    assert.ok(logs.some((l) => l.includes("self-heal exhausted")), "the exhaustion is logged");
+  } finally {
+    clearInterval(kill);
+    await bridge.disconnect();
+  }
+});

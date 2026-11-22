@@ -14,7 +14,7 @@ if (!window.hollow) {
   throw new Error("window.hollow missing — preload failed to load");
 }
 const logEl = $("log");
-let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "", liveCarriers: 0, poolSize: 0, slotEdges: {}, edgeCandidateRtts: {}, edgeIp: null, traffic: { up: 0, down: 0 } };
+let snapshot = { state: "disconnected", connectedSince: null, stats: null, socksPort: null, queuedNow: 0, detail: "", liveCarriers: 0, poolSize: 0, slotEdges: {}, edgeCandidateRtts: {}, edgeIp: null, edgeSelfHeal: null, traffic: { up: 0, down: 0 } };
 let trafficRates = { upRate: 0, downRate: 0 };
 let landingInfo = null;
 let firstRunMode = false;
@@ -73,6 +73,9 @@ function stateView() {
   const st = snapshot.state;
   if (st === "connected") {
     if (snapshot.poolSize > 0 && snapshot.liveCarriers < snapshot.poolSize) {
+      if (snapshot.edgeSelfHeal === "exhausted") {
+        return { label: "已降级", dot: "warn", detail: `承载 ${snapshot.liveCarriers}/${snapshot.poolSize} 在线。入口自愈已多轮重测仍未恢复（已尽力），先靠现有承载撑着；可尝试手动测速或重新连接。` };
+      }
       return { label: "已降级", dot: "warn", detail: `承载 ${snapshot.liveCarriers}/${snapshot.poolSize} 在线，速度与稳定性会打折，系统会自动补齐。` };
     }
     return { label: "已连接", dot: "ok", detail: snapshot.detail || "" };

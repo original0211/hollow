@@ -85,35 +85,70 @@ export function fetchRemoteEdges(workerUrl, { timeoutMs = 8000, path = null } = 
   });
 }
 
-async function handshakeOnce(workerUrl, psk, keyId, edgeIp) {
+// NP-1118-59 (fix B): a probe gets the same class of bound as a
+// real establishment (NP-1118-49). Before this, handshakeOnce
+// passed no timeout to connectWs and raced nothing against the
+// Hollow handshake, so one blackholed candidate could hang an
+// entire measureEdges run — and with it the bridge's auto
+// re-measure — forever.
+export const PROBE_TIMEOUT_MS = 10000;
+
+async function handshakeOnce(workerUrl, psk, keyId, edgeIp, timeoutMs = PROBE_TIMEOUT_MS) {
   const t0 = Date.now();
-  const transport = await connectWs(workerUrl, { userAgent: "HollowClient/0.1", edgeIp });
+  const transport = await connectWs(workerUrl, { userAgent: "HollowClient/0.1", edgeIp, timeoutMs });
   const client = new HollowClient({ transport, psk, keyId });
   try {
-    await client.handshake();
+    await Promise.race([
+      client.handshake(),
+      new Promise((_, rej) => {
+        const t = setTimeout(() => rej(new Error("probe handshake timed out")), Math.max(1, timeoutMs - (Date.now() - t0)));
+        t.unref?.();
+      }),
+    ]);
     return Date.now() - t0;
   } finally {
     try { client.close(); } catch { /* ignore */ }
   }
 }
 
+// Race a promise against the time left until `deadline`; on
+// expiry the underlying work is abandoned (its late settlement
+// is ignored by the race) and the caller records a failure.
+function withinDeadline(promise, deadline, what) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error(`${what} budget exhausted`));
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => {
+      const t = setTimeout(() => rej(new Error(`${what} budget exhausted`)), remaining);
+      t.unref?.();
+    }),
+  ]);
+}
+
 // Measure every candidate: 3 handshakes (median RTT) + one /meta landing.
 // Failures are recorded per candidate (fail-open at selection time, never
 // thrown as a whole). Deps injectable for tests.
-export async function measureEdges({ workerUrl, psk, keyId = 1, edges, probe = handshakeOnce, meta = fetchMeta, metaPath = null, onProgress = null }) {
+export async function measureEdges({ workerUrl, psk, keyId = 1, edges, probe = handshakeOnce, meta = fetchMeta, metaPath = null, onProgress = null, probeTimeoutMs = PROBE_TIMEOUT_MS, candidateBudgetMs = 40000 }) {
   const results = {};
   for (const { ip } of edges) {
+    // NP-1118-59 (fix B): a per-candidate total budget. A single
+    // blackholed candidate costs at most one probe timeout (the
+    // first failed probe ends its samples) and can never hold
+    // the whole run hostage; 40 s still fits a slow-but-alive
+    // candidate (3 probes inside the 10 s probe bound + /meta).
+    const deadline = Date.now() + candidateBudgetMs;
     const samples = [];
     let error = null;
     for (let i = 0; i < 3; i++) {
-      try { samples.push(await probe(workerUrl, psk, keyId, ip)); }
+      try { samples.push(await withinDeadline(Promise.resolve().then(() => probe(workerUrl, psk, keyId, ip, probeTimeoutMs)), deadline, "probe")); }
       catch (e) { error = e.message; break; }
     }
     let landing = null;
     if (samples.length === 3) {
       // fetchMeta itself rejects when no path is configured — landing then
       // stays unknown (fail-open), exactly like an unreachable endpoint.
-      try { landing = await meta(workerUrl, { edgeIp: ip, path: metaPath }); } catch { /* landing unknown */ }
+      try { landing = await withinDeadline(Promise.resolve().then(() => meta(workerUrl, { edgeIp: ip, path: metaPath })), deadline, "probe"); } catch { /* landing unknown */ }
     }
     results[ip] = {
       ok: samples.length === 3,

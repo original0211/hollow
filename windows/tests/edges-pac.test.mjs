@@ -168,3 +168,18 @@ test("pac provider (NP-1117-19 b): last-good cache, DIRECT-only without cache, n
   assert.equal(find("https://anything.example/", "anything.example"), "DIRECT");
   assert.ok(logs.some((l) => l.includes("DIRECT-only")), "fallback is logged");
 });
+
+test("NP-1118-59: a blackholed probe cannot hang measureEdges (per-candidate budget)", async () => {
+  const t0 = Date.now();
+  const results = await measureEdges({
+    workerUrl: "wss://test.workers.dev/", psk: null, keyId: 1,
+    edges: [{ ip: "9.9.9.9" }, { ip: "8.8.8.8" }],
+    probe: async (url, p, k, ip) => { if (ip === "9.9.9.9") return new Promise(() => {}); return 42; },
+    meta: async () => ({ colo: "TST", country: "XX" }),
+    candidateBudgetMs: 300,
+  });
+  assert.ok(Date.now() - t0 < 5000, "the run finished in bounded time despite the hung probe");
+  assert.equal(results["9.9.9.9"].ok, false);
+  assert.equal(results["8.8.8.8"].ok, true);
+  assert.equal(results["8.8.8.8"].medianMs, 42);
+});
