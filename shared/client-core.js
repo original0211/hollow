@@ -30,6 +30,7 @@ export class ClientStream {
     this.onOpenOk = null; this.onQueued = null; this.onReject = null;
     this.onData = null; this.onEnd = null; this.onReset = null; this.onFail = null;
     this._openResolve = null; this._openReject = null;
+    this._openTimer = null; // NP-1118-54: local OPEN-answer bound
   }
   write(data) {
     if (this.state !== "open" && this.state !== "opening" && this.state !== "queued") return false;
@@ -65,9 +66,18 @@ export class ClientStream {
 // under the measured cap — so the cap is never user-visible.
 export const SESSION_OPEN_HARD_CAP = 50; // measured platform ceiling (approx.)
 export const SESSION_ROTATE_THRESHOLD = 40; // rotate here; margin = 10
+// NP-1118-54: local bound on the OPEN answer (§10.2 local parameter,
+// no wire change). Neither the client nor the server's establishing
+// phase had any timer: an OPEN whose egress connect never settles
+// hung the stream until the whole carrier died (NP-1118-52
+// assessment). 20 s sits far above every measured legitimate OPEN
+// answer (queue guarantee 5 s + egress connect + several
+// worst-grade RTTs) and matches the NP-1118-49 establishment
+// budget family. 0/null disables (rollback switch).
+export const OPEN_TIMEOUT_MS = 20000;
 
 export class HollowClient {
-  constructor({ transport, psk, keyId = 1, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT }) {
+  constructor({ transport, psk, keyId = 1, streamWindowGrant = STREAM_WINDOW_GRANT, connWindowGrant = CONN_WINDOW_GRANT, openTimeoutMs = OPEN_TIMEOUT_MS }) {
     this.transport = transport;
     this.psk = psk; this.keyId = keyId;
     // §6.5 v0.2.1 (NP-1117-25): receiver grant targets. Passing the
@@ -75,6 +85,7 @@ export class HollowClient {
     // which is also the per-endpoint rollback switch.
     this.streamWindowGrant = streamWindowGrant;
     this.connWindowGrant = connWindowGrant;
+    this.openTimeoutMs = openTimeoutMs; // NP-1118-54 (0/null = disabled)
     this.halfStream = streamWindowGrant / 2;
     this.halfConn = connWindowGrant / 2;
     this.state = "idle"; // idle | hello | wait-finished | open | dead
@@ -131,6 +142,7 @@ export class HollowClient {
     this.state = "dead"; this.failReason = reason;
     if (this._hsReject) { this._hsReject(new Error(reason)); this._hsReject = null; }
     for (const s of this.streams.values()) {
+      if (s._openTimer) { clearTimeout(s._openTimer); s._openTimer = null; }
       if (s.onFail) s.onFail(reason);
       if (s._openReject) s._openReject(new Error(reason));
     }
@@ -249,7 +261,38 @@ export class HollowClient {
       try { this.onOpenThreshold(); } catch { /* the session layer's problem, not the stream's */ }
     }
     s.opened = new Promise((res, rej) => { s._openResolve = res; s._openReject = rej; });
+    // NP-1118-54: arm the OPEN-answer bound. OPEN_QUEUED does NOT
+    // clear it (the queue has its own 5 s server guarantee; if that
+    // frame is lost this bound is the backstop). OPEN_OK /
+    // OPEN_REJECT / RESET / carrier death clear it via
+    // _forgetStream / _die.
+    if (this.openTimeoutMs) {
+      s._openTimer = setTimeout(() => this._onOpenTimeout(s), this.openTimeoutMs);
+      if (s._openTimer.unref) s._openTimer.unref();
+    }
     return s;
+  }
+
+  // NP-1118-54: the bound expired with no OPEN_OK / OPEN_REJECT.
+  // Stream-local failure only: reject `opened`, fire onFail, and
+  // RESET the stream (which also cancels a queued OPEN and frees
+  // the server-side bookkeeping). The error's code is
+  // ERR.STREAM_TIMEOUT — deliberately neither 0x01 nor 0x06, so
+  // openWithRetry surfaces it as an ordinary non-retryable failure.
+  _onOpenTimeout(s) {
+    s._openTimer = null;
+    if (this.streams.get(s.id) !== s) return;
+    if (s.state !== "opening" && s.state !== "queued") return;
+    s.state = "failed";
+    if (s._openReject) {
+      const e = new Error("open timed out after " + this.openTimeoutMs + "ms");
+      e.code = ERR.STREAM_TIMEOUT;
+      s._openReject(e); s._openReject = null;
+    }
+    if (s.onFail) s.onFail("open timed out");
+    this._sendFrame(buildFrame(FT.RESET, s.id,
+      new Uint8Array([ERR.STREAM_TIMEOUT, 0, 0])), true);
+    this._forgetStream(s);
   }
 
   _pumpStream(s) {
@@ -416,6 +459,7 @@ export class HollowClient {
     if (s.localClosed && s.remoteClosed) { s.state = "closed"; this._forgetStream(s); }
   }
   _forgetStream(s) {
+    if (s._openTimer) { clearTimeout(s._openTimer); s._openTimer = null; }
     if (this.sender) this.sender.flush();
     this.streams.delete(s.id);
   }

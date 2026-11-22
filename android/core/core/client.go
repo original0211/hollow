@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync/atomic"
+	"time"
 )
 
 // Transport carries raw WebSocket messages (hello plaintext, then AEAD
@@ -42,6 +43,26 @@ func (e *OpenRejectError) Error() string {
 	return fmt.Sprintf("open rejected (code 0x%02x)", e.Code)
 }
 
+// OpenTimeoutError is the typed form of the NP-1118-54 local OPEN
+// bound expiring: the server never answered the OPEN in time. It
+// is deliberately NOT an OpenRejectError — the session layer's
+// retry / migration policy keys off reject codes only, so a
+// timeout surfaces as an ordinary, non-retryable failure.
+type OpenTimeoutError struct {
+	AfterMs int
+}
+
+func (e *OpenTimeoutError) Error() string {
+	return fmt.Sprintf("open timed out after %d ms", e.AfterMs)
+}
+
+// DefaultOpenTimeoutMs is the NP-1118-54 local bound on the OPEN
+// answer (§10.2 local parameter, no wire change): neither side's
+// establishing phase had any timer, so an OPEN whose egress
+// connect never settles hung until the whole carrier died
+// (NP-1118-52 assessment).
+const DefaultOpenTimeoutMs = 20000
+
 type ClientStream struct {
 	client *HollowClient
 	ID     uint32
@@ -61,6 +82,7 @@ type ClientStream struct {
 	Paused       bool
 	openErr      error
 	openDone     chan struct{}
+	openTimer    *time.Timer // NP-1118-54
 
 	OnOpenOK    func(gate byte)
 	OnQueued    func(info QueuedInfo)
@@ -132,8 +154,11 @@ type ClientOptions struct {
 	// INIT values reproduces pre-v0.2.1 behavior exactly.
 	StreamWindowGrant int
 	ConnWindowGrant   int
-	PSK               []byte
-	KeyID             byte // zero means 1, as the JS default
+	// NP-1118-54: OPEN-answer bound in ms. 0 selects
+	// DefaultOpenTimeoutMs; a negative value disables the bound.
+	OpenTimeoutMs int
+	PSK           []byte
+	KeyID         byte // zero means 1, as the JS default
 
 	// Test-only determinism hooks (nil in production): a fixed ephemeral
 	// key pair, client random and hello padding, so a recorded session
@@ -186,6 +211,7 @@ type HollowClient struct {
 	opensSent       atomic.Int64
 	activeStreams   atomic.Int64
 	OnOpenThreshold func()
+	openTimeout     time.Duration // NP-1118-54; 0 = disabled
 
 	inbox chan func()
 }
@@ -203,6 +229,12 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 	if connGrant == 0 {
 		connGrant = ConnWindowGrant
 	}
+	openTimeout := time.Duration(opts.OpenTimeoutMs) * time.Millisecond
+	if opts.OpenTimeoutMs == 0 {
+		openTimeout = DefaultOpenTimeoutMs * time.Millisecond
+	} else if opts.OpenTimeoutMs < 0 {
+		openTimeout = 0
+	}
 	c := &HollowClient{
 		transport:         t,
 		psk:               opts.PSK,
@@ -217,6 +249,7 @@ func NewClient(t Transport, opts ClientOptions) *HollowClient {
 		halfConnWindow:    connGrant / 2,
 		connSendWindow:    ConnWindowInit,
 		connRecvWindow:    connGrant,
+		openTimeout:       openTimeout,
 		hsDone:            make(chan struct{}),
 		inbox:             make(chan func(), 4096),
 	}
@@ -367,6 +400,15 @@ func (c *HollowClient) OpenStreamWithCallbacks(host string, port int, schemeHint
 		// §6.5 v0.2.1: top up the server's per-stream window for
 		// the return direction (rides right behind OPEN).
 		c.topUp(s.ID, c.streamWindowGrant-StreamWindowInit)
+		// NP-1118-54: arm the OPEN-answer bound. OPEN_QUEUED does
+		// not clear it (the queue's 5 s server guarantee has this
+		// as its backstop); OPEN_OK / OPEN_REJECT / RESET /
+		// carrier death clear it via forgetStream / die.
+		if c.openTimeout > 0 {
+			s.openTimer = time.AfterFunc(c.openTimeout, func() {
+				c.enqueue(func() { c.failOpenTimeout(s) })
+			})
+		}
 	})
 	// Resolve the ID assignment synchronously for the caller: the op
 	// above runs on the loop; wait for it via a barrier.
@@ -375,6 +417,35 @@ func (c *HollowClient) OpenStreamWithCallbacks(host string, port int, schemeHint
 		return nil, buildErr
 	}
 	return s, nil
+}
+
+// failOpenTimeout expires one stream whose OPEN was never
+// answered (NP-1118-54). Runs on the event loop. Stream-local
+// failure only: WaitOpen returns an OpenTimeoutError, OnFail
+// fires, and a RESET frees the server-side bookkeeping (it also
+// cancels a queued OPEN server-side).
+func (c *HollowClient) failOpenTimeout(s *ClientStream) {
+	if _, ok := c.streams[s.ID]; !ok {
+		return
+	}
+	if s.openErr != nil || (s.State != "opening" && s.State != "queued") {
+		return
+	}
+	s.State = "failed"
+	s.openErr = &OpenTimeoutError{AfterMs: int(c.openTimeout / time.Millisecond)}
+	select {
+	case <-s.openDone:
+	default:
+		close(s.openDone)
+	}
+	if s.OnFail != nil {
+		s.OnFail("open timed out")
+	}
+	if s.OnOpenError != nil {
+		s.OnOpenError("open timed out")
+	}
+	c.sendFrame(BuildFrame(FTReset, s.ID, []byte{ErrStreamTimeout, 0, 0}), true)
+	c.forgetStream(s)
 }
 
 func (c *HollowClient) Close() {
@@ -754,6 +825,9 @@ func (c *HollowClient) maybeFreeStream(s *ClientStream) {
 }
 
 func (c *HollowClient) forgetStream(s *ClientStream) {
+	if s.openTimer != nil {
+		s.openTimer.Stop()
+	}
 	if c.sender != nil {
 		c.sender.Flush()
 	}
